@@ -1,0 +1,39 @@
+# Fonts and archives
+*.zip
+*.ttf
+*.otf
+
+# Old/backup profiles
+oldprofile.ps1
+*.bak
+
+# Oh My Posh themes (downloaded at runtime)
+*.omp.json
+
+# Cached init scripts (generated at runtime)
+omp-init.ps1
+zoxide-init.ps1
+
+# PowerShell module cache
+Modules/
+
+# Editor and IDE
+.vscode/
+*.code-workspace
+.idea/
+CLAUDE.md
+.claude/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# User overrides (per-machine, never tracked)
+profile_user.ps1
+
+# Temp and logs
+*.log
+*.tmp
+.tmpcmd.ps1
+LastExecutionTime.txt

@@ -1,0 +1,26 @@
+{
+  "defaults": {
+    "font": {
+      "face": "CaskaydiaCove NF",
+      "size": 11
+    },
+    "opacity": 75,
+    "useAcrylic": false,
+    "cursorShape": "bar",
+    "padding": "8, 8, 8, 8",
+    "scrollbarState": "visible",
+    "historySize": 20000,
+    "antialiasingMode": "cleartype"
+  },
+  "fontInstall": {
+    "name": "CascadiaCode",
+    "displayName": "CaskaydiaCove NF",
+    "version": "3.2.1"
+  },
+  "keybindings": [
+    {
+      "keys": "ctrl+a",
+      "command": "selectAll"
+    }
+  ]
+}

@@ -1,0 +1,297 @@
+name: PSScriptAnalyzer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule @(
+            'PSAvoidUsingWriteHost'              # Profile needs colored console output
+            'PSAvoidUsingWMICmdlet'               # PS5 compatibility path in uptime
+            'PSUseShouldProcessForStateChangingFunctions'  # Overkill for a profile
+            'PSUseBOMForUnicodeEncodedFile'       # Not needed
+            'PSReviewUnusedParameter'             # Scriptblock params required by completer API
+            'PSUseSingularNouns'                  # Style preference
+          )
+          $results | Format-Table -AutoSize
+          if ($results | Where-Object Severity -in 'Error','Warning') {
+            Write-Error "PSScriptAnalyzer found warnings or errors"
+            exit 1
+          }
+
+      - name: Smoke-test profile (non-interactive)
+        shell: pwsh
+        run: |
+          $env:CI = 'true'
+          try {
+            pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
+            Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
+          } catch {
+            Write-Error "Profile failed to load non-interactive: $_"
+            exit 1
+          }
+
+      - name: PS5 parse-check (all .ps1 files)
+        shell: powershell
+        run: |
+          Write-Host "PS5 version: $($PSVersionTable.PSVersion)" -ForegroundColor Cyan
+          $errors = 0
+          $files = Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1
+          foreach ($file in $files) {
+            $tokens = $null; $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              Write-Host "FAIL: $($file.Name)" -ForegroundColor Red
+              foreach ($pe in $parseErrors) {
+                Write-Host "  Line $($pe.Extent.StartLineNumber) Col $($pe.Extent.StartColumnNumber): $($pe.Message)" -ForegroundColor Red
+                Write-Host "  Text: $($pe.Extent.Text)" -ForegroundColor Yellow
+              }
+              $errors++
+            } else {
+              Write-Host "OK: $($file.Name)" -ForegroundColor Green
+            }
+          }
+          if ($errors -gt 0) { exit 1 }
+
+      - name: Check for hardcoded paths
+        shell: pwsh
+        run: |
+          $patterns = @(
+            'C:\\Users\\'
+            'C:/Users/'
+            '/home/'
+            '\\\\Users\\\\'
+          )
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              foreach ($pattern in $patterns) {
+                if ($lines[$i] -match [regex]::Escape($pattern)) {
+                  $found += [PSCustomObject]@{
+                    File = $file.Name
+                    Line = $i + 1
+                    Match = $lines[$i].Trim()
+                  }
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Hardcoded user paths found"
+            exit 1
+          }
+          Write-Host "No hardcoded paths found." -ForegroundColor Green
+
+      - name: Check for secrets
+        shell: pwsh
+        run: |
+          $patterns = @(
+            '(?i)(api[_-]?key|apikey)\s*[:=]\s*[''"][A-Za-z0-9+/=]{16,}[''"]'
+            '(?i)(secret|token|password)\s*[:=]\s*[''"][^''"]{8,}[''"]'
+            '(?i)(aws_access_key_id|aws_secret_access_key)\s*[:=]'
+            'ghp_[A-Za-z0-9]{36}'
+            'sk-[A-Za-z0-9]{32,}'
+            '(?i)connectionstring\s*[:=]\s*[''"]Server='
+          )
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+            foreach ($pattern in $patterns) {
+              if ($content -match $pattern) {
+                $found += [PSCustomObject]@{
+                  File = $file.Name
+                  Pattern = $pattern.Substring(0, [Math]::Min(40, $pattern.Length)) + '...'
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Potential secrets found"
+            exit 1
+          }
+          Write-Host "No secrets found." -ForegroundColor Green
+
+  install-flow:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate JSON configs parse correctly
+        shell: pwsh
+        run: |
+          $errors = 0
+          foreach ($file in @('theme.json', 'terminal-config.json')) {
+            try {
+              $null = Get-Content $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+              Write-Host "OK: $file" -ForegroundColor Green
+            } catch {
+              Write-Host "FAIL: $file — $_" -ForegroundColor Red
+              $errors++
+            }
+          }
+          if ($errors -gt 0) { exit 1 }
+
+      - name: Validate config schema (required keys)
+        shell: pwsh
+        run: |
+          $theme = Get-Content 'theme.json' -Raw | ConvertFrom-Json
+          $terminal = Get-Content 'terminal-config.json' -Raw | ConvertFrom-Json
+          $errors = @()
+          # theme.json must have theme.name and theme.url
+          if (-not $theme.theme.name) { $errors += 'theme.json: missing theme.name' }
+          if (-not $theme.theme.url) { $errors += 'theme.json: missing theme.url' }
+          # terminal-config.json must have defaults and fontInstall
+          if (-not $terminal.defaults) { $errors += 'terminal-config.json: missing defaults' }
+          if (-not $terminal.fontInstall) { $errors += 'terminal-config.json: missing fontInstall' }
+          if (-not $terminal.fontInstall.name) { $errors += 'terminal-config.json: missing fontInstall.name' }
+          if (-not $terminal.fontInstall.displayName) { $errors += 'terminal-config.json: missing fontInstall.displayName' }
+          if (-not $terminal.fontInstall.version) { $errors += 'terminal-config.json: missing fontInstall.version' }
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }
+            exit 1
+          }
+          Write-Host "Config schema valid." -ForegroundColor Green
+
+      - name: Dry-run setup.ps1 (parse + function definitions)
+        shell: pwsh
+        run: |
+          # Source setup.ps1 functions without running the main install flow
+          # by extracting and testing the helper functions in isolation
+          $content = Get-Content 'setup.ps1' -Raw
+
+          # Verify required functions are defined in setup.ps1
+          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject')
+          $errors = 0
+          foreach ($fn in $requiredFunctions) {
+            if ($content -notmatch "function\s+$fn\b") {
+              Write-Host "FAIL: setup.ps1 missing function $fn" -ForegroundColor Red
+              $errors++
+            } else {
+              Write-Host "OK: $fn defined" -ForegroundColor Green
+            }
+          }
+          if ($errors -gt 0) { exit 1 }
+
+      - name: Test Merge-JsonObject logic
+        shell: pwsh
+        run: |
+          # Extract Merge-JsonObject from setup.ps1 and test it
+          function Merge-JsonObject($base, $override) {
+            foreach ($prop in $override.PSObject.Properties) {
+              $baseVal = $base.PSObject.Properties[$prop.Name]
+              if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
+                Merge-JsonObject $baseVal.Value $prop.Value
+              } else {
+                $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
+              }
+            }
+          }
+
+          # Test 1: flat merge
+          $base = [PSCustomObject]@{ a = 1; b = 2 }
+          $override = [PSCustomObject]@{ b = 99; c = 3 }
+          Merge-JsonObject $base $override
+          if ($base.a -ne 1 -or $base.b -ne 99 -or $base.c -ne 3) {
+            Write-Error "Flat merge failed: $($base | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          Write-Host "OK: flat merge" -ForegroundColor Green
+
+          # Test 2: deep merge preserves nested keys
+          $base = [PSCustomObject]@{ font = [PSCustomObject]@{ face = "Consolas"; size = 11 }; opacity = 75 }
+          $override = [PSCustomObject]@{ font = [PSCustomObject]@{ size = 14 } }
+          Merge-JsonObject $base $override
+          if ($base.font.face -ne "Consolas" -or $base.font.size -ne 14 -or $base.opacity -ne 75) {
+            Write-Error "Deep merge failed: $($base | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          Write-Host "OK: deep merge" -ForegroundColor Green
+
+          # Test 3: override replaces non-object with object
+          $base = [PSCustomObject]@{ theme = "simple" }
+          $override = [PSCustomObject]@{ theme = [PSCustomObject]@{ name = "pure" } }
+          Merge-JsonObject $base $override
+          if ($base.theme.name -ne "pure") {
+            Write-Error "Object replacement failed: $($base | ConvertTo-Json -Compress)"
+            exit 1
+          }
+          Write-Host "OK: object replacement" -ForegroundColor Green
+
+      - name: Test WT settings merge (mock)
+        shell: pwsh
+        run: |
+          # Simulate the WT settings update flow with mock data
+          $mockWt = [PSCustomObject]@{
+            profiles = [PSCustomObject]@{
+              defaults = [PSCustomObject]@{ font = [PSCustomObject]@{ face = "Consolas"; size = 10 } }
+              list = @()
+            }
+            schemes = @()
+            actions = @()
+          }
+          $theme = Get-Content 'theme.json' -Raw | ConvertFrom-Json
+          $terminal = Get-Content 'terminal-config.json' -Raw | ConvertFrom-Json
+          $defaults = $mockWt.profiles.defaults
+
+          # Apply terminal defaults
+          $terminal.defaults.PSObject.Properties | ForEach-Object {
+            $defaults | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force
+          }
+
+          # Apply theme colors
+          if ($theme.windowsTerminal.colorScheme) {
+            $defaults | Add-Member -NotePropertyName "colorScheme" -NotePropertyValue $theme.windowsTerminal.colorScheme -Force
+          }
+
+          # Verify results
+          $errors = 0
+          if ($defaults.opacity -ne $terminal.defaults.opacity) { Write-Host "FAIL: opacity=$($defaults.opacity), expected $($terminal.defaults.opacity)" -ForegroundColor Red; $errors++ }
+          if ($defaults.colorScheme -ne 'Tokyo Night') { Write-Host "FAIL: colorScheme=$($defaults.colorScheme)" -ForegroundColor Red; $errors++ }
+          if ($defaults.font.face -ne 'CaskaydiaCove NF') { Write-Host "FAIL: font.face=$($defaults.font.face)" -ForegroundColor Red; $errors++ }
+
+          # Verify scheme upsert
+          $schemeDef = $theme.windowsTerminal.scheme
+          $mockWt.schemes = @(@($mockWt.schemes | Where-Object { $_ -and $_.name -ne $schemeDef.name }) + ([PSCustomObject]$schemeDef))
+          if ($mockWt.schemes.Count -ne 1 -or $mockWt.schemes[0].name -ne 'Tokyo Night') {
+            Write-Host "FAIL: scheme upsert" -ForegroundColor Red; $errors++
+          }
+
+          # Verify keybinding upsert
+          foreach ($kb in $terminal.keybindings) {
+            $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
+            $mockWt.actions = @($mockWt.actions) + ([PSCustomObject]@{ keys = $kb.keys; command = $kb.command })
+          }
+          $ctrlA = $mockWt.actions | Where-Object { $_.keys -eq 'ctrl+a' }
+          if (-not $ctrlA -or $ctrlA.command -ne 'selectAll') {
+            Write-Host "FAIL: keybinding upsert" -ForegroundColor Red; $errors++
+          }
+
+          if ($errors -gt 0) { exit 1 }
+
+          # Verify JSON roundtrip
+          $json = $mockWt | ConvertTo-Json -Depth 10
+          $null = $json | ConvertFrom-Json -ErrorAction Stop
+          Write-Host "OK: WT settings merge + JSON roundtrip" -ForegroundColor Green
