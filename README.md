@@ -112,7 +112,8 @@ Run `Show-Help` in your terminal for a quick reference.
 | `Show-Help` | Show all commands in the terminal |
 | `admin` / `su` | Open elevated terminal |
 | `b64 <text>` / `b64d <text>` | Base64 encode / decode |
-| `vt <file>` | VirusTotal scan (hash lookup first, uploads if unknown). Set `$env:VT_API_KEY` in `profile_user.ps1` ([free key](https://www.virustotal.com/gui/my-apikey)) |
+| `vtscan <file>` | Quick VirusTotal scan + open in browser (hash lookup first, uploads if unknown). Uses `$env:VTCLI_APIKEY` ([free key](https://www.virustotal.com/gui/my-apikey)) or `vt init` |
+| `vt <subcommand>` | Full [VirusTotal CLI](https://github.com/VirusTotal/vt-cli) (`winget install VirusTotal.vt-cli`) |
 | `cat <file>` | Syntax-highlighted file viewer (bat), falls back to `Get-Content` |
 | `checkport <host> <port>` | Test TCP connectivity to host:port |
 | `checksum <file> <expected>` | Verify file hash (auto-detects algorithm from length) |

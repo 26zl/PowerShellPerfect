@@ -1204,10 +1204,12 @@ function b64d {
     catch { Write-Error "Invalid Base64 input: $_" }
 }
 
-function vt {
+function vtscan {
     param([Parameter(Mandatory)][string]$FilePath)
-    if (-not $env:VT_API_KEY) {
-        Write-Host 'Set $env:VT_API_KEY first (free key at https://www.virustotal.com/gui/my-apikey)' -ForegroundColor Red
+    $apiKey = if ($env:VTCLI_APIKEY) { $env:VTCLI_APIKEY } elseif ($env:VT_API_KEY) { $env:VT_API_KEY } else { $null }
+    if (-not $apiKey) {
+        Write-Host 'Set $env:VTCLI_APIKEY first (free key at https://www.virustotal.com/gui/my-apikey)' -ForegroundColor Red
+        Write-Host 'Or run: vt init' -ForegroundColor Yellow
         return
     }
     $resolved = Resolve-Path $FilePath -ErrorAction SilentlyContinue
@@ -1219,7 +1221,7 @@ function vt {
         return
     }
     $sha = (Get-FileHash $resolved -Algorithm SHA256).Hash.ToLower()
-    $headers = @{ 'x-apikey' = $env:VT_API_KEY }
+    $headers = @{ 'x-apikey' = $apiKey }
     $sizeLabel = if ($file.Length -ge 1MB) { "$sizeMB MB" } else { "$([math]::Round($file.Length / 1KB, 1)) KB" }
     Write-Host "`nFile:       $($file.Name) ($sizeLabel)" -ForegroundColor Cyan
     Write-Host "SHA256:     $sha" -ForegroundColor Cyan
@@ -1282,6 +1284,14 @@ function vt {
         Start-Process $vtLink
     } catch {
         Write-Error "Upload failed: $_"
+    }
+}
+
+if (-not (Get-Command vt.exe -ErrorAction SilentlyContinue)) {
+    function vt {
+        Write-Host 'vt-cli is not installed. Install with:' -ForegroundColor Red
+        Write-Host '  winget install VirusTotal.vt-cli' -ForegroundColor Yellow
+        Write-Host 'Then run: vt init' -ForegroundColor Yellow
     }
 }
 
@@ -1996,7 +2006,8 @@ ${g}hash${r} <file> [algo] - File hash (default SHA256).
 ${g}checksum${r} <file> <expected> - Verify file hash.
 ${g}genpass${r} [length] - Random password (default 20), copies to clipboard.
 ${g}b64${r} / ${g}b64d${r} <text> - Base64 encode / decode.
-${g}vt${r} <file> - VirusTotal scan (hash lookup, upload if unknown). Needs ${g}`$env:VT_API_KEY${r}.
+${g}vtscan${r} <file> - Quick VirusTotal scan + open in browser. Uses ${g}`$env:VTCLI_APIKEY${r} or ${g}vt init${r}.
+${g}vt${r} <subcommand> - Full VirusTotal CLI (vt-cli). Run ${g}vt --help${r} for details.
 
 ${c}Developer${r}
 ${g}killport${r} <port> - Kill process on a TCP port.
