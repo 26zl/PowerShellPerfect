@@ -796,7 +796,113 @@ function sed($file, $find, $replace) {
 
 # Show the full path of a command
 function which($name) {
-    Get-Command $name | Select-Object -ExpandProperty Definition
+    if (-not $name) { Write-Error "Usage: which <name>"; return }
+    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    if ($cmd) { $cmd | Select-Object -ExpandProperty Definition; return }
+    # Fall back to checking the current directory (like bash which for ./files)
+    $local = Join-Path $pwd $name
+    if (Test-Path $local) { (Resolve-Path $local).Path; return }
+    Write-Error "which: $name not found"
+}
+
+# Identify file type via magic bytes (like Linux file command)
+function file {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "file: cannot open '$Path' (No such file or directory)"; return }
+    $fullPath = $resolved.Path
+    $item = Get-Item -LiteralPath $fullPath
+    if ($item.PSIsContainer) { Write-Host "$($fullPath): directory"; return }
+    $size = $item.Length
+    if ($size -eq 0) { Write-Host "$($fullPath): empty"; return }
+
+    $readLen = [Math]::Min($size, 512)
+    $stream = [System.IO.File]::OpenRead($fullPath)
+    try {
+        $bytes = New-Object byte[] $readLen
+        [void]$stream.Read($bytes, 0, $readLen)
+    }
+    finally { $stream.Close() }
+
+    $hex = -join ($bytes[0..([Math]::Min(3, $readLen - 1))] | ForEach-Object { '{0:X2}' -f $_ })
+    $result = $null
+
+    # Magic byte signatures (ordered by specificity)
+    if ($hex.StartsWith('89504E47')) { $result = 'PNG image data' }
+    elseif ($hex.StartsWith('FFD8FF')) { $result = 'JPEG image data' }
+    elseif ($hex.StartsWith('47494638')) { $result = 'GIF image data' }
+    elseif ($hex.StartsWith('424D')) { $result = 'BMP image data' }
+    elseif ($hex.StartsWith('52494646') -and $readLen -ge 12) {
+        $fourcc = [System.Text.Encoding]::ASCII.GetString($bytes, 8, 4)
+        if ($fourcc -eq 'WEBP') { $result = 'WebP image data' }
+        elseif ($fourcc -eq 'WAVE') { $result = 'WAVE audio' }
+        elseif ($fourcc -eq 'AVI ') { $result = 'AVI video' }
+        else { $result = "RIFF data ($fourcc)" }
+    }
+    elseif ($hex.StartsWith('25504446')) { $result = 'PDF document' }
+    elseif ($hex.StartsWith('504B0304') -or $hex.StartsWith('504B0506') -or $hex.StartsWith('504B0708')) {
+        # ZIP-based: check for Office/JAR/APK/EPUB markers
+        $inner = [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min($readLen, 256))
+        if ($inner -match 'word/') { $result = 'Microsoft Word document (DOCX)' }
+        elseif ($inner -match 'xl/') { $result = 'Microsoft Excel spreadsheet (XLSX)' }
+        elseif ($inner -match 'ppt/') { $result = 'Microsoft PowerPoint presentation (PPTX)' }
+        elseif ($inner -match 'META-INF/') { $result = 'Java Archive (JAR)' }
+        elseif ($inner -match 'AndroidManifest') { $result = 'Android application (APK)' }
+        elseif ($inner -match 'mimetype.*epub') { $result = 'EPUB document' }
+        else { $result = 'ZIP archive' }
+    }
+    elseif ($hex.StartsWith('4D5A')) { $result = 'PE32 executable (Windows)' }
+    elseif ($hex.StartsWith('7F454C46')) { $result = 'ELF executable (Linux)' }
+    elseif ($hex.StartsWith('FEEDFACE') -or $hex.StartsWith('FEEDFACF') -or $hex.StartsWith('CEFAEDFE') -or $hex.StartsWith('CFFAEDFE')) { $result = 'Mach-O executable (macOS)' }
+    elseif ($hex.StartsWith('CAFEBABE')) { $result = 'Java class file' }
+    elseif ($hex.StartsWith('1F8B')) { $result = 'gzip compressed data' }
+    elseif ($hex.StartsWith('425A68')) { $result = 'bzip2 compressed data' }
+    elseif ($hex.StartsWith('FD377A58')) { $result = 'XZ compressed data' }
+    elseif ($hex.StartsWith('377ABCAF')) { $result = '7-zip archive' }
+    elseif ($hex.StartsWith('526172')) { $result = 'RAR archive' }
+    elseif ($hex.StartsWith('7573746172') -or ($readLen -ge 262 -and [System.Text.Encoding]::ASCII.GetString($bytes, 257, [Math]::Min(5, $readLen - 257)) -eq 'ustar')) { $result = 'POSIX tar archive' }
+    elseif ($hex.StartsWith('4F676753')) { $result = 'OGG audio' }
+    elseif ($hex.StartsWith('664C6143')) { $result = 'FLAC audio' }
+    elseif ($hex.StartsWith('494433') -or $hex.StartsWith('FFFB') -or $hex.StartsWith('FFF3') -or $hex.StartsWith('FFE3')) { $result = 'MP3 audio' }
+    elseif ($readLen -ge 8 -and [System.Text.Encoding]::ASCII.GetString($bytes, 4, 4) -eq 'ftyp') {
+        $brand = if ($readLen -ge 12) { [System.Text.Encoding]::ASCII.GetString($bytes, 8, 4).Trim() } else { '' }
+        if ($brand -match '^mp4|^isom|^M4V|^MSNV') { $result = 'MP4 video' }
+        elseif ($brand -match '^M4A|^mp4a') { $result = 'M4A audio' }
+        elseif ($brand -match '^qt') { $result = 'QuickTime video' }
+        elseif ($brand -match '^heic|^mif1') { $result = 'HEIF image' }
+        else { $result = "ISO Media ($brand)" }
+    }
+    elseif ($hex.StartsWith('1A45DFA3')) { $result = 'Matroska video (MKV/WEBM)' }
+    elseif ($hex.StartsWith('53514C69')) { $result = 'SQLite database' }
+    elseif ($hex.StartsWith('D0CF11E0')) { $result = 'Microsoft Office legacy document (OLE2)' }
+    elseif ($hex.StartsWith('00000100')) { $result = 'Windows icon (ICO)' }
+    elseif ($hex.StartsWith('00000200')) { $result = 'Windows cursor (CUR)' }
+    elseif ($hex.StartsWith('4C000000')) { $result = 'Windows shortcut (LNK)' }
+    elseif ($hex.StartsWith('EFBBBF') -or $hex.StartsWith('FFFE') -or $hex.StartsWith('FEFF')) {
+        $result = 'Unicode text (with BOM)'
+    }
+    else {
+        # Check if content is printable ASCII/UTF-8 text
+        $textSample = $bytes[0..([Math]::Min(255, $readLen - 1))]
+        $nonText = ($textSample | Where-Object { $_ -lt 0x09 -or ($_ -gt 0x0D -and $_ -lt 0x20 -and $_ -ne 0x1B) -or $_ -eq 0x7F }).Count
+        if ($nonText -eq 0) {
+            $firstLine = [System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min(128, $readLen))
+            if ($firstLine -match '^#!.*python') { $result = 'Python script, ASCII text' }
+            elseif ($firstLine -match '^#!.*bash|^#!.*/sh') { $result = 'Bourne shell script, ASCII text' }
+            elseif ($firstLine -match '^#!.*perl') { $result = 'Perl script, ASCII text' }
+            elseif ($firstLine -match '^#!.*ruby') { $result = 'Ruby script, ASCII text' }
+            elseif ($firstLine -match '^#!.*node|^#!.*deno|^#!.*bun') { $result = 'JavaScript script, ASCII text' }
+            elseif ($firstLine -match '^#!') { $result = 'script, ASCII text' }
+            elseif ($firstLine -match '^\s*<\?xml') { $result = 'XML document, ASCII text' }
+            elseif ($firstLine -match '^\s*<!DOCTYPE\s+html|^\s*<html') { $result = 'HTML document, ASCII text' }
+            elseif ($firstLine -match '^\s*\{') { $result = 'JSON data, ASCII text' }
+            elseif ($firstLine -match '^-----BEGIN') { $result = 'PEM certificate/key, ASCII text' }
+            else { $result = 'ASCII text' }
+        }
+        else { $result = 'data' }
+    }
+
+    Write-Host "$($fullPath): $result ($([Math]::Round($size / 1KB, 1)) KB)"
 }
 
 # Set an environment variable in the current session
