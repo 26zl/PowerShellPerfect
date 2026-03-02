@@ -546,8 +546,8 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             if ($dec -ne 'hello world') { throw "b64d returned unexpected value: $dec" }
         }
         Invoke-CommandProbe -Command 'jwtd' -Code {
-            $token = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQiOjE1MTYyMzkwMjJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
-            jwtd $token | Out-Null
+            $sampleJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQiOjE1MTYyMzkwMjJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+            jwtd $sampleJwt | Out-Null
         }
         Invoke-CommandProbe -Command 'uuid' -Code { uuid | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'epoch' -Code {
