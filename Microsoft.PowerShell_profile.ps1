@@ -1609,6 +1609,7 @@ function Uninstall-Profile {
             Write-Host '  Skipping PSFzf module uninstall under CI/agent environment.' -ForegroundColor DarkGray
         }
         elseif ($PSCmdlet.ShouldProcess('PSFzf', 'Uninstall module')) {
+            $uninstalled = $false
             try {
                 # Try to unload the module from the current session first
                 Remove-Module -Name PSFzf -Force -ErrorAction SilentlyContinue
@@ -1617,8 +1618,43 @@ function Uninstall-Profile {
             try {
                 Uninstall-Module -Name PSFzf -AllVersions -Force -ErrorAction Stop
                 Write-Host '  Uninstalled PSFzf module.' -ForegroundColor Green
+                $uninstalled = $true
             }
-            catch { Write-Warning "  Failed to uninstall PSFzf: $_" }
+            catch {
+                Write-Warning "  Failed to uninstall PSFzf in current session: $_"
+            }
+
+            if (-not $uninstalled) {
+                # Fallback: spawn a background shell to attempt uninstall so this session
+                # does not keep the module "in use".
+                $psExe = $null
+                $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+                if ($cmd) {
+                    $psExe = $cmd.Source
+                }
+                else {
+                    $cmd = Get-Command powershell -ErrorAction SilentlyContinue
+                    if ($cmd) { $psExe = $cmd.Source }
+                }
+
+                if ($psExe) {
+                    try {
+                        Start-Process -FilePath $psExe -ArgumentList @(
+                            '-NoProfile'
+                            '-NonInteractive'
+                            '-Command'
+                            "try { Uninstall-Module -Name PSFzf -AllVersions -Force -ErrorAction SilentlyContinue } catch { `$null = `$_ }"
+                        ) -WindowStyle Hidden | Out-Null
+                        Write-Host '  Scheduled PSFzf uninstall in background session.' -ForegroundColor Yellow
+                    }
+                    catch {
+                        Write-Warning "  Failed to schedule PSFzf uninstall in background session: $_"
+                    }
+                }
+                else {
+                    Write-Warning '  Could not locate pwsh or powershell to retry PSFzf uninstall in a background session.'
+                }
+            }
         }
     }
 
@@ -2098,6 +2134,7 @@ function tlscert {
 
 # Quick TCP port scan
 function portscan {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Hostname,
         [int[]]$Ports = @(21, 22, 25, 53, 80, 443, 445, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017)
@@ -2115,7 +2152,10 @@ function portscan {
                 $open++
             }
         }
-        catch { Write-Verbose "Port $port closed or filtered" }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Write-Verbose "Port $port closed or filtered"
+        }
         finally { $tcp.Dispose() }
     }
     if ($open -eq 0) { Write-Host "  No open ports found." -ForegroundColor Yellow }
