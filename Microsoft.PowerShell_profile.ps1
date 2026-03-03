@@ -955,7 +955,7 @@ function file {
         $bytes = New-Object byte[] $readLen
         [void]$stream.Read($bytes, 0, $readLen)
     }
-    finally { $stream.Close() }
+    finally { $stream.Dispose() }
 
     $hex = -join ($bytes[0..([Math]::Min(3, $readLen - 1))] | ForEach-Object { '{0:X2}' -f $_ })
     $result = $null
@@ -1483,6 +1483,7 @@ function svc {
         [int]$Count = 25,
         [switch]$Live
     )
+    $bootTime = Get-SystemBootTime
     do {
         if ($Live) { Clear-Host }
         try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop }
@@ -1492,7 +1493,7 @@ function svc {
         $memPct = [math]::Round($usedMem / $totalMem * 100)
         $cpuLoad = try { [math]::Round((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average) } catch { 0 }
         $procCount = @(Get-Process).Count
-        $up = (Get-Date) - (Get-SystemBootTime)
+        $up = (Get-Date) - $bootTime
         $upStr = '{0}d {1}h {2}m' -f $up.Days, $up.Hours, $up.Minutes
         Write-Host ''
         Write-Host ('  CPU: {0}%  |  Mem: {1}/{2} GB ({3}%)  |  Procs: {4}  |  Up: {5}' -f $cpuLoad, $usedMem, $totalMem, $memPct, $procCount, $upStr) -ForegroundColor Cyan
@@ -2111,7 +2112,12 @@ function tlscert {
     )
     $tcp = $null; $ssl = $null; $cert = $null
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient($Domain, $Port)
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $async = $tcp.BeginConnect($Domain, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne(5000)) {
+            throw "Connection to ${Domain}:${Port} timed out after 5 seconds"
+        }
+        $tcp.EndConnect($async)
         $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, {$true})
         $ssl.AuthenticateAsClient($Domain)
         $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
@@ -2452,20 +2458,27 @@ if ($isInteractive) {
         }
         if ($localThemePath -and (Test-Path $localThemePath)) {
             # Cache the OMP init script so we don't shell out every startup
-            # Header tracks both OMP version AND theme path so a theme switch invalidates the cache
+            # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
+            # PERF: Defer `oh-my-posh version` (~2-3s) until we know the cache is missing/stale.
+            # When the cache exists, validate using only the theme path portion of the header
+            # (version changes are handled by Update-Tools which deletes the cache on upgrade).
             $ompCachePath = Join-Path $cacheDir "omp-init.ps1"
-            $ompVersion = try { ((oh-my-posh version) | Out-String).Trim() } catch { 'unknown' }
-            $ompCacheHeader = '# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath
             $cacheValid = $false
             if (Test-Path $ompCachePath) {
                 $fileSize = (Get-Item $ompCachePath).Length
                 if ($fileSize -gt 0) {
                     $cacheContent = Get-Content $ompCachePath -First 1
-                    if ($cacheContent -eq $ompCacheHeader) { $cacheValid = $true }
+                    # Fast check: just verify the header references the correct theme path
+                    if ($cacheContent -match '^# OMP_CACHE: .+ \| ' -and $cacheContent.EndsWith($localThemePath)) {
+                        $cacheValid = $true
+                    }
                 }
                 if (-not $cacheValid) { Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue }
             }
             if (-not $cacheValid) {
+                # Only pay the cost of `oh-my-posh version` when we need to regenerate the cache
+                $ompVersion = try { ((oh-my-posh version) | Out-String).Trim() } catch { 'unknown' }
+                $ompCacheHeader = '# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath
                 $initScript = oh-my-posh init pwsh --config $localThemePath
                 if ($initScript) {
                     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -2481,6 +2494,8 @@ if ($isInteractive) {
             catch {
                 Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
                 try {
+                    $ompVersion = try { ((oh-my-posh version) | Out-String).Trim() } catch { 'unknown' }
+                    $ompCacheHeader = '# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath
                     $initScript = oh-my-posh init pwsh --config $localThemePath
                     if ($initScript) {
                         $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -2506,17 +2521,19 @@ if ($isInteractive) {
 if ($isInteractive) {
     if (Get-Command zoxide -ErrorAction SilentlyContinue) {
         $zoxideCachePath = Join-Path $cacheDir "zoxide-init.ps1"
-        $zoxideVersion = try { ((zoxide --version 2>$null) | Out-String).Trim() } catch { 'unknown' }
+        # PERF: Defer `zoxide --version` (~1s) until cache is missing/stale.
+        # When cache exists and is non-empty, trust it (Update-Tools deletes cache on upgrade).
         $cacheValid = $false
         if (Test-Path $zoxideCachePath) {
             $fileSize = (Get-Item $zoxideCachePath).Length
             if ($fileSize -gt 0) {
                 $cacheContent = Get-Content $zoxideCachePath -First 1
-                if ($cacheContent -eq "# ZOXIDE_CACHE_VERSION: $zoxideVersion") { $cacheValid = $true }
+                if ($cacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $cacheValid = $true }
             }
             if (-not $cacheValid) { Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue }
         }
         if (-not $cacheValid) {
+            $zoxideVersion = try { ((zoxide --version 2>$null) | Out-String).Trim() } catch { 'unknown' }
             $initScript = (zoxide init --cmd z powershell | Out-String)
             if ($initScript) {
                 $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
@@ -2533,6 +2550,7 @@ if ($isInteractive) {
         catch {
             Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue
             try {
+                $zoxideVersion = try { ((zoxide --version 2>$null) | Out-String).Trim() } catch { 'unknown' }
                 $initScript = (zoxide init --cmd z powershell | Out-String)
                 if ($initScript) {
                     $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"

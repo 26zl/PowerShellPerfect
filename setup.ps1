@@ -116,6 +116,7 @@ function Install-NerdFonts {
                 }
             }
             # CopyHere is async - wait for fonts to arrive before deleting source
+            $pending = $null
             if ($copied -gt 0) {
                 $timeout = 60; $elapsed = 0
                 while ($elapsed -lt $timeout) {
@@ -517,12 +518,12 @@ function Install-WingetPackage {
 # OMP Install
 Write-Host "[3/10] Oh My Posh" -ForegroundColor Cyan
 $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
-if ($profileConfig -and $profileConfig.theme.name -and $profileConfig.theme.url) {
+if ($profileConfig -and $profileConfig.theme -and $profileConfig.theme.name -and $profileConfig.theme.url) {
     $themeInstalled = Install-OhMyPoshTheme -ThemeName $profileConfig.theme.name -ThemeUrl $profileConfig.theme.url
 }
 else {
     $reason = if (-not $profileConfig) { "theme.json missing" }
-    elseif (-not $profileConfig.theme.name) { "theme name missing" }
+    elseif (-not $profileConfig.theme -or -not $profileConfig.theme.name) { "theme name missing" }
     else { "theme URL missing" }
     Write-Host "  Skipped theme download ($reason)." -ForegroundColor Yellow
     $themeInstalled = $false
@@ -643,9 +644,9 @@ if (Test-Path $wtSettingsPath) {
 
         # Explicit -ColorScheme param wins over config
         $cfgColorScheme = if ($PSBoundParameters.ContainsKey('ColorScheme')) { $ColorScheme }
-        elseif ($profileConfig -and $profileConfig.windowsTerminal.colorScheme) { $profileConfig.windowsTerminal.colorScheme }
+        elseif ($profileConfig -and $profileConfig.windowsTerminal -and $profileConfig.windowsTerminal.colorScheme) { $profileConfig.windowsTerminal.colorScheme }
         else { $null }
-        $cfgCursorColor = if ($profileConfig -and $profileConfig.windowsTerminal.cursorColor) { $profileConfig.windowsTerminal.cursorColor } else { $null }
+        $cfgCursorColor = if ($profileConfig -and $profileConfig.windowsTerminal -and $profileConfig.windowsTerminal.cursorColor) { $profileConfig.windowsTerminal.cursorColor } else { $null }
         if ($cfgColorScheme) {
             $defaults | Add-Member -NotePropertyName "colorScheme" -NotePropertyValue $cfgColorScheme -Force
         }
@@ -654,7 +655,7 @@ if (Test-Path $wtSettingsPath) {
         }
 
         # Upsert color scheme from config
-        if ($profileConfig -and $profileConfig.windowsTerminal.scheme) {
+        if ($profileConfig -and $profileConfig.windowsTerminal -and $profileConfig.windowsTerminal.scheme) {
             $schemeDef = [PSCustomObject]$profileConfig.windowsTerminal.scheme
             if (-not $wt.schemes) {
                 $wt | Add-Member -NotePropertyName "schemes" -NotePropertyValue @() -Force
