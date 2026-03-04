@@ -731,8 +731,8 @@ Set-Alias -Name ep -Value Edit-Profile
 # Create file or update its timestamp
 function touch($file) {
     if (-not $file) { Write-Error "Usage: touch <file>"; return }
-    if (Test-Path $file) {
-        (Get-Item $file).LastWriteTime = Get-Date
+    if (Test-Path -LiteralPath $file) {
+        (Get-Item -LiteralPath $file).LastWriteTime = Get-Date
     }
     else {
         New-Item -ItemType File -Path $file | Out-Null
@@ -915,16 +915,16 @@ function df {
 
 # Find and replace text in a file
 function sed($file, $find, $replace) {
-    if (-not $file -or -not (Test-Path $file)) {
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) {
         Write-Warning "File not found: $file"
         return
     }
     if ($null -eq $find -or $find -eq '') { Write-Error "Usage: sed <file> <find> <replace>"; return }
     if ($null -eq $replace) { $replace = '' }
-    $content = Get-Content $file -Raw
-    if (-not $content) { Write-Warning "File is empty: $file"; return }
+    $content = Get-Content -LiteralPath $file -Raw
+    if ($null -eq $content -or $content.Length -eq 0) { Write-Warning "File is empty: $file"; return }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText((Resolve-Path $file).Path, $content.replace("$find", $replace), $utf8NoBom)
+    [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $file).Path, $content.replace("$find", $replace), $utf8NoBom)
 }
 
 # Show the full path of a command
@@ -1041,6 +1041,7 @@ function file {
 # Set an environment variable in the current session
 function export($name, $value) {
     if (-not $name) { Write-Error "Usage: export <name> <value>"; return }
+    if ($null -eq $value) { Write-Error "Usage: export <name> <value>"; return }
     set-item -force -path "env:$name" -value $value;
 }
 
@@ -1278,8 +1279,8 @@ function hash {
         [Parameter(Mandatory)][string]$File,
         [ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')][string]$Algorithm = 'SHA256'
     )
-    if (-not (Test-Path $File)) { Write-Error "File not found: $File"; return }
-    (Get-FileHash -Path $File -Algorithm $Algorithm).Hash
+    if (-not (Test-Path -LiteralPath $File)) { Write-Error "File not found: $File"; return }
+    (Get-FileHash -LiteralPath $File -Algorithm $Algorithm).Hash
 }
 
 function checksum {
@@ -1287,7 +1288,7 @@ function checksum {
         [Parameter(Mandatory)][string]$File,
         [Parameter(Mandatory)][string]$Expected
     )
-    if (-not (Test-Path $File)) { Write-Error "File not found: $File"; return }
+    if (-not (Test-Path -LiteralPath $File)) { Write-Error "File not found: $File"; return }
     $algo = switch ($Expected.Length) {
         32 { 'MD5' }
         40 { 'SHA1' }
@@ -1356,7 +1357,7 @@ function vtscan {
         Write-Host 'Or run: vt init' -ForegroundColor Yellow
         return
     }
-    $resolved = Resolve-Path $FilePath -ErrorAction SilentlyContinue
+    $resolved = Resolve-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "File not found: $FilePath"; return }
     $file = Get-Item $resolved
     $sizeMB = [math]::Round($file.Length / 1MB, 2)
@@ -2118,7 +2119,10 @@ function tlscert {
             throw "Connection to ${Domain}:${Port} timed out after 5 seconds"
         }
         $tcp.EndConnect($async)
-        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, {$true})
+        $stream = $tcp.GetStream()
+        $stream.ReadTimeout = 10000
+        $stream.WriteTimeout = 10000
+        $ssl = New-Object System.Net.Security.SslStream($stream, $false, {$true})
         $ssl.AuthenticateAsClient($Domain)
         $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
         $daysLeft = [math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays)
@@ -2342,8 +2346,6 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     Set-PSReadLineKeyHandler -Chord 'Alt+v' -BriefDescription SmartPaste -Description 'Paste clipboard as one block into prompt' -ScriptBlock $smartPasteHandler
 
     # fzf integration via PSFzf (fuzzy history search on Ctrl+R, file finder on Ctrl+T)
-    # Lazy-loaded: PSFzf is imported on first Ctrl+R/Ctrl+T press, not at profile load,
-    # to prevent fzf from launching during terminal startup (VS Code shell integration, etc.)
     if (Get-Command fzf -ErrorAction SilentlyContinue) {
         if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -ErrorAction SilentlyContinue)) {
             $env:FZF_DEFAULT_COMMAND = 'rg --files --hidden --glob "!.git"'
@@ -2351,19 +2353,11 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
         if (-not $env:FZF_DEFAULT_OPTS) {
             $env:FZF_DEFAULT_OPTS = '--height=40% --layout=reverse'
         }
-        Set-PSReadLineKeyHandler -Chord 'Ctrl+r' -BriefDescription FzfHistory -Description 'Fuzzy history search (fzf)' -ScriptBlock {
-            if (-not (Get-Module PSFzf)) {
-                try { Import-Module PSFzf -ErrorAction Stop }
-                catch { [Microsoft.PowerShell.PSConsoleReadLine]::Ding(); return }
+        if (Get-Module -ListAvailable -Name PSFzf) {
+            Import-Module PSFzf -ErrorAction SilentlyContinue
+            if (Get-Module PSFzf) {
+                Set-PsFzfOption -PSReadlineChordProvider 'Ctrl+t' -PSReadlineChordReverseHistory 'Ctrl+r'
             }
-            Invoke-FzfPsReadlineHandlerHistory
-        }
-        Set-PSReadLineKeyHandler -Chord 'Ctrl+t' -BriefDescription FzfFileFind -Description 'Fuzzy file finder (fzf)' -ScriptBlock {
-            if (-not (Get-Module PSFzf)) {
-                try { Import-Module PSFzf -ErrorAction Stop }
-                catch { [Microsoft.PowerShell.PSConsoleReadLine]::Ding(); return }
-            }
-            Invoke-FzfPsReadlineHandlerProvider
         }
     }
 
