@@ -470,11 +470,15 @@ function Update-Profile {
                                 $src = if ($prof.source) { $prof.source } else { '' }
                                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
                                 $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
-                                # Only modify profiles that already have an explicit commandline.
-                                # Source-only profiles (no commandline) rely on WT's source resolution
-                                # and adding a hardcoded commandline may break Store-installed pwsh.
-                                if ($cmd -and ($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
-                                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
+                                if ($isPwsh -or $isPS5) {
+                                    if ($cmd -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
+                                        $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
+                                    }
+                                    elseif (-not $cmd -and $src) {
+                                        # Source-only profiles: resolve executable and set commandline with -NoLogo
+                                        $exe = if ($isPwsh) { 'pwsh.exe' } else { 'powershell.exe' }
+                                        $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$exe -NoLogo" -Force
+                                    }
                                 }
                             }
                         }
@@ -735,7 +739,7 @@ function touch($file) {
         (Get-Item -LiteralPath $file).LastWriteTime = Get-Date
     }
     else {
-        New-Item -ItemType File -Path $file | Out-Null
+        New-Item -ItemType File -Path $file -Force | Out-Null
     }
 }
 # Recursive file search by name
@@ -830,7 +834,7 @@ function extract {
     if ($baseName.EndsWith('.tar')) { $ext = '.tar' + $ext }
     Write-Host "Extracting $path ..." -ForegroundColor Cyan
     switch ($ext) {
-        '.zip' { Expand-Archive -Path $path -DestinationPath $pwd -Force }
+        '.zip' { Expand-Archive -LiteralPath $path -DestinationPath $pwd -Force }
         '.tar' { tar -xf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
         '.tar.gz' { tar -xzf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
         '.tgz' { tar -xzf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
@@ -871,8 +875,8 @@ function hb {
 
     $FilePath = $args[0]
 
-    if (Test-Path $FilePath) {
-        $Content = Get-Content $FilePath -Raw
+    if (Test-Path -LiteralPath $FilePath) {
+        $Content = Get-Content -LiteralPath $FilePath -Raw
     }
     else {
         Write-Error "File path does not exist."
@@ -1061,14 +1065,14 @@ function pgrep($name) {
 function head {
     param($Path, $n = 10)
     if (-not $Path) { Write-Error "Usage: head <path> [n]"; return }
-    Get-Content $Path -Head $n
+    Get-Content -LiteralPath $Path -Head $n
 }
 
 # Display last n lines of a file (default 10, -f to follow)
 function tail {
     param($Path, $n = 10, [switch]$f = $false)
     if (-not $Path) { Write-Error "Usage: tail <path> [n] [-f]"; return }
-    Get-Content $Path -Tail $n -Wait:$f
+    Get-Content -LiteralPath $Path -Tail $n -Wait:$f
 }
 
 Set-Alias -Name nf -Value touch
@@ -1359,7 +1363,7 @@ function vtscan {
     }
     $resolved = Resolve-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "File not found: $FilePath"; return }
-    $file = Get-Item $resolved
+    $file = Get-Item -LiteralPath $resolved
     $sizeMB = [math]::Round($file.Length / 1MB, 2)
     if ($file.Length -gt 32MB) {
         Write-Error "File too large ($sizeMB MB). VirusTotal free limit is 32 MB."
@@ -1810,7 +1814,9 @@ function weather {
             [PSCustomObject]@{ name = $ip.city; latitude = $ll[0]; longitude = $ll[1] }
         }
         if (-not $loc) { return }
-        $wx = Invoke-RestMethod "https://api.open-meteo.com/v1/forecast?latitude=$($loc.latitude)&longitude=$($loc.longitude)&current=temperature_2m,weather_code" -TimeoutSec 5
+        $lat = ([double]$loc.latitude).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        $lon = ([double]$loc.longitude).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        $wx = Invoke-RestMethod "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,weather_code" -TimeoutSec 5
         if (-not $wx -or -not $wx.current) { Write-Error "Weather API returned no data."; return }
         $temp = $wx.current.temperature_2m
         $unit = $wx.current_units.temperature_2m
@@ -1877,10 +1883,10 @@ function speedtest {
 
 function sizeof {
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path $Path)) { Write-Error "Path not found: $Path"; return }
-    $item = Get-Item $Path
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Error "Path not found: $Path"; return }
+    $item = Get-Item -LiteralPath $Path
     if ($item.PSIsContainer) {
-        $size = (Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        $size = (Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
     }
     else {
         $size = $item.Length
@@ -2020,8 +2026,8 @@ function prettyjson {
             ($jsonInput -join "`n") | ConvertFrom-Json | ConvertTo-Json -Depth 10
         }
         elseif ($File) {
-            if (-not (Test-Path $File)) { Write-Error "File not found: $File"; return }
-            Get-Content $File -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10
+            if (-not (Test-Path -LiteralPath $File)) { Write-Error "File not found: $File"; return }
+            Get-Content -LiteralPath $File -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10
         }
         else { Write-Error 'Usage: prettyjson <file> or <pipeline> | prettyjson' }
     }
@@ -2191,10 +2197,10 @@ function ipinfo {
 # Quick timestamped backup of a file
 function bak {
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path $Path)) { Write-Error "File not found: $Path"; return }
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Error "File not found: $Path"; return }
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $dest = "$Path.$timestamp.bak"
-    Copy-Item -Path $Path -Destination $dest -Force
+    Copy-Item -LiteralPath $Path -Destination $dest -Force
     Write-Host "Backup: $dest" -ForegroundColor Green
 }
 

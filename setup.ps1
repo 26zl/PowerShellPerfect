@@ -671,11 +671,14 @@ if (Test-Path $wtSettingsPath) {
                 $src = if ($prof.source) { $prof.source } else { '' }
                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
                 $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
-                # Only modify profiles that already have an explicit commandline.
-                # Source-only profiles (no commandline) rely on WT's source resolution
-                # and adding a hardcoded commandline may break Store-installed pwsh.
-                if ($cmd -and ($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
-                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
+                if ($isPwsh -or $isPS5) {
+                    if ($cmd -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
+                        $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
+                    }
+                    elseif (-not $cmd -and $src) {
+                        $exe = if ($isPwsh) { 'pwsh.exe' } else { 'powershell.exe' }
+                        $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$exe -NoLogo" -Force
+                    }
                 }
             }
         }
