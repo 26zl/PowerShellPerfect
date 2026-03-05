@@ -564,6 +564,7 @@ function Update-Profile {
         }
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Unable to check for `$profile updates: $_"
     }
     finally {
@@ -755,6 +756,7 @@ function pubip {
         (Invoke-WebRequest https://ifconfig.me/ip -TimeoutSec 10 -UseBasicParsing).Content
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Failed to retrieve public IP: $_"
     }
 }
@@ -831,7 +833,7 @@ function extract {
     $path = $resolved.Path
     $ext = [System.IO.Path]::GetExtension($path).ToLower()
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($path)
-    if ($baseName.EndsWith('.tar')) { $ext = '.tar' + $ext }
+    if ([string]::Equals('.tar', [System.IO.Path]::GetExtension($baseName), [StringComparison]::OrdinalIgnoreCase)) { $ext = '.tar' + $ext }
     Write-Host "Extracting $path ..." -ForegroundColor Cyan
     switch ($ext) {
         '.zip' { Expand-Archive -LiteralPath $path -DestinationPath $pwd -Force }
@@ -892,6 +894,7 @@ function hb {
         Write-Output "$url copied to clipboard."
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Failed to upload the document. Error: $_"
     }
 }
@@ -1244,6 +1247,7 @@ function ports {
         } | Format-Table -AutoSize
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         netstat -ano | Select-String 'LISTENING'
     }
 }
@@ -1382,6 +1386,7 @@ function vtscan {
         $found = $true
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         $status = $null
         if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
         if ($status -ne 404) {
@@ -1423,6 +1428,7 @@ function vtscan {
             Write-Host 'Using large-file upload endpoint.' -ForegroundColor DarkGray
         }
         catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
             Write-Error "Failed to get upload URL: $_"
             return
         }
@@ -1446,6 +1452,7 @@ function vtscan {
         Start-Process $vtLink
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Upload failed: $_"
     }
 }
@@ -1797,7 +1804,7 @@ function weather {
             return
         }
     }
-    catch { $null = $_ }
+    catch { if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }; $null = $_ }
 
     # Fallback: Open-Meteo (free, no API key)
     try {
@@ -1822,7 +1829,10 @@ function weather {
         $unit = $wx.current_units.temperature_2m
         Write-Host "$($loc.name): ${temp}${unit}" -ForegroundColor Cyan
     }
-    catch { Write-Error "Could not fetch weather: $_" }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Could not fetch weather: $_"
+    }
 }
 
 function wifipass {
@@ -1878,7 +1888,10 @@ function speedtest {
         $mbps = [math]::Round((25 * 8) / $elapsed, 1)
         Write-Host "Download: ~${mbps} Mbps ($([math]::Round($elapsed, 1))s for 25 MB)" -ForegroundColor Green
     }
-    catch { Write-Error "Speed test failed: $_" }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Speed test failed: $_"
+    }
 }
 
 function sizeof {
@@ -1994,6 +2007,7 @@ function http {
         }
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         if ($_.Exception.Response) {
             $status = [int]$_.Exception.Response.StatusCode
             Write-Host "$status $($_.Exception.Response.StatusCode)" -ForegroundColor Red
@@ -2140,7 +2154,10 @@ function tlscert {
         Write-Host "  Days left:   $daysLeft" -ForegroundColor $color
         Write-Host "  Thumbprint:  $($cert.Thumbprint)" -ForegroundColor DarkGray
     }
-    catch { Write-Error "Failed to check certificate for ${Domain}:${Port} - $_" }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Failed to check certificate for ${Domain}:${Port} - $_"
+    }
     finally {
         if ($cert) { $cert.Dispose() }
         if ($ssl) { $ssl.Dispose() }
@@ -2162,7 +2179,8 @@ function portscan {
         try {
             $async = $tcp.BeginConnect($Hostname, $port, $null, $null)
             $connected = $async.AsyncWaitHandle.WaitOne(500) -and $tcp.Connected
-            try { $tcp.EndConnect($async) } catch { $null = $_ }
+            try { $tcp.EndConnect($async) }
+            catch { if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }; $null = $_ }
             if ($connected) {
                 Write-Host ("  {0,-6} open" -f $port) -ForegroundColor Green
                 $open++
@@ -2191,7 +2209,10 @@ function ipinfo {
         Write-Host "  Org:      $($info.org)" -ForegroundColor DarkGray
         Write-Host "  AS:       $($info.as)" -ForegroundColor DarkGray
     }
-    catch { Write-Error "Failed to lookup IP info: $_" }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Failed to lookup IP info: $_"
+    }
 }
 
 # Quick timestamped backup of a file
@@ -2216,8 +2237,14 @@ function watch {
         Write-Host ("watch: every {0}s | {1}" -f $Interval, (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
         Write-Host ""
         try { & $Command }
-        catch { Write-Host $_.Exception.Message -ForegroundColor Red }
-        Start-Sleep -Seconds $Interval
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+        try { Start-Sleep -Seconds $Interval }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        }
     }
 }
 
@@ -2231,8 +2258,8 @@ function whois {
         Write-Host "  Status:     $($rdap.status -join ', ')" -ForegroundColor White
         if ($rdap.entities) {
             $registrar = $rdap.entities | Where-Object { $_.roles -contains 'registrar' } | Select-Object -First 1
-            if ($registrar -and $registrar.vcardArray) {
-                $fn = $registrar.vcardArray[1] | Where-Object { $_[0] -eq 'fn' } | ForEach-Object { $_[3] }
+            if ($registrar -and $registrar.vcardArray -and @($registrar.vcardArray).Count -gt 1) {
+                $fn = $registrar.vcardArray[1] | Where-Object { $_ -and $_[0] -eq 'fn' } | ForEach-Object { $_[3] }
                 if ($fn) { Write-Host "  Registrar:  $fn" -ForegroundColor White }
             }
         }
@@ -2254,6 +2281,7 @@ function whois {
         }
     }
     catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
             Write-Error "Domain not found: $Domain"
         }
@@ -2409,7 +2437,7 @@ if (Get-Command dotnet -ErrorAction SilentlyContinue) {
 # Oh My Posh initialization (interactive only, cached for fast startup)
 if ($isInteractive) {
     if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-        # Read theme name + URL from cached config
+        # Read theme name + URL from cached config; user-settings.json overrides theme.json
         $profileConfigPath = Join-Path $cacheDir "theme.json"
         $themeName = $null
         $themeUrl = $null
@@ -2421,7 +2449,6 @@ if ($isInteractive) {
             }
             catch { Write-Verbose "Failed to parse theme.json: $_" }
         }
-        # User-settings theme override (startup-time, not just Update-Profile)
         $userSettingsStartup = Join-Path $cacheDir "user-settings.json"
         if (Test-Path $userSettingsStartup) {
             try {
@@ -2483,10 +2510,14 @@ if ($isInteractive) {
                     $cacheContent = Get-Content $ompCachePath -Raw
                     $firstLine = ($cacheContent -split "`n", 2)[0]
                     # Fast check: verify header references correct theme path
-                    if ($firstLine -match '^# OMP_CACHE: .+ \| ' -and $firstLine.EndsWith($localThemePath)) {
-                        # Also verify that the OMP internal init file referenced in the cache still exists.
-                        # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
-                        # deleting OMP's internal init script and breaking the cached redirect.
+                    # Header format: # OMP_CACHE: <version> | <theme_path> - compare path case-insensitively (Windows)
+                    $headerPath = $null
+                    if ($firstLine -match '^# OMP_CACHE: .+ \| (.+)$') { $headerPath = $Matches[1].Trim() }
+                    $pathMatches = $headerPath -and [string]::Equals($headerPath, $localThemePath, [StringComparison]::OrdinalIgnoreCase)
+                    # Also verify that the OMP internal init file referenced in the cache still exists.
+                    # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
+                    # deleting OMP's internal init script and breaking the cached redirect.
+                    if ($pathMatches) {
                         $ompInternalPath = [regex]::Match($cacheContent, "& '([^']+)'").Groups[1].Value
                         if ($ompInternalPath -and (Test-Path -LiteralPath $ompInternalPath)) {
                             $cacheValid = $true
