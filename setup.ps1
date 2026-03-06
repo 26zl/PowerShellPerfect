@@ -233,6 +233,7 @@ catch {
 
 # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
 function Merge-JsonObject($base, $override) {
+    if (-not $base -or -not $override) { return }
     foreach ($prop in $override.PSObject.Properties) {
         $baseVal = $base.PSObject.Properties[$prop.Name]
         if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -244,15 +245,16 @@ function Merge-JsonObject($base, $override) {
     }
 }
 
-# Editor candidates for interactive selection during setup
+# Editor candidates for interactive selection. WingetId = $null means built-in (not installed via winget).
+# WingetIds verified with: winget search --id <Id>
 $EditorCandidates = @(
-    @{ Cmd = 'code'; Display = 'Visual Studio Code' }
-    @{ Cmd = 'nvim'; Display = 'Neovim' }
-    @{ Cmd = 'vim'; Display = 'Vim' }
-    @{ Cmd = 'nano'; Display = 'GNU Nano' }
-    @{ Cmd = 'subl'; Display = 'Sublime Text' }
-    @{ Cmd = 'notepad++'; Display = 'Notepad++' }
-    @{ Cmd = 'notepad'; Display = 'Notepad (always available)' }
+    @{ Cmd = 'code'; Display = 'Visual Studio Code'; WingetId = 'Microsoft.VisualStudioCode' }
+    @{ Cmd = 'nvim'; Display = 'Neovim'; WingetId = 'Neovim.Neovim' }
+    @{ Cmd = 'vim'; Display = 'Vim'; WingetId = 'vim.vim' }
+    @{ Cmd = 'msedit'; Display = 'Microsoft Edit'; WingetId = 'Microsoft.Edit' }
+    @{ Cmd = 'subl'; Display = 'Sublime Text'; WingetId = 'SublimeHQ.SublimeText.4' }
+    @{ Cmd = 'notepad++'; Display = 'Notepad++'; WingetId = 'Notepad++.Notepad++' }
+    @{ Cmd = 'notepad'; Display = 'Notepad (always available)'; WingetId = $null }
 )
 
 # Interactive editor preference prompt - returns chosen Cmd string
@@ -447,6 +449,26 @@ $canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -
 if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
 if ($canPromptEditor) {
     $chosenEditor = Select-PreferredEditor
+    # Install chosen editor via winget only if not already installed
+    $chosen = $EditorCandidates | Where-Object { $_.Cmd -eq $chosenEditor } | Select-Object -First 1
+    if ($chosen -and $chosen.WingetId -and -not (Get-Command $chosenEditor -ErrorAction SilentlyContinue)) {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
+            $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
+                $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+                Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Could not install $($chosen.Display) via winget. Using Notepad." -ForegroundColor Yellow
+                $chosenEditor = 'notepad'
+            }
+        }
+        else {
+            Write-Host "  winget not found. Using Notepad." -ForegroundColor Yellow
+            $chosenEditor = 'notepad'
+        }
+    }
     Write-Host "  Editor set to: $chosenEditor" -ForegroundColor Green
     $editorLine = '$script:EditorPriority = @(' + "'$chosenEditor', 'notepad'" + ')'
     foreach ($dir in $profileDirs) {
@@ -615,6 +637,7 @@ if (Test-Path $wtSettingsPath) {
                 else { throw }
             }
         }
+        if (-not $wt) { $wt = [PSCustomObject]@{} }
 
         if (-not $wt.profiles) {
             $wt | Add-Member -NotePropertyName "profiles" -NotePropertyValue ([PSCustomObject]@{}) -Force
@@ -667,6 +690,7 @@ if (Test-Path $wtSettingsPath) {
         # the copyright banner and "Loading personal and system profiles took ..." message
         if ($wt.profiles.list) {
             foreach ($prof in @($wt.profiles.list)) {
+                if (-not $prof) { continue }
                 $cmd = if ($prof.commandline) { $prof.commandline } else { '' }
                 $src = if ($prof.source) { $prof.source } else { '' }
                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
@@ -689,6 +713,7 @@ if (Test-Path $wtSettingsPath) {
                 $wt | Add-Member -NotePropertyName "actions" -NotePropertyValue @() -Force
             }
             foreach ($kb in $terminalConfig.keybindings) {
+                if (-not $kb) { continue }
                 $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
                 if ($wt.PSObject.Properties['keybindings']) {
                     # New WT format: separate keybindings array references actions by id
@@ -732,15 +757,25 @@ else {
     Write-Host "Setup completed with some issues. Check the messages above." -ForegroundColor Yellow
 }
 Write-Host ""
-Write-Host "Restart your terminal to apply all changes." -ForegroundColor Cyan
-Write-Host ""
 $canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID -and -not [bool]$env:CLAUDE_CODE
 if ($canPromptExit) { try { $null = [Console]::KeyAvailable } catch { $canPromptExit = $false } }
+# Same restart logic as profile's Restart-TerminalToApply: prefer WT (new tab), else pwsh/powershell. Applies for both .\setup.ps1 and irm | iex.
 if ($canPromptExit) {
-    Read-Host "Press Enter to exit"
+    Write-Host "Setup applied. Restarting terminal..." -ForegroundColor Green
+    $dir = (Get-Location).Path
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
+        $dir = [Environment]::GetFolderPath('UserProfile')
+    }
+    $shellName = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
+    if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
+        Start-Process -FilePath "wt.exe" -ArgumentList "-w", "0", "-d", $dir, $shellName, "-NoExit"
+    }
+    else {
+        $shellExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+        Start-Process -FilePath $shellExe -ArgumentList "-NoExit" -WorkingDirectory $dir
+    }
+    exit ([int](-not $allGood))
 }
-# Only exit when running as a standalone script file; return otherwise to avoid closing
-# the user's session when piped via irm | iex or dot-sourced.
 if ($MyInvocation.PSCommandPath) {
     exit ([int](-not $allGood))
 }

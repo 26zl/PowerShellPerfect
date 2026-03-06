@@ -441,6 +441,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             if ([string]::IsNullOrWhiteSpace($editor)) { throw 'Resolve-PreferredEditor returned empty value' }
         }
         Invoke-CommandProbe -Command 'reload' -SkipReason 'Reloads profile mid-test'
+        Invoke-CommandProbe -Command 'Restart-TerminalToApply' -SkipReason 'Exits process and restarts terminal'
         Invoke-CommandProbe -Command 'Edit-Profile' -SkipReason 'Opens interactive editor'
         Invoke-CommandProbe -Command 'ep' -SkipReason 'Alias to Edit-Profile (opens interactive editor)'
         Invoke-CommandProbe -Command 'edit' -SkipReason 'Opens interactive editor'
@@ -467,6 +468,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Clear-Cache' -Code { Clear-Cache -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Uninstall-Profile' -Code { Uninstall-Profile -All -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Invoke-DownloadWithRetry' -SkipReason 'Internal helper (covered by setup tests)'
+        Invoke-CommandProbe -Command 'Invoke-WithTimeout' -SkipReason 'Internal helper (used by OMP/zoxide init)'
         Invoke-CommandProbe -Command 'Merge-JsonObject' -SkipReason 'Internal helper nested in Update-Profile'
 
         # Git

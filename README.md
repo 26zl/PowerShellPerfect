@@ -24,7 +24,7 @@ Run in an **elevated** PowerShell window:
 irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
 ```
 
-Restart your terminal after running. For the best experience use [PowerShell 7](https://github.com/PowerShell/PowerShell).
+The terminal restarts automatically when setup finishes (new tab in Windows Terminal, or new window otherwise). For the best experience use [PowerShell 7](https://github.com/PowerShell/PowerShell).
 
 ### Manual Setup
 

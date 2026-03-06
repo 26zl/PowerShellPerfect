@@ -41,6 +41,31 @@ $script:ProfileTools = @(
     @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version" }
 )
 
+# Run a scriptblock in a job with timeout; returns result or $null on timeout/failure (avoids OMP/zoxide init hangs)
+function Invoke-WithTimeout {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$ScriptBlock,
+        [int]$TimeoutSec = 15,
+        [object[]]$ArgumentList = @()
+    )
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+        $null = Wait-Job $job -Timeout $TimeoutSec
+        if ($job.State -eq 'Running') {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            return $null
+        }
+        if ($job.State -eq 'Failed') { return $null }
+        Receive-Job $job
+    }
+    catch { return $null }
+    finally {
+        if ($job) { Remove-Job $job -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # Download helper with retry, size validation, and corrupt-file cleanup
 function Invoke-DownloadWithRetry {
     param(
@@ -89,6 +114,7 @@ function Update-Profile {
     $tempTerminalConfig = Join-Path $env:TEMP "terminal-config.json"
 
     $phaseErrors = @()
+    $profileActuallyUpdated = $false
     try {
         # Phase 1: Download profile and config
         $profileUrl = "$repo_root/$repo_name/main/Microsoft.PowerShell_profile.ps1"
@@ -208,9 +234,11 @@ function Update-Profile {
                 }
                 if ($copySuccess -gt 0 -and $copyFailed.Count -eq 0) {
                     Write-Host "Profile updated ($copySuccess locations)." -ForegroundColor Green
+                    $profileActuallyUpdated = $true
                 }
                 elseif ($copySuccess -gt 0) {
                     Write-Warning "Profile updated partially. Failed to write: $($copyFailed -join ', ')"
+                    $profileActuallyUpdated = $true
                 }
                 else {
                     Write-Warning "Profile not updated -- no writable profile directories found."
@@ -251,6 +279,7 @@ function Update-Profile {
 
         # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
         function Merge-JsonObject($base, $override) {
+            if (-not $base -or -not $override) { return }
             foreach ($prop in $override.PSObject.Properties) {
                 $baseVal = $base.PSObject.Properties[$prop.Name]
                 if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -400,6 +429,7 @@ function Update-Profile {
                                 else { throw }
                             }
                         }
+                        if (-not $wt) { $wt = [PSCustomObject]@{} }
 
                         if (-not $wt.profiles) {
                             $wt | Add-Member -NotePropertyName "profiles" -NotePropertyValue ([PSCustomObject]@{}) -Force
@@ -444,6 +474,7 @@ function Update-Profile {
                                 $wt | Add-Member -NotePropertyName "actions" -NotePropertyValue @() -Force
                             }
                             foreach ($kb in $terminalConfig.keybindings) {
+                                if (-not $kb) { continue }
                                 $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
                                 if ($wt.PSObject.Properties['keybindings']) {
                                     # New WT format: separate keybindings array references actions by id
@@ -466,6 +497,7 @@ function Update-Profile {
                         # Ensure PowerShell profiles launch with -NoLogo
                         if ($wt.profiles.list) {
                             foreach ($prof in @($wt.profiles.list)) {
+                                if (-not $prof) { continue }
                                 $cmd = if ($prof.commandline) { $prof.commandline } else { '' }
                                 $src = if ($prof.source) { $prof.source } else { '' }
                                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
@@ -559,8 +591,8 @@ function Update-Profile {
             }
         }
 
-        if ($profileChanged) {
-            Write-Host "Please restart your shell to reflect changes." -ForegroundColor Magenta
+        if ($profileActuallyUpdated) {
+            Restart-TerminalToApply -Message "Profile updated. Restarting terminal..."
         }
     }
     catch {
@@ -588,6 +620,7 @@ function Update-PowerShell {
         $headers = @{}
         if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
         $latestReleaseInfo = Invoke-RestMethod -Uri $gitHubApiUrl -TimeoutSec 10 -Headers $headers
+        if (-not $latestReleaseInfo.tag_name) { Write-Error "Invalid GitHub API response (missing tag_name)."; return }
         $latestVersionStr = $latestReleaseInfo.tag_name.Trim('v') -replace '-.*$', ''
         $latestVersion = [version]$latestVersionStr
         if ($currentVersion -lt $latestVersion) {
@@ -644,7 +677,7 @@ function Update-Tools {
         elseif ($LASTEXITCODE -ne -1978335189) { $failed++ }
     }
     if ($upgraded -gt 0) {
-        Write-Host "$upgraded tool(s) updated. Restart your shell to apply changes." -ForegroundColor Magenta
+        Restart-TerminalToApply -Message "Tools updated. Restarting terminal..."
     }
     if ($failed -gt 0) {
         Write-Warning "$failed tool(s) failed to update. Check the output above."
@@ -653,6 +686,30 @@ function Update-Tools {
         Write-Host "All tools are up to date." -ForegroundColor Green
     }
 }
+
+# Start a new terminal and exit the current one so changes take effect (interactive only; skips when -WhatIf).
+# Same logic as setup.ps1 end block: prefer Windows Terminal (wt -w 0 = new tab in current window), else pwsh/powershell.
+function Restart-TerminalToApply {
+    param([string]$Message = "Update applied. Restarting terminal...")
+    if (-not $isInteractive) { return }
+    if ($WhatIfPreference) { return }
+    $dir = (Get-Location).Path
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
+        $dir = [Environment]::GetFolderPath('UserProfile')
+    }
+    $shellName = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
+    Write-Host $Message -ForegroundColor Green
+    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    if ($wt) {
+        Start-Process -FilePath "wt.exe" -ArgumentList "-w", "0", "-d", $dir, $shellName, "-NoExit"
+    }
+    else {
+        $shellExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+        Start-Process -FilePath $shellExe -ArgumentList "-NoExit" -WorkingDirectory $dir
+    }
+    exit
+}
+
 # Clear user temp/browser caches (-IncludeSystemCaches for system dirs)
 function Clear-Cache {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -804,7 +861,7 @@ Set-Alias -Name su -Value admin
 # Shared boot-time helper (PS5: WMI, PS7: Get-Uptime)
 function Get-SystemBootTime {
     if ($PSVersionTable.PSVersion.Major -eq 5) {
-        $lastBoot = (Get-WmiObject win32_operatingsystem).LastBootUpTime
+        $lastBoot = (Get-WmiObject win32_operatingsystem | Select-Object -First 1).LastBootUpTime
         [System.Management.ManagementDateTimeConverter]::ToDateTime($lastBoot)
     }
     else {
@@ -1094,6 +1151,7 @@ function trash($path) {
     $item = Get-Item -LiteralPath $path
 
     if ($item.PSIsContainer) {
+        if (-not $item.Parent) { Write-Error "Cannot move root directory to Recycle Bin."; return }
         $parentPath = $item.Parent.FullName
     }
     else {
@@ -1124,12 +1182,14 @@ function trash($path) {
 
 # Navigation Shortcuts
 function docs {
-    $docs = if (([Environment]::GetFolderPath("MyDocuments"))) { ([Environment]::GetFolderPath("MyDocuments")) } else { $HOME + "\Documents" }
+    $docs = [Environment]::GetFolderPath("MyDocuments")
+    if ([string]::IsNullOrWhiteSpace($docs)) { $docs = $HOME + "\Documents" }
     Set-Location -Path $docs
 }
 
 function dtop {
-    $dtop = if ([Environment]::GetFolderPath("Desktop")) { [Environment]::GetFolderPath("Desktop") } else { $HOME + "\Desktop" }
+    $dtop = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($dtop)) { $dtop = $HOME + "\Desktop" }
     Set-Location -Path $dtop
 }
 
@@ -1397,6 +1457,10 @@ function vtscan {
 
     if ($found) {
         $stats = $report.data.attributes.last_analysis_stats
+        if (-not $stats) {
+            Write-Warning "Unexpected VirusTotal response (missing analysis stats)."
+            return
+        }
         $mal = $stats.malicious; $total = $mal + $stats.undetected + $stats.harmless + $stats.suspicious + $stats.timeout
         $color = if ($mal -eq 0) { 'Green' } elseif ($mal -le 5) { 'Yellow' } else { 'Red' }
         Write-Host "Detections: $mal/$total" -ForegroundColor $color
@@ -1425,6 +1489,7 @@ function vtscan {
     if ($file.Length -gt 10MB) {
         try {
             $uploadUrl = (Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files/upload_url' -Headers $headers -ErrorAction Stop).data
+            if (-not $uploadUrl) { Write-Error "VirusTotal did not return an upload URL."; return }
             Write-Host 'Using large-file upload endpoint.' -ForegroundColor DarkGray
         }
         catch {
@@ -1445,7 +1510,12 @@ function vtscan {
             -Method Post -Headers $headers `
             -ContentType "multipart/form-data; boundary=$boundary" `
             -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
-        $link = ($resp.Content | ConvertFrom-Json).data.links.self
+        $parsed = $resp.Content | ConvertFrom-Json
+        if (-not $parsed -or -not $parsed.data -or -not $parsed.data.links) {
+            Write-Error "Unexpected VirusTotal upload response."
+            return
+        }
+        $link = $parsed.data.links.self
         Write-Host "Uploaded. Analysis: $link" -ForegroundColor Green
         $vtLink = "https://www.virustotal.com/gui/file/$sha/detection"
         Write-Host "Link:       $vtLink" -ForegroundColor Cyan
@@ -1521,7 +1591,7 @@ function svc {
         @{L = 'PID'; E = { $_.Id }; A = 'Right' },
         @{L = 'CPU(s)'; E = { [math]::Round($_.CPU, 1) }; A = 'Right' },
         @{L = 'Mem(MB)'; E = { [math]::Round($_.WorkingSet64 / 1MB, 1) }; A = 'Right' },
-        @{L = 'Threads'; E = { $_.Threads.Count }; A = 'Right' } -AutoSize
+        @{L = 'Threads'; E = { try { $_.Threads.Count } catch { 0 } }; A = 'Right' } -AutoSize
         if ($Live) { Start-Sleep -Seconds 2 }
     } while ($Live)
 }
@@ -1537,7 +1607,7 @@ function Clear-ProfileCache {
         Remove-Item $item.FullName -Force -ErrorAction SilentlyContinue
         Write-Host "  Removed $($item.Name)" -ForegroundColor DarkGray
     }
-    Write-Host "Profile cache cleared. Restart your terminal to regenerate." -ForegroundColor Green
+    Restart-TerminalToApply -Message "Profile cache cleared. Restarting terminal..."
 }
 
 function Uninstall-Profile {
@@ -1777,7 +1847,6 @@ function Uninstall-Profile {
 
     # Phase 8: Summary
     Write-Host ''
-    Write-Host 'Uninstall complete. Restart your terminal for changes to take effect.' -ForegroundColor Green
     if ($preserved) {
         Write-Host ''
         Write-Host 'Preserved:' -ForegroundColor Yellow
@@ -1787,6 +1856,7 @@ function Uninstall-Profile {
             Write-Host 'Use Uninstall-Profile -All to remove everything.' -ForegroundColor Yellow
         }
     }
+    Restart-TerminalToApply -Message "Uninstall complete. Restarting terminal..."
 }
 
 function path { $env:PATH -split ';' | Where-Object { $_ } }
@@ -1810,7 +1880,7 @@ function weather {
     try {
         $loc = if ($City) {
             $geo = Invoke-RestMethod "https://geocoding-api.open-meteo.com/v1/search?name=$encoded&count=1" -TimeoutSec 5
-            if (-not $geo -or -not $geo.results) { Write-Error "City '$City' not found."; return }
+            if (-not $geo -or -not $geo.results -or @($geo.results).Count -eq 0) { Write-Error "City '$City' not found."; return }
             $geo.results[0]
         }
         else {
@@ -1826,7 +1896,7 @@ function weather {
         $wx = Invoke-RestMethod "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,weather_code" -TimeoutSec 5
         if (-not $wx -or -not $wx.current) { Write-Error "Weather API returned no data."; return }
         $temp = $wx.current.temperature_2m
-        $unit = $wx.current_units.temperature_2m
+        $unit = if ($wx.current_units -and $wx.current_units.temperature_2m) { $wx.current_units.temperature_2m } else { 'C' }
         Write-Host "$($loc.name): ${temp}${unit}" -ForegroundColor Cyan
     }
     catch {
@@ -2202,6 +2272,7 @@ function ipinfo {
     $url = if ($IpAddress) { "http://ip-api.com/json/$IpAddress" } else { "http://ip-api.com/json/" }
     try {
         $info = Invoke-RestMethod -Uri $url -TimeoutSec 10
+        if (-not $info) { Write-Error "IP lookup returned no data."; return }
         if ($info.status -eq 'fail') { Write-Error "Lookup failed: $($info.message)"; return }
         Write-Host "  IP:       $($info.query)" -ForegroundColor White
         Write-Host "  Location: $($info.city), $($info.regionName), $($info.country)" -ForegroundColor White
@@ -2255,7 +2326,7 @@ function whois {
     try {
         $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$Domain" -TimeoutSec 10
         Write-Host "  Domain:     $($rdap.ldhName)" -ForegroundColor White
-        Write-Host "  Status:     $($rdap.status -join ', ')" -ForegroundColor White
+        Write-Host "  Status:     $(@($rdap.status) -join ', ')" -ForegroundColor White
         if ($rdap.entities) {
             $registrar = $rdap.entities | Where-Object { $_.roles -contains 'registrar' } | Select-Object -First 1
             if ($registrar -and $registrar.vcardArray -and @($registrar.vcardArray).Count -gt 1) {
@@ -2263,7 +2334,8 @@ function whois {
                 if ($fn) { Write-Host "  Registrar:  $fn" -ForegroundColor White }
             }
         }
-        foreach ($ev in $rdap.events) {
+        foreach ($ev in @($rdap.events)) {
+            if (-not $ev) { continue }
             $label = switch ($ev.eventAction) {
                 'registration'    { 'Registered' }
                 'expiration'      { 'Expires' }
@@ -2444,8 +2516,10 @@ if ($isInteractive) {
         if (Test-Path $profileConfigPath) {
             try {
                 $cfg = Get-Content $profileConfigPath -Raw | ConvertFrom-Json
-                if ($cfg.theme.name) { $themeName = $cfg.theme.name }
-                if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
+                if ($cfg -and $cfg.theme) {
+                    if ($cfg.theme.name) { $themeName = $cfg.theme.name }
+                    if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
+                }
             }
             catch { Write-Verbose "Failed to parse theme.json: $_" }
         }
@@ -2453,8 +2527,10 @@ if ($isInteractive) {
         if (Test-Path $userSettingsStartup) {
             try {
                 $userCfg = Get-Content $userSettingsStartup -Raw | ConvertFrom-Json
-                if ($userCfg.theme.name) { $themeName = $userCfg.theme.name }
-                if ($userCfg.theme.url) { $themeUrl = $userCfg.theme.url }
+                if ($userCfg -and $userCfg.theme) {
+                    if ($userCfg.theme.name) { $themeName = $userCfg.theme.name }
+                    if ($userCfg.theme.url) { $themeUrl = $userCfg.theme.url }
+                }
             }
             catch { Write-Verbose "Failed to parse user-settings.json: $_" }
         }
@@ -2464,8 +2540,10 @@ if ($isInteractive) {
                 $configUrl = "$repo_root/$repo_name/main/theme.json"
                 Invoke-RestMethod -Uri $configUrl -OutFile $profileConfigPath -TimeoutSec 5 -ErrorAction Stop
                 $cfg = Get-Content $profileConfigPath -Raw | ConvertFrom-Json
-                if ($cfg.theme.name) { $themeName = $cfg.theme.name }
-                if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
+                if ($cfg -and $cfg.theme) {
+                    if ($cfg.theme.name) { $themeName = $cfg.theme.name }
+                    if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
+                }
             }
             catch { Write-Verbose "Could not recover theme.json from repo: $_" }
         }
@@ -2495,41 +2573,49 @@ if ($isInteractive) {
             }
         }
         if ($localThemePath -and (Test-Path $localThemePath)) {
-            # Resolve OMP's internal cache directory (used for stale cache cleanup below)
-            $ompInternalDir = (Resolve-Path (Join-Path $env:LOCALAPPDATA 'Packages\ohmyposh.cli_*\LocalCache\Local\oh-my-posh') -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+            # Resolve OMP's internal cache directory (used for stale cache cleanup below); non-blocking
+            $ompInternalDir = $null
+            try {
+                $ompInternalDir = (Resolve-Path (Join-Path $env:LOCALAPPDATA 'Packages\ohmyposh.cli_*\LocalCache\Local\oh-my-posh') -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+            }
+            catch { }
             # Cache the OMP init script so we don't shell out every startup.
             # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
-            # PERF: Defer `oh-my-posh version` (~2-3s) until we know the cache is missing/stale.
+            # PERF: Defer `oh-my-posh version` until we know the cache is missing/stale; use timeout to avoid hangs.
             # When the cache exists, validate using only the theme path portion of the header
             # (version changes are handled by Update-Tools which deletes the cache on upgrade).
             $ompCachePath = Join-Path $cacheDir "omp-init.ps1"
             $cacheValid = $false
             if (Test-Path $ompCachePath) {
-                $fileSize = (Get-Item $ompCachePath).Length
-                if ($fileSize -gt 0) {
-                    $cacheContent = Get-Content $ompCachePath -Raw
-                    $firstLine = ($cacheContent -split "`n", 2)[0]
-                    # Fast check: verify header references correct theme path
-                    # Header format: # OMP_CACHE: <version> | <theme_path> - compare path case-insensitively (Windows)
-                    $headerPath = $null
-                    if ($firstLine -match '^# OMP_CACHE: .+ \| (.+)$') { $headerPath = $Matches[1].Trim() }
-                    $pathMatches = $headerPath -and [string]::Equals($headerPath, $localThemePath, [StringComparison]::OrdinalIgnoreCase)
-                    # Also verify that the OMP internal init file referenced in the cache still exists.
-                    # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
-                    # deleting OMP's internal init script and breaking the cached redirect.
-                    if ($pathMatches) {
-                        $ompInternalPath = [regex]::Match($cacheContent, "& '([^']+)'").Groups[1].Value
-                        if ($ompInternalPath -and (Test-Path -LiteralPath $ompInternalPath)) {
-                            $cacheValid = $true
+                try {
+                    $fileSize = (Get-Item $ompCachePath).Length
+                    if ($fileSize -gt 0) {
+                        $cacheContent = Get-Content $ompCachePath -Raw -ErrorAction Stop
+                        $firstLine = ($cacheContent -split "`n", 2)[0]
+                        # Fast check: verify header references correct theme path
+                        # Header format: # OMP_CACHE: <version> | <theme_path> - compare path case-insensitively (Windows)
+                        $headerPath = $null
+                        if ($firstLine -match '^# OMP_CACHE: .+ \| (.+)$') { $headerPath = $Matches[1].Trim() }
+                        $pathMatches = $headerPath -and [string]::Equals($headerPath, $localThemePath, [StringComparison]::OrdinalIgnoreCase)
+                        # Also verify that the OMP internal init file referenced in the cache still exists.
+                        # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
+                        # deleting OMP's internal init script and breaking the cached redirect.
+                        if ($pathMatches) {
+                            $ompInternalPath = [regex]::Match($cacheContent, "& '([^']+)'").Groups[1].Value
+                            if ($ompInternalPath -and (Test-Path -LiteralPath $ompInternalPath)) {
+                                $cacheValid = $true
+                            }
                         }
                     }
+                }
+                catch {
+                    # Locked file, corrupt read, or missing internal path - treat as invalid
+                    $cacheValid = $false
                 }
                 if (-not $cacheValid) {
                     Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
                     # OMP bakes the theme into its binary cache (omp.cache) during `init --config`.
-                    # POSH_THEME env var is NOT respected by `print primary` - only --config during init matters.
-                    # When our cache is invalid (cleaner wiped the internal init file, or theme changed),
-                    # clear all OMP binary/session caches so the regenerated init bakes in the correct theme.
+                    # When our cache is invalid, clear OMP binary/session caches so regenerated init bakes in the correct theme.
                     if ($ompInternalDir) {
                         Remove-Item (Join-Path $ompInternalDir 'omp.cache') -Force -ErrorAction SilentlyContinue
                         Get-ChildItem $ompInternalDir -Filter 'pwsh.*.omp.cache' -ErrorAction SilentlyContinue |
@@ -2538,16 +2624,18 @@ if ($isInteractive) {
                 }
             }
             if (-not $cacheValid) {
-                # Only pay the cost of `oh-my-posh version` when we need to regenerate the cache
-                $ompVersion = try { ((oh-my-posh version) | Out-String).Trim() } catch { 'unknown' }
-                $ompCacheHeader = '# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath
-                $initScript = oh-my-posh init pwsh --config $localThemePath
+                # Run with timeout so OMP binary cannot hang the profile (av virus, slow disk, etc.)
+                $ompVersionResult = Invoke-WithTimeout -ScriptBlock { (oh-my-posh version 2>&1 | Out-String).Trim() } -TimeoutSec 10
+                $ompVersion = if ($ompVersionResult) { $ompVersionResult } else { 'unknown' }
+                $initScript = Invoke-WithTimeout -ScriptBlock { param($cfg) oh-my-posh init pwsh --config $cfg } -ArgumentList $localThemePath -TimeoutSec 15
                 if ($initScript) {
+                    $initStr = @($initScript) -join "`n"
                     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                    [System.IO.File]::WriteAllText($ompCachePath, ($ompCacheHeader + "`n" + ($initScript -join "`n")), $utf8NoBom)
+                    [System.IO.File]::WriteAllText($ompCachePath, ('# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath) + "`n" + $initStr, $utf8NoBom)
                 }
                 else {
-                    Write-Warning "oh-my-posh init produced no output. Cache not written."
+                    if (-not $ompVersionResult) { Write-Warning "oh-my-posh version timed out or failed; using fallback prompt." }
+                    else { Write-Warning "oh-my-posh init timed out or produced no output. Cache not written." }
                 }
             }
             try {
@@ -2555,20 +2643,16 @@ if ($isInteractive) {
             }
             catch {
                 Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
-                try {
-                    $ompVersion = try { ((oh-my-posh version) | Out-String).Trim() } catch { 'unknown' }
-                    $ompCacheHeader = '# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath
-                    $initScript = oh-my-posh init pwsh --config $localThemePath
-                    if ($initScript) {
-                        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                        [System.IO.File]::WriteAllText($ompCachePath, ($ompCacheHeader + "`n" + ($initScript -join "`n")), $utf8NoBom)
-                        . $ompCachePath
-                    }
-                    else {
-                        Write-Warning "oh-my-posh init produced no output."
-                    }
+                $ompVersionResult = Invoke-WithTimeout -ScriptBlock { (oh-my-posh version 2>&1 | Out-String).Trim() } -TimeoutSec 10
+                $ompVersion = if ($ompVersionResult) { $ompVersionResult } else { 'unknown' }
+                $initScript = Invoke-WithTimeout -ScriptBlock { param($cfg) oh-my-posh init pwsh --config $cfg } -ArgumentList $localThemePath -TimeoutSec 15
+                if ($initScript) {
+                    $initStr = @($initScript) -join "`n"
+                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                    [System.IO.File]::WriteAllText($ompCachePath, ('# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath) + "`n" + $initStr, $utf8NoBom)
+                    try { . $ompCachePath } catch { Write-Warning "Failed to initialize oh-my-posh: $_" }
                 }
-                catch {
+                else {
                     Write-Warning "Failed to initialize oh-my-posh: $_"
                 }
             }
@@ -2583,27 +2667,32 @@ if ($isInteractive) {
 if ($isInteractive) {
     if (Get-Command zoxide -ErrorAction SilentlyContinue) {
         $zoxideCachePath = Join-Path $cacheDir "zoxide-init.ps1"
-        # PERF: Defer `zoxide --version` (~1s) until cache is missing/stale.
+        # PERF: Defer version/init until cache is missing/stale; use timeout to avoid hangs.
         # When cache exists and is non-empty, trust it (Update-Tools deletes cache on upgrade).
         $cacheValid = $false
         if (Test-Path $zoxideCachePath) {
-            $fileSize = (Get-Item $zoxideCachePath).Length
-            if ($fileSize -gt 0) {
-                $cacheContent = Get-Content $zoxideCachePath -First 1
-                if ($cacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $cacheValid = $true }
+            try {
+                $fileSize = (Get-Item $zoxideCachePath).Length
+                if ($fileSize -gt 0) {
+                    $cacheContent = Get-Content $zoxideCachePath -First 1 -ErrorAction Stop
+                    if ($cacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $cacheValid = $true }
+                }
             }
+            catch { }
             if (-not $cacheValid) { Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue }
         }
         if (-not $cacheValid) {
-            $zoxideVersion = try { ((zoxide --version 2>$null) | Out-String).Trim() } catch { 'unknown' }
-            $initScript = (zoxide init --cmd z powershell | Out-String)
+            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock { (zoxide --version 2>$null | Out-String).Trim() } -TimeoutSec 5
+            $zoxideVersion = if ($zoxideVersionResult) { $zoxideVersionResult } else { 'unknown' }
+            $initScript = Invoke-WithTimeout -ScriptBlock { zoxide init --cmd z powershell | Out-String } -TimeoutSec 10
             if ($initScript) {
+                $zoxideInitStr = @($initScript) -join "`n"
                 $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
                 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                [System.IO.File]::WriteAllText($zoxideCachePath, ($zoxideHeader + "`n" + $initScript), $utf8NoBom)
+                [System.IO.File]::WriteAllText($zoxideCachePath, ($zoxideHeader + "`n" + $zoxideInitStr), $utf8NoBom)
             }
             else {
-                Write-Warning "zoxide init produced no output. Cache not written."
+                Write-Warning "zoxide init timed out or produced no output. Cache not written."
             }
         }
         try {
@@ -2611,20 +2700,17 @@ if ($isInteractive) {
         }
         catch {
             Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue
-            try {
-                $zoxideVersion = try { ((zoxide --version 2>$null) | Out-String).Trim() } catch { 'unknown' }
-                $initScript = (zoxide init --cmd z powershell | Out-String)
-                if ($initScript) {
-                    $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
-                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                    [System.IO.File]::WriteAllText($zoxideCachePath, ($zoxideHeader + "`n" + $initScript), $utf8NoBom)
-                    . $zoxideCachePath
-                }
-                else {
-                    Write-Warning "zoxide init produced no output."
-                }
+            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock { (zoxide --version 2>$null | Out-String).Trim() } -TimeoutSec 5
+            $zoxideVersion = if ($zoxideVersionResult) { $zoxideVersionResult } else { 'unknown' }
+            $initScript = Invoke-WithTimeout -ScriptBlock { zoxide init --cmd z powershell | Out-String } -TimeoutSec 10
+            if ($initScript) {
+                $zoxideInitStr = @($initScript) -join "`n"
+                $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
+                $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                [System.IO.File]::WriteAllText($zoxideCachePath, ($zoxideHeader + "`n" + $zoxideInitStr), $utf8NoBom)
+                try { . $zoxideCachePath } catch { Write-Warning "Failed to initialize zoxide: $_" }
             }
-            catch {
+            else {
                 Write-Warning "Failed to initialize zoxide: $_"
             }
         }

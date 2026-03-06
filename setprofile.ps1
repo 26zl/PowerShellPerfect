@@ -1,5 +1,9 @@
 # Copy profile to both PS7 and PS5 directories
 # Derive Documents root from $PROFILE (works correctly even when Documents is in OneDrive)
+if (-not $PSScriptRoot -or -not (Test-Path (Join-Path $PSScriptRoot "Microsoft.PowerShell_profile.ps1"))) {
+    Write-Error "Cannot find profile script. Run this script from the repo directory (e.g. .\setprofile.ps1)."
+    exit 1
+}
 $docsRoot = Split-Path (Split-Path $PROFILE)
 $profileDirs = @(
     Join-Path $docsRoot "PowerShell"          # PS7 (Core)
