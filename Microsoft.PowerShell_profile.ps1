@@ -2578,7 +2578,7 @@ if ($isInteractive) {
             try {
                 $ompInternalDir = (Resolve-Path (Join-Path $env:LOCALAPPDATA 'Packages\ohmyposh.cli_*\LocalCache\Local\oh-my-posh') -ErrorAction SilentlyContinue | Select-Object -First 1).Path
             }
-            catch { }
+            catch { Write-Verbose "OMP internal cache path not resolved." }
             # Cache the OMP init script so we don't shell out every startup.
             # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
             # PERF: Defer `oh-my-posh version` until we know the cache is missing/stale; use timeout to avoid hangs.
@@ -2619,7 +2619,7 @@ if ($isInteractive) {
                     if ($ompInternalDir) {
                         Remove-Item (Join-Path $ompInternalDir 'omp.cache') -Force -ErrorAction SilentlyContinue
                         Get-ChildItem $ompInternalDir -Filter 'pwsh.*.omp.cache' -ErrorAction SilentlyContinue |
-                            Remove-Item -Force -ErrorAction SilentlyContinue
+                        Remove-Item -Force -ErrorAction SilentlyContinue
                     }
                 }
             }
@@ -2678,7 +2678,7 @@ if ($isInteractive) {
                     if ($cacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $cacheValid = $true }
                 }
             }
-            catch { }
+            catch { Write-Verbose "Zoxide cache read failed (will regenerate)." }
             if (-not $cacheValid) { Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue }
         }
         if (-not $cacheValid) {
