@@ -186,6 +186,39 @@ function Invoke-DownloadWithRetry {
     }
 }
 
+# Resolve oh-my-posh executable path (Get-Command or known install locations)
+function Get-OhMyPoshExecutablePath {
+    $cmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Path) {
+        return $cmd.Path
+    }
+
+    $candidatePaths = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\oh-my-posh.exe'),
+        (Join-Path $env:ProgramFiles 'oh-my-posh\bin\oh-my-posh.exe')
+    )
+
+    $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Process')
+    if ($pf86) {
+        $candidatePaths += (Join-Path $pf86 'oh-my-posh\bin\oh-my-posh.exe')
+    }
+
+    foreach ($candidatePath in ($candidatePaths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidatePath)) { continue }
+
+        $candidateDir = Split-Path -Path $candidatePath -Parent
+        $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
+        if ($pathEntries -notcontains $candidateDir) {
+            $env:PATH = $candidateDir + ';' + $env:PATH
+        }
+
+        return $candidatePath
+    }
+
+    return $null
+}
+
 # Check for internet connectivity before proceeding (skip when using a local repo)
 if (-not $LocalRepo -and -not (Test-InternetConnection)) {
     return
@@ -537,6 +570,10 @@ function Install-WingetPackage {
         [Parameter(Mandatory)]
         [string]$Id
     )
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "  winget not found. Skipping $Name." -ForegroundColor Yellow
+        return $false
+    }
     $null = winget install -e --id $Id --accept-source-agreements --accept-package-agreements 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  $Name installed." -ForegroundColor Green
@@ -556,7 +593,14 @@ function Install-WingetPackage {
 
 # OMP Install
 Write-Host "[3/10] Oh My Posh" -ForegroundColor Cyan
-$ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
+$ompPath = Get-OhMyPoshExecutablePath
+if ($ompPath -and $ompPath -notlike ((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps') + '*')) {
+    Write-Host "  Oh My Posh already present at $ompPath (preserved)." -ForegroundColor Green
+    $ompInstalled = $true
+}
+else {
+    $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
+}
 if ($profileConfig -and $profileConfig.theme -and $profileConfig.theme.name -and $profileConfig.theme.url) {
     $themeInstalled = Install-OhMyPoshTheme -ThemeName $profileConfig.theme.name -ThemeUrl $profileConfig.theme.url
 }
@@ -567,9 +611,10 @@ else {
     Write-Host "  Skipped theme download ($reason)." -ForegroundColor Yellow
     $themeInstalled = $false
 }
-# Invalidate all cached init scripts so they regenerate with correct paths on next startup
-Get-ChildItem -Path $configCachePath -Filter "*-init.ps1" -ErrorAction SilentlyContinue |
-Remove-Item -Force -ErrorAction SilentlyContinue
+# Invalidate zoxide cache and any leftover legacy OMP init cache from older profile versions.
+foreach ($cacheFile in @('zoxide-init.ps1', 'omp-init.ps1')) {
+    Remove-Item (Join-Path $configCachePath $cacheFile) -Force -ErrorAction SilentlyContinue
+}
 
 # Font Install
 Write-Host "[4/10] Nerd Fonts" -ForegroundColor Cyan

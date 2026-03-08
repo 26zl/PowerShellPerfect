@@ -11,7 +11,7 @@ A PowerShell profile made to make a CLI nerd's life easier. Brings the Linux ter
 - **AI/CI sandbox safe** - detects non-interactive environments and suppresses network calls and UI setup automatically
 - **PS5 + PS7** - installs to both profile directories and handles every API difference between editions
 - **Hardened** - sensitive commands filtered from PSReadLine history; no secrets in source
-- **Fast startup** - init scripts cached to disk
+- **Fast startup** - prompt renders directly from a local Oh My Posh theme; only zoxide init is cached
 - **Survives updates** - personal overrides in `profile_user.ps1` and `user-settings.json` are never touched
 
 Originally forked and inspired by [ChrisTitusTech/powershell-profile](https://github.com/ChrisTitusTech/powershell-profile).
@@ -25,6 +25,10 @@ irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
 ```
 
 The terminal restarts automatically when setup finishes (new tab in Windows Terminal, or new window otherwise). For the best experience use [PowerShell 7](https://github.com/PowerShell/PowerShell).
+
+> **Recommended for Oh My Posh:** Install the x64 MSI release manually instead of relying on `winget`/Store (`WindowsApps`/MSIX). This repo preserves a direct MSI install and avoids the WindowsApps path when possible.
+
+If Oh My Posh is already installed directly via MSI, setup preserves that install instead of forcing it back through the WindowsApps/MSIX path.
 
 ### Manual Setup
 
@@ -53,7 +57,7 @@ When running locally you can override terminal defaults (not available via `irm 
 ```powershell
 Update-Profile      # Sync profile, theme, caches, and Windows Terminal settings
 Update-PowerShell   # Check for new PowerShell 7 releases
-Update-Tools        # Update all managed tools (Oh My Posh, eza, zoxide, fzf, bat, ripgrep)
+Update-Tools        # Update winget-managed tools; direct/MSI Oh My Posh installs are preserved
 ```
 
 `Update-Profile` requires hash verification by default. Confirm with `-ExpectedSha256 '<hash>'`, or use `-SkipHashCheck` to bypass. Use `-Force` to re-apply settings even when nothing changed upstream.
@@ -108,7 +112,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `Edit-Profile` / `ep` | Open profile in preferred editor |
 | `Update-Profile` | Sync profile, theme, caches, and WT settings |
 | `Update-PowerShell` | Check for new PowerShell 7 releases |
-| `Update-Tools` | Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep |
+| `Update-Tools` | Update winget-managed tools; direct/MSI Oh My Posh installs are preserved |
 | `reload` | Reload the PowerShell profile |
 | `Show-Help` | Show help in terminal |
 | `Uninstall-Profile` | Remove profile, caches, and WT changes (`-All` for everything) |

@@ -779,7 +779,10 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     # Internal helper functions that are not direct end-user commands
     $internalOnly = @(
         'Get-ExternalCommandPath'
+        'Get-OhMyPoshInstallInfo'
         'Get-OhMyPoshExecutablePath'
+        'Get-ProfileToolExecutablePath'
+        'Get-ProfileToolVersionText'
         'Invoke-OhMyPoshCommand'
         'Get-OhMyPoshPromptContext'
         'Get-OhMyPoshPromptText'

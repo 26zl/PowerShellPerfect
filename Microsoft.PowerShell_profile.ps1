@@ -38,12 +38,12 @@ if ($isAdmin -and -not [System.Environment]::GetEnvironmentVariable('POWERSHELL_
 # Cache: init-script filename in $cacheDir that must be deleted when the tool is upgraded (or $null).
 # VerCmd: argument(s) to get the tool version for pre/post-upgrade display.
 $script:ProfileTools = @(
-    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = $null; VerCmd = "version" }
-    @{ Name = "eza"; Id = "eza-community.eza"; Cmd = "eza"; Cache = $null; VerCmd = "--version" }
-    @{ Name = "zoxide"; Id = "ajeetdsouza.zoxide"; Cmd = "zoxide"; Cache = "zoxide-init.ps1"; VerCmd = "--version" }
-    @{ Name = "fzf"; Id = "junegunn.fzf"; Cmd = "fzf"; Cache = $null; VerCmd = "--version" }
-    @{ Name = "bat"; Id = "sharkdp.bat"; Cmd = "bat"; Cache = $null; VerCmd = "--version" }
-    @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version" }
+    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = $null; VerCmd = "version"; UpgradeStrategy = "preserve-direct" }
+    @{ Name = "eza"; Id = "eza-community.eza"; Cmd = "eza"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
+    @{ Name = "zoxide"; Id = "ajeetdsouza.zoxide"; Cmd = "zoxide"; Cache = "zoxide-init.ps1"; VerCmd = "--version"; UpgradeStrategy = "winget" }
+    @{ Name = "fzf"; Id = "junegunn.fzf"; Cmd = "fzf"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
+    @{ Name = "bat"; Id = "sharkdp.bat"; Cmd = "bat"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
+    @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
 )
 
 # Run a scriptblock in a job with timeout; returns result or $null on timeout/failure.
@@ -59,11 +59,10 @@ function Invoke-WithTimeout {
     try {
         $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
         $null = Wait-Job $job -Timeout $TimeoutSec
-        if ($job.State -eq 'Running') {
-            Stop-Job $job -ErrorAction SilentlyContinue
+        if ($job.State -ne 'Completed') {
+            if ($job.State -eq 'Running') { Stop-Job $job -ErrorAction SilentlyContinue }
             return $null
         }
-        if ($job.State -eq 'Failed') { return $null }
         Receive-Job $job
     }
     catch { return $null }
@@ -120,6 +119,25 @@ function Get-ExternalCommandPath {
     return $null
 }
 
+# Merge PSCustomObject overrides recursively so nested user/theme/terminal keys are preserved.
+function Merge-JsonObject {
+    param(
+        $base,
+        $override
+    )
+
+    if (-not $base -or -not $override) { return }
+    foreach ($prop in $override.PSObject.Properties) {
+        $baseVal = $base.PSObject.Properties[$prop.Name]
+        if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
+            Merge-JsonObject $baseVal.Value $prop.Value
+        }
+        else {
+            $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
+        }
+    }
+}
+
 # Specific helper to get the path to oh-my-posh executable for cache clearing (since it has a built-in cache clear command instead of a file-based cache)
 function Get-OhMyPoshExecutablePath {
     $resolvedPath = Get-ExternalCommandPath -CommandName 'oh-my-posh'
@@ -148,6 +166,70 @@ function Get-OhMyPoshExecutablePath {
         }
 
         return $candidatePath
+    }
+
+    return $null
+}
+
+# Return OMP install path and kind (windowsapps vs direct) for upgrade logic
+function Get-OhMyPoshInstallInfo {
+    $path = Get-OhMyPoshExecutablePath
+    if (-not $path) {
+        return [PSCustomObject]@{
+            Path        = $null
+            InstallKind = 'missing'
+        }
+    }
+
+    $windowsAppsRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    $installKind = if ($path -like "$windowsAppsRoot*") { 'windowsapps' } else { 'direct' }
+    return [PSCustomObject]@{
+        Path        = $path
+        InstallKind = $installKind
+    }
+}
+
+# Resolve executable path for a profile tool (OMP uses Get-OhMyPoshInstallInfo, others use Get-Command)
+function Get-ProfileToolExecutablePath {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Tool
+    )
+
+    if ($Tool.Cmd -eq 'oh-my-posh') {
+        return (Get-OhMyPoshInstallInfo).Path
+    }
+
+    return Get-ExternalCommandPath -CommandName $Tool.Cmd
+}
+
+# Get version string for a profile tool by running its VerCmd
+function Get-ProfileToolVersionText {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Tool,
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath
+    )
+
+    $versionArgs = @()
+    if ($Tool.VerCmd -is [System.Array]) {
+        $versionArgs = @($Tool.VerCmd)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$Tool.VerCmd)) {
+        $versionArgs = @([string]$Tool.VerCmd)
+    }
+
+    try {
+        $versionLine = & $ExecutablePath @versionArgs 2>$null |
+            Where-Object { $_ -match '\d+\.\d+' } |
+            Select-Object -First 1
+        if ($versionLine) {
+            return $versionLine.Trim()
+        }
+    }
+    catch {
+        return $null
     }
 
     return $null
@@ -216,7 +298,7 @@ function Invoke-OhMyPoshCommand {
     }
 }
 
-# Gather context for oh-my-posh prompt rendering, including error code, execution time, stack count, terminal width, and non-filesystem working directory. 
+# Gather context for oh-my-posh prompt rendering, including error code, execution time, stack count, terminal width, and non-filesystem working directory.
 # This is used to provide consistent context to oh-my-posh for prompt rendering without relying on opaque internal state or caches.
 function Get-OhMyPoshPromptContext {
     param(
@@ -305,12 +387,12 @@ function Get-OhMyPoshPromptContext {
     return [PSCustomObject]$context
 }
 
-# Get the prompt text from oh-my-posh by invoking the executable with explicit arguments and context. 
+# Get the prompt text from oh-my-posh by invoking the executable with explicit arguments and context.
 # This avoids relying on opaque internal state or caches for prompt rendering, and allows consistent prompts even in non-interactive contexts (like SSH or CI) where init scripts may not run.
 function Get-OhMyPoshPromptText {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('primary', 'secondary', 'transient', 'debug', 'right', 'tooltip', 'valid', 'error', 'preview')]
+        [ValidateSet('primary', 'secondary')]
         [string]$Type,
         [Parameter(Mandatory)]
         [string]$ExecutablePath,
@@ -334,7 +416,7 @@ function Get-OhMyPoshPromptText {
         "--shell-version=$($PSVersionTable.PSVersion.ToString())"
     )
 
-    if ($Type -eq 'primary' -or $Type -eq 'debug' -or $Type -eq 'transient') {
+    if ($Type -eq 'primary') {
         $context = Get-OhMyPoshPromptContext -OriginalSuccess:$OriginalSuccess -OriginalLastExitCode $OriginalLastExitCode
         $arguments += @(
             "--status=$($context.ErrorCode)"
@@ -603,20 +685,6 @@ function Update-Profile {
             catch {
                 Write-Warning "Corrupt cached terminal config removed: $cachedTerminalConfig"
                 Remove-Item $cachedTerminalConfig -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
-        function Merge-JsonObject($base, $override) {
-            if (-not $base -or -not $override) { return }
-            foreach ($prop in $override.PSObject.Properties) {
-                $baseVal = $base.PSObject.Properties[$prop.Name]
-                if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
-                    Merge-JsonObject $baseVal.Value $prop.Value
-                }
-                else {
-                    $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
-                }
             }
         }
 
@@ -903,7 +971,7 @@ function Update-Profile {
 
         # Phase 7: Install missing tools
         if (Get-Command winget -ErrorAction SilentlyContinue) {
-            $missing = $script:ProfileTools | Where-Object { -not (Get-Command $_.Cmd -ErrorAction SilentlyContinue) }
+            $missing = $script:ProfileTools | Where-Object { -not (Get-ProfileToolExecutablePath -Tool $_) }
             if ($missing) {
                 Write-Host "Installing missing tools..." -ForegroundColor Cyan
                 $installedTools = @()
@@ -1031,24 +1099,52 @@ function Update-PowerShell {
         }
     }
 }
-# Update installed profile tools via winget (skips tools not present on this machine)
+# Update installed profile tools via winget, while preserving direct/MSI Oh My Posh installs.
 function Update-Tools {
-    $installed = $script:ProfileTools | Where-Object { Get-Command $_.Cmd -ErrorAction SilentlyContinue }
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Warning "winget not found. Update-Tools only supports winget-managed upgrades."
+        return
+    }
+
+    $installed = foreach ($tool in $script:ProfileTools) {
+        $toolPath = Get-ProfileToolExecutablePath -Tool $tool
+        if ($toolPath) {
+            [PSCustomObject]@{
+                Tool           = $tool
+                ExecutablePath = $toolPath
+            }
+        }
+    }
+
     if (-not $installed) {
         Write-Host "No profile tools detected. Run Update-Profile to install them." -ForegroundColor Yellow
         return
     }
     $upgraded = 0
     $failed = 0
-    foreach ($tool in $installed) {
+    $preserved = 0
+    foreach ($toolEntry in $installed) {
+        $tool = $toolEntry.Tool
+        $toolPath = $toolEntry.ExecutablePath
+
+        if ($tool.UpgradeStrategy -eq 'preserve-direct' -and $tool.Cmd -eq 'oh-my-posh') {
+            $ompInstall = Get-OhMyPoshInstallInfo
+            if ($ompInstall.InstallKind -eq 'direct') {
+                Write-Host "Skipping $($tool.Name) update to preserve direct/MSI install at $($ompInstall.Path)." -ForegroundColor DarkGray
+                $preserved++
+                continue
+            }
+        }
+
         # Capture pre-upgrade version
-        $oldVer = try { (& $tool.Cmd $tool.VerCmd 2>$null | Where-Object { $_ -match '\d+\.\d+' } | Select-Object -First 1).Trim() } catch { $null }
+        $oldVer = Get-ProfileToolVersionText -Tool $tool -ExecutablePath $toolPath
         Write-Host "Updating $($tool.Name)..." -ForegroundColor Cyan
         winget upgrade --id $tool.Id --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -eq 0) {
             # Refresh PATH so the new binary is found for version check
             $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-            $newVer = try { (& $tool.Cmd $tool.VerCmd 2>$null | Where-Object { $_ -match '\d+\.\d+' } | Select-Object -First 1).Trim() } catch { $null }
+            $newToolPath = Get-ProfileToolExecutablePath -Tool $tool
+            $newVer = if ($newToolPath) { Get-ProfileToolVersionText -Tool $tool -ExecutablePath $newToolPath } else { $null }
             if ($newVer -and $oldVer -and $newVer -ne $oldVer) {
                 Write-Host "  $($tool.Name): $oldVer -> $newVer" -ForegroundColor Green
                 if ($tool.Cache) {
@@ -1069,7 +1165,12 @@ function Update-Tools {
         Write-Warning "$failed tool(s) failed to update. Check the output above."
     }
     if ($upgraded -eq 0 -and $failed -eq 0) {
-        Write-Host "All tools are up to date." -ForegroundColor Green
+        if ($preserved -gt 0) {
+            Write-Host "All winget-managed tools are up to date. $preserved tool(s) were preserved." -ForegroundColor Green
+        }
+        else {
+            Write-Host "All tools are up to date." -ForegroundColor Green
+        }
     }
 }
 
@@ -2949,6 +3050,7 @@ $scriptblock = {
         'deno' = @('run', 'compile', 'test', 'lint', 'fmt', 'cache', 'info', 'doc', 'upgrade')
     }
 
+    if (-not $commandAst.CommandElements -or $commandAst.CommandElements.Count -eq 0) { return }
     $command = $commandAst.CommandElements[0].Value
     if ($customCompletions.ContainsKey($command)) {
         $customCompletions[$command] | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -3095,7 +3197,7 @@ if ($isInteractive) {
         }
     }
     else {
-        Write-Warning "oh-my-posh not found. Install it with: winget install JanDeDobbeleer.OhMyPosh"
+        Write-Warning "oh-my-posh not found. Install the MSI build or use: winget install JanDeDobbeleer.OhMyPosh"
     }
 }
 
@@ -3187,7 +3289,7 @@ ${g}Edit-Profile${r} / ${g}ep${r} - Open profile in preferred editor.
 ${g}edit${r} <file> - Open file in preferred editor.
 ${g}Update-Profile${r} - Sync profile, theme, caches, and WT settings. Use -Force to re-apply.
 ${g}Update-PowerShell${r} - Check for new PowerShell releases.
-${g}Update-Tools${r} - Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep.
+${g}Update-Tools${r} - Update winget-managed tools; direct/MSI Oh My Posh installs are preserved.
 ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
 ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.

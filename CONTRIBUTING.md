@@ -40,6 +40,7 @@ All code must work under both PowerShell 5.1 and 7+. Key differences:
 ### Adding a New Tool
 
 1. Add an entry to the `$script:ProfileTools` array in `Microsoft.PowerShell_profile.ps1` with `Name`, `Id` (winget), `Cmd`, `Cache`, and `VerCmd`
+   Also set `UpgradeStrategy` (`winget` for normal tools, `preserve-direct` only when a direct/MSI install must not be pushed back through winget).
 2. Add a numbered install step in `setup.ps1` (it cannot read `ProfileTools`)
 
 ## Running the Linter
