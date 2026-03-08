@@ -122,7 +122,35 @@ function Get-ExternalCommandPath {
 
 # Specific helper to get the path to oh-my-posh executable for cache clearing (since it has a built-in cache clear command instead of a file-based cache)
 function Get-OhMyPoshExecutablePath {
-    Get-ExternalCommandPath -CommandName 'oh-my-posh'
+    $resolvedPath = Get-ExternalCommandPath -CommandName 'oh-my-posh'
+    if ($resolvedPath) {
+        return $resolvedPath
+    }
+
+    $candidatePaths = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\oh-my-posh.exe'),
+        (Join-Path $env:ProgramFiles 'oh-my-posh\bin\oh-my-posh.exe')
+    )
+
+    $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Process')
+    if ($pf86) {
+        $candidatePaths += (Join-Path $pf86 'oh-my-posh\bin\oh-my-posh.exe')
+    }
+
+    foreach ($candidatePath in ($candidatePaths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidatePath)) { continue }
+
+        $candidateDir = Split-Path -Path $candidatePath -Parent
+        $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
+        if ($pathEntries -notcontains $candidateDir) {
+            $env:PATH = $candidateDir + ';' + $env:PATH
+        }
+
+        return $candidatePath
+    }
+
+    return $null
 }
 
 # Invoke oh-my-posh with explicit UTF-8 stdio and explicit arguments so prompt rendering
@@ -188,6 +216,8 @@ function Invoke-OhMyPoshCommand {
     }
 }
 
+# Gather context for oh-my-posh prompt rendering, including error code, execution time, stack count, terminal width, and non-filesystem working directory. 
+# This is used to provide consistent context to oh-my-posh for prompt rendering without relying on opaque internal state or caches.
 function Get-OhMyPoshPromptContext {
     param(
         [bool]$OriginalSuccess,
@@ -196,11 +226,11 @@ function Get-OhMyPoshPromptContext {
     )
 
     $context = [ordered]@{
-        NoExitCode   = $true
-        ErrorCode    = 0
+        NoExitCode    = $true
+        ErrorCode     = 0
         ExecutionTime = 0
-        StackCount   = 0
-        NonFSWD      = $null
+        StackCount    = 0
+        NonFSWD       = $null
         TerminalWidth = 0
     }
 
@@ -254,8 +284,8 @@ function Get-OhMyPoshPromptContext {
     $invocationInfo = $null
     try {
         $invocationInfo = $global:Error |
-            Where-Object { $_.GetType().Name -eq 'ErrorRecord' } |
-            Select-Object -First 1 -ExpandProperty InvocationInfo
+        Where-Object { $_.GetType().Name -eq 'ErrorRecord' } |
+        Select-Object -First 1 -ExpandProperty InvocationInfo
     }
     catch {
         $invocationInfo = $null
@@ -275,6 +305,8 @@ function Get-OhMyPoshPromptContext {
     return [PSCustomObject]$context
 }
 
+# Get the prompt text from oh-my-posh by invoking the executable with explicit arguments and context. 
+# This avoids relying on opaque internal state or caches for prompt rendering, and allows consistent prompts even in non-interactive contexts (like SSH or CI) where init scripts may not run.
 function Get-OhMyPoshPromptText {
     param(
         [Parameter(Mandatory)]
@@ -815,7 +847,7 @@ function Update-Profile {
                                 $wt | Add-Member -NotePropertyName "actions" -NotePropertyValue @() -Force
                             }
                             foreach ($kb in $terminalConfig.keybindings) {
-                                if (-not $kb) { continue }
+                                if (-not $kb -or [string]::IsNullOrWhiteSpace($kb.keys)) { continue }
                                 $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
                                 if ($wt.PSObject.Properties['keybindings']) {
                                     # New WT format: separate keybindings array references actions by id
@@ -1841,7 +1873,9 @@ function vtscan {
             Write-Warning "Unexpected VirusTotal response (missing analysis stats)."
             return
         }
-        $mal = $stats.malicious; $total = $mal + $stats.undetected + $stats.harmless + $stats.suspicious + $stats.timeout
+        $mal = [int]$stats.malicious
+        $total = [int]$stats.malicious + [int]$stats.undetected + [int]$stats.harmless + [int]$stats.suspicious + [int]$stats.timeout
+        if ($total -eq 0) { $total = 1 }
         $color = if ($mal -eq 0) { 'Green' } elseif ($mal -le 5) { 'Yellow' } else { 'Red' }
         Write-Host "Detections: $mal/$total" -ForegroundColor $color
         $vtLink = "https://www.virustotal.com/gui/file/$sha/detection"

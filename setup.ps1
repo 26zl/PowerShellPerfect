@@ -495,7 +495,7 @@ else {
     Write-Host "  Skipped (non-interactive). Default: code, notepad" -ForegroundColor Yellow
 }
 
-# Function to download Oh My Posh theme locally
+# Function to download Oh My Posh theme locally (skips download if file exists and is valid JSON)
 function Install-OhMyPoshTheme {
     param (
         [Parameter(Mandatory)]
@@ -505,9 +505,21 @@ function Install-OhMyPoshTheme {
     )
     $themeFilePath = Join-Path $configCachePath "$ThemeName.omp.json"
     try {
-        Invoke-DownloadWithRetry -Uri $ThemeUrl -OutFile $themeFilePath
-        $null = Get-Content $themeFilePath -Raw | ConvertFrom-Json
-        Write-Host "  Theme '$ThemeName' downloaded." -ForegroundColor Green
+        $alreadyValid = $false
+        if (Test-Path -LiteralPath $themeFilePath -PathType Leaf) {
+            try {
+                $null = Get-Content $themeFilePath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $alreadyValid = $true
+            } catch { $null = $_ }
+        }
+        if (-not $alreadyValid) {
+            Invoke-DownloadWithRetry -Uri $ThemeUrl -OutFile $themeFilePath
+            $null = Get-Content $themeFilePath -Raw | ConvertFrom-Json
+            Write-Host "  Theme '$ThemeName' downloaded." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  Theme '$ThemeName' already present." -ForegroundColor Green
+        }
         return $true
     }
     catch {
@@ -718,7 +730,7 @@ if (Test-Path $wtSettingsPath) {
                 $wt | Add-Member -NotePropertyName "actions" -NotePropertyValue @() -Force
             }
             foreach ($kb in $terminalConfig.keybindings) {
-                if (-not $kb) { continue }
+                if (-not $kb -or [string]::IsNullOrWhiteSpace($kb.keys)) { continue }
                 $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
                 if ($wt.PSObject.Properties['keybindings']) {
                     # New WT format: separate keybindings array references actions by id
