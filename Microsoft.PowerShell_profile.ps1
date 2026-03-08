@@ -3,11 +3,16 @@
 
 $profileStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
+# Normalize agent detection: if the host sets a known agent/AI env var, set AI_AGENT so the rest of the profile only checks one name
+if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_CODE -or [bool]$env:CODEX -or [bool]$env:CODEX_AGENT)) {
+    $env:AI_AGENT = '1'
+}
+
 # Non-interactive mode detection (sandboxed/AI/CI/SSH-pipe sessions skip network calls and UI setup)
+# Set AI_AGENT (or CI) when running in any AI/agent/automation context to skip interactive init
 $isInteractive = [Environment]::UserInteractive -and
 -not [bool]$env:CI -and
--not [bool]$env:AGENT_ID -and
--not [bool]$env:CLAUDE_CODE -and
+-not [bool]$env:AI_AGENT -and
 -not ($host.Name -eq 'Default Host') -and
 -not $(try { [Console]::IsOutputRedirected } catch { $false }) -and
 -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '(?i)^-NonI' })
@@ -852,6 +857,9 @@ function Restart-TerminalToApply {
     }
     $shellName = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
     Write-Host $Message -ForegroundColor Green
+    Start-Sleep -Seconds 2
+    Write-Host "Press Enter to restart (or close this window to cancel)..." -ForegroundColor Yellow
+    try { $null = Read-Host } catch { $null = $_ }
     $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
     if ($wt) {
         Start-Process -FilePath "wt.exe" -ArgumentList "-w", "0", "-d", $dir, $shellName, "-NoExit"
@@ -1877,9 +1885,9 @@ function Uninstall-Profile {
     Clear-OhMyPoshCaches -Quiet
 
     # Phase 3: Uninstall PSFzf module
-    # Note: In CI/sandbox runs (env:CI/AGENT_ID), we skip uninstalling PSFzf to avoid
+    # Note: In CI or agent runs (env:CI or env:AI_AGENT), we skip uninstalling PSFzf to avoid
     # mutating the host user's real module installation when ci-functional.ps1 is run locally.
-    $isCiOrAgent = ($env:CI -or $env:AGENT_ID)
+    $isCiOrAgent = ($env:CI -or $env:AI_AGENT)
     if (Get-Module -ListAvailable -Name PSFzf) {
         if ($isCiOrAgent) {
             Write-Host '  Skipping PSFzf module uninstall under CI/agent environment.' -ForegroundColor DarkGray
@@ -2637,7 +2645,7 @@ Set-PSReadLineOption @PSReadLineOptions
 # PSReadLine features that require an interactive console host
 if ($isInteractive -and (Get-Module PSReadLine)) {
     # Core-only prediction settings (PredictionSource/PredictionViewStyle don't exist on Desktop)
-    # Guard against hosts without VT support (e.g. AI/Codex terminals, redirected output)
+    # Guard against hosts without VT support (e.g. agent terminals, redirected output)
     if ($PSVersionTable.PSEdition -eq "Core") {
         $supportsPrediction = $false
         try {

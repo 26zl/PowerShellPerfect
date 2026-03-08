@@ -30,3 +30,4 @@ The following areas are in scope for security reports:
 - `Update-Profile` requires SHA-256 hash verification (or explicit `-SkipHashCheck`)
 - PSReadLine history filters out lines containing: `password`, `secret`, `token`, `api[_-]?key`, `connectionstring`, `credential`, `bearer`
 - Repository download URLs are centralized (not hardcoded inline)
+- When in CI or when `$env:AI_AGENT` is set, the profile and setup skip network calls and interactive prompts, reducing exposure in automated or AI/agent environments

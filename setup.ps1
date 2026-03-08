@@ -19,6 +19,11 @@ param(
     [switch]$CiMode
 )
 
+# Normalize agent detection (same as profile): if host set a known agent var, set AI_AGENT so we only check one name
+if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_CODE -or [bool]$env:CODEX -or [bool]$env:CODEX_AGENT)) {
+    $env:AI_AGENT = '1'
+}
+
 $RepoBase = "https://raw.githubusercontent.com/26zl/PowerShellPerfect/main"
 
 $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -45,7 +50,7 @@ if ($currentUserPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
 if (-not $isCiHost) {
     $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
     if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
-        $canPrompt = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID
+        $canPrompt = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
         if ($canPrompt) { try { $null = [Console]::KeyAvailable } catch { $canPrompt = $false } }
         if ($canPrompt) {
             $reply = Read-Host "  LocalMachine execution policy is '$machinePolicy'. Set to RemoteSigned for all users? [y/N]"
@@ -445,7 +450,7 @@ else {
 
 # Editor preference (interactive prompt writes $script:EditorPriority into profile_user.ps1)
 Write-Host "[2/10] Editor preference" -ForegroundColor Cyan
-$canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID
+$canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
 if ($canPromptEditor) {
     $chosenEditor = Select-PreferredEditor
@@ -757,11 +762,15 @@ else {
     Write-Host "Setup completed with some issues. Check the messages above." -ForegroundColor Yellow
 }
 Write-Host ""
-$canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID -and -not [bool]$env:CLAUDE_CODE
+# AI_AGENT or CI = skip "Press Enter to restart" (agent/AI/automation context)
+$canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptExit) { try { $null = [Console]::KeyAvailable } catch { $canPromptExit = $false } }
 # Same restart logic as profile's Restart-TerminalToApply: prefer WT (new tab), else pwsh/powershell. Applies for both .\setup.ps1 and irm | iex.
 if ($canPromptExit) {
     Write-Host "Setup applied. Restarting terminal..." -ForegroundColor Green
+    Start-Sleep -Seconds 2
+    Write-Host "Press Enter to restart (or close this window to cancel)..." -ForegroundColor Yellow
+    try { $null = Read-Host } catch { $null = $_ }
     $dir = (Get-Location).Path
     if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
         $dir = [Environment]::GetFolderPath('UserProfile')

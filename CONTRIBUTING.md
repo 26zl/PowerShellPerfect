@@ -58,6 +58,8 @@ Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule PSAvoidUsingWriteHost, PSAvo
 $env:CI = 'true'; . .\Microsoft.PowerShell_profile.ps1
 ```
 
+(Non-interactive mode is triggered by `$env:CI` or `$env:AI_AGENT`. Known agent env vars are normalized to `$env:AI_AGENT`.)
+
 ### PS5 Parse Check
 
 CI checks all `.ps1` files recursively. To match locally:
@@ -77,9 +79,10 @@ Get-ChildItem -Filter *.ps1 -Recurse | ForEach-Object { powershell -NoProfile -C
 
 ## CI Checks
 
-CI runs on push/PR to `main` with two jobs:
+CI runs on push/PR to `main` with three jobs:
 
-- **lint**: PSScriptAnalyzer, smoke test, PS5 parse, path/secret checks
+- **lint**: PSScriptAnalyzer, smoke test, PS5 parse, hardcoded-path check, non-ASCII/BOM/secrets checks
 - **install-flow**: JSON config validation, schema checks, Merge-JsonObject tests, WT merge mock, required function checks (`Test-InternetConnection`, `Install-NerdFonts`, `Install-OhMyPoshTheme`, `Install-WingetPackage`, `Merge-JsonObject`, `Select-PreferredEditor`, `Invoke-DownloadWithRetry`)
+- **functional**: Runs `ci-functional.ps1` (elevated): full install flow, sandbox install/execute/uninstall, and 100% command-probe coverage
 
-Both jobs must pass. CI also fails on hardcoded user paths and embedded secrets.
+All three jobs must pass. CI also fails on hardcoded user paths and embedded secrets.
