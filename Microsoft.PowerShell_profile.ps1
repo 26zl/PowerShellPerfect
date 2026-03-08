@@ -125,6 +125,202 @@ function Get-OhMyPoshExecutablePath {
     Get-ExternalCommandPath -CommandName 'oh-my-posh'
 }
 
+# Invoke oh-my-posh with explicit UTF-8 stdio and explicit arguments so prompt rendering
+# never depends on opaque internal init/cache state.
+function Invoke-OhMyPoshCommand {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    $process = New-Object System.Diagnostics.Process
+    $startInfo = $process.StartInfo
+    $startInfo.FileName = $ExecutablePath
+    if ($startInfo.PSObject.Properties.Match('ArgumentList').Count -gt 0) {
+        $Arguments | ForEach-Object { $null = $startInfo.ArgumentList.Add($_) }
+    }
+    else {
+        $escapedArgs = $Arguments | ForEach-Object {
+            $s = $_ -replace '(\\+)"', '$1$1"'
+            $s = $s -replace '(\\+)$', '$1$1'
+            $s = $s -replace '"', '\"'
+            "`"$s`""
+        }
+        $startInfo.Arguments = $escapedArgs -join ' '
+    }
+
+    $startInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    if ($PWD.Provider.Name -eq 'FileSystem') {
+        try {
+            if (Test-Path -LiteralPath $PWD.ProviderPath) {
+                $startInfo.WorkingDirectory = $PWD.ProviderPath
+            }
+        }
+        catch {
+            Write-Verbose "Failed to set oh-my-posh working directory: $_"
+        }
+    }
+
+    [void]$process.Start()
+
+    try {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stderr = $stderrTask.Result.Trim()
+        if ($stderr) {
+            $Host.UI.WriteErrorLine($stderr)
+        }
+
+        return $stdoutTask.Result
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Get-OhMyPoshPromptContext {
+    param(
+        [bool]$OriginalSuccess,
+        [AllowNull()]
+        [object]$OriginalLastExitCode
+    )
+
+    $context = [ordered]@{
+        NoExitCode   = $true
+        ErrorCode    = 0
+        ExecutionTime = 0
+        StackCount   = 0
+        NonFSWD      = $null
+        TerminalWidth = 0
+    }
+
+    try {
+        $locations = Get-Location -Stack
+        if ($locations) {
+            $context.StackCount = $locations.Count
+        }
+    }
+    catch {
+        $context.StackCount = 0
+    }
+
+    try {
+        if ($PWD.Provider.Name -ne 'FileSystem') {
+            $context.NonFSWD = $PWD.ToString()
+        }
+    }
+    catch {
+        $context.NonFSWD = $null
+    }
+
+    try {
+        $terminalWidth = $Host.UI.RawUI.WindowSize.Width
+        if ($terminalWidth) {
+            $context.TerminalWidth = $terminalWidth
+        }
+    }
+    catch {
+        $context.TerminalWidth = 0
+    }
+
+    $lastHistory = Get-History -ErrorAction Ignore -Count 1
+    if (($null -eq $lastHistory) -or ($script:OhMyPoshLastHistoryId -eq $lastHistory.Id)) {
+        return [PSCustomObject]$context
+    }
+
+    $script:OhMyPoshLastHistoryId = $lastHistory.Id
+    $context.NoExitCode = $false
+    try {
+        $context.ExecutionTime = [math]::Max(0, [int](($lastHistory.EndExecutionTime - $lastHistory.StartExecutionTime).TotalMilliseconds))
+    }
+    catch {
+        $context.ExecutionTime = 0
+    }
+
+    if ($OriginalSuccess) {
+        return [PSCustomObject]$context
+    }
+
+    $invocationInfo = $null
+    try {
+        $invocationInfo = $global:Error |
+            Where-Object { $_.GetType().Name -eq 'ErrorRecord' } |
+            Select-Object -First 1 -ExpandProperty InvocationInfo
+    }
+    catch {
+        $invocationInfo = $null
+    }
+
+    if ($null -ne $invocationInfo -and $invocationInfo.HistoryId -eq $lastHistory.Id) {
+        $context.ErrorCode = 1
+        return [PSCustomObject]$context
+    }
+
+    if ($OriginalLastExitCode -is [int] -and $OriginalLastExitCode -ne 0) {
+        $context.ErrorCode = $OriginalLastExitCode
+        return [PSCustomObject]$context
+    }
+
+    $context.ErrorCode = 1
+    return [PSCustomObject]$context
+}
+
+function Get-OhMyPoshPromptText {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('primary', 'secondary', 'transient', 'debug', 'right', 'tooltip', 'valid', 'error', 'preview')]
+        [string]$Type,
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+        [Parameter(Mandatory)]
+        [string]$ConfigPath,
+        [bool]$OriginalSuccess = $true,
+        [AllowNull()]
+        [object]$OriginalLastExitCode = 0
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        throw "oh-my-posh config not found: $ConfigPath"
+    }
+
+    $arguments = @(
+        'print'
+        $Type
+        '--config'
+        $ConfigPath
+        '--shell=pwsh'
+        "--shell-version=$($PSVersionTable.PSVersion.ToString())"
+    )
+
+    if ($Type -eq 'primary' -or $Type -eq 'debug' -or $Type -eq 'transient') {
+        $context = Get-OhMyPoshPromptContext -OriginalSuccess:$OriginalSuccess -OriginalLastExitCode $OriginalLastExitCode
+        $arguments += @(
+            "--status=$($context.ErrorCode)"
+            "--no-status=$($context.NoExitCode)"
+            "--execution-time=$($context.ExecutionTime)"
+            "--stack-count=$($context.StackCount)"
+            "--terminal-width=$($context.TerminalWidth)"
+            '--job-count=0'
+        )
+
+        if ($context.NonFSWD) {
+            $arguments += "--pswd=$($context.NonFSWD)"
+        }
+    }
+
+    return Invoke-OhMyPoshCommand -ExecutablePath $ExecutablePath -Arguments $arguments
+}
+
 # Clear oh-my-posh cache by either deleting legacy cache files or invoking the built-in cache clear command (if available).
 # Legacy cache files are detected by a special comment in the first line and are removed if found. The built-in command is used if the executable is available, and any errors during cache clearing are logged as warnings.
 function Clear-OhMyPoshCaches {
@@ -912,6 +1108,7 @@ $adminSuffix = if ($isAdmin) { " [ADMIN]" } else { "" }
 function prompt {
     if ($adminSuffix) { "[" + (Get-Location) + "] # " } else { "[" + (Get-Location) + "] $ " }
 }
+$script:FallbackPromptFunction = $Function:prompt
 $Host.UI.RawUI.WindowTitle = "PowerShell {0}$adminSuffix" -f $PSVersionTable.PSVersion.ToString()
 
 # Editor Configuration (lazy - resolves on first use)
@@ -2739,7 +2936,7 @@ if (Get-Command dotnet -ErrorAction SilentlyContinue) {
     Register-ArgumentCompleter -Native -CommandName dotnet -ScriptBlock $dotnetScriptblock
 }
 
-# Oh My Posh initialization (interactive only; no init-script caching for maximum reliability)
+# Oh My Posh initialization (interactive only; render with explicit --config every prompt)
 if ($isInteractive) {
     $ompExecutablePath = Get-OhMyPoshExecutablePath
     if ($ompExecutablePath) {
@@ -2790,18 +2987,69 @@ if ($isInteractive) {
         }
 
         if ($localThemePath -and (Test-Path $localThemePath)) {
-            Clear-OhMyPoshCaches -Quiet
             try {
-                $initScript = @((& $ompExecutablePath init pwsh --config $localThemePath) 2>&1)
-                if (-not $initScript) { throw 'oh-my-posh init produced no output' }
-                if ($LASTEXITCODE -ne 0) { throw "oh-my-posh init exited with code $LASTEXITCODE" }
-                $initText = @($initScript) -join "`n"
+                $null = Get-Content $localThemePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+                # Explicit render mode avoids oh-my-posh's internal config/session cache silently
+                # dropping back to the built-in default theme on some WindowsApps/MSIX installs.
+                $script:OhMyPoshExecutablePath = $ompExecutablePath
+                $script:OhMyPoshConfigPath = $localThemePath
+                $script:OhMyPoshLastHistoryId = $null
+                $env:VIRTUAL_ENV_DISABLE_PROMPT = 1
+                $env:PYENV_VIRTUALENV_DISABLE_PROMPT = 1
+                $env:POWERLINE_COMMAND = 'oh-my-posh'
+                $env:POSH_SHELL = 'pwsh'
+                $env:POSH_SHELL_VERSION = $PSVersionTable.PSVersion.ToString()
+                $env:CONDA_PROMPT_MODIFIER = $false
+
                 try {
-                    $initBlock = [scriptblock]::Create($initText)
-                    . $initBlock
+                    if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
+                        $secondaryPrompt = Get-OhMyPoshPromptText `
+                            -Type 'secondary' `
+                            -ExecutablePath $script:OhMyPoshExecutablePath `
+                            -ConfigPath $script:OhMyPoshConfigPath
+                        if (-not [string]::IsNullOrWhiteSpace($secondaryPrompt)) {
+                            Set-PSReadLineOption -ContinuationPrompt ($secondaryPrompt -join "`n")
+                        }
+                    }
                 }
                 catch {
-                    Write-Warning "Failed to initialize oh-my-posh with '$localThemePath': $_"
+                    Write-Verbose "Failed to set oh-my-posh continuation prompt: $_"
+                }
+
+                $Function:prompt = {
+                    $originalSuccess = $?
+                    $originalLastExitCode = $global:LASTEXITCODE
+                    try {
+                        $output = Get-OhMyPoshPromptText `
+                            -Type 'primary' `
+                            -ExecutablePath $script:OhMyPoshExecutablePath `
+                            -ConfigPath $script:OhMyPoshConfigPath `
+                            -OriginalSuccess:$originalSuccess `
+                            -OriginalLastExitCode $originalLastExitCode
+
+                        if ([string]::IsNullOrWhiteSpace($output)) {
+                            return & $script:FallbackPromptFunction
+                        }
+
+                        try {
+                            if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
+                                Set-PSReadLineOption -ExtraPromptLineCount (($output | Measure-Object -Line).Lines - 1)
+                            }
+                        }
+                        catch {
+                            Write-Verbose "Failed to update PSReadLine prompt line count: $_"
+                        }
+
+                        return ($output -join "`n")
+                    }
+                    catch {
+                        Write-Warning "Failed to render oh-my-posh prompt with '$($script:OhMyPoshConfigPath)': $_"
+                        return & $script:FallbackPromptFunction
+                    }
+                    finally {
+                        $global:LASTEXITCODE = $originalLastExitCode
+                    }
                 }
             }
             catch {

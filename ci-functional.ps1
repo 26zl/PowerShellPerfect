@@ -780,6 +780,9 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     $internalOnly = @(
         'Get-ExternalCommandPath'
         'Get-OhMyPoshExecutablePath'
+        'Invoke-OhMyPoshCommand'
+        'Get-OhMyPoshPromptContext'
+        'Get-OhMyPoshPromptText'
         'Merge-JsonObject'
         'Invoke-DownloadWithRetry'
         'Invoke-WithTimeout'
