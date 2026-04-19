@@ -15,7 +15,14 @@ foreach ($dir in $profileDirs) {
     if (!(Test-Path -Path $dir)) {
         New-Item -Path $dir -ItemType "directory" -Force | Out-Null
     }
-    Copy-Item (Join-Path $PSScriptRoot "Microsoft.PowerShell_profile.ps1") $dir
+    $targetProfile = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
+    # Mirror setup.ps1 backup behaviour so an existing profile is preserved before overwrite.
+    if (Test-Path -Path $targetProfile -PathType Leaf) {
+        $backupPath = Join-Path $dir "oldprofile.ps1"
+        Copy-Item -Path $targetProfile -Destination $backupPath -Force
+        Write-Host "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
+    }
+    Copy-Item -Path (Join-Path $PSScriptRoot "Microsoft.PowerShell_profile.ps1") -Destination $targetProfile -Force
     Write-Host "Profile copied to $dir" -ForegroundColor Green
 }
 if ([Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT) {

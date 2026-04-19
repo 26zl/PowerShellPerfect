@@ -38,7 +38,5 @@ profile_user.ps1
 .tmpcmd.ps1
 LastExecutionTime.txt
 
-# Local test/lint scripts
-lint2.ps1
-test.ps1
-rawhunt.ps1
+# Experimental / scratch files (underscore-prefixed stay untracked)
+_*.ps1

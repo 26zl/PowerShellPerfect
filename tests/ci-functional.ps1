@@ -8,7 +8,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+# This script lives in tests/. Resolve repo root (parent of tests/) so all relative
+# references to Microsoft.PowerShell_profile.ps1, setup.ps1, theme.json etc. still work.
+$repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
 
 $passed = 0
@@ -246,7 +248,7 @@ Invoke-TestCase -Name 'Full install flow on host (setup.ps1)' -Code {
     $isCiHost = [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
 
     if (-not $isElevated -and -not $isCiHost) {
-        throw 'setup.ps1 requires an elevated (Administrator) shell when run locally. Run ci-functional.ps1 from an elevated pwsh so the full install flow can be validated.'
+        throw 'setup.ps1 requires an elevated (Administrator) shell when run locally. Run tests/ci-functional.ps1 from an elevated pwsh so the full install flow can be validated.'
     }
 
     $setupPath = Join-Path $repoRoot 'setup.ps1'
@@ -452,21 +454,56 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Edit-Profile' -SkipReason 'Opens interactive editor'
         Invoke-CommandProbe -Command 'ep' -SkipReason 'Alias to Edit-Profile (opens interactive editor)'
         Invoke-CommandProbe -Command 'edit' -SkipReason 'Opens interactive editor'
-        Invoke-CommandProbe -Command 'Update-Profile' -SkipReason 'Network and mutating profile update flow'
-        Invoke-CommandProbe -Command 'Update-PowerShell' -SkipReason 'Installs or upgrades shell binaries'
-        Invoke-CommandProbe -Command 'Update-Tools' -SkipReason 'Installs or upgrades external tools'
+        # Update flows are network/mutation-heavy; we can't run them end-to-end in CI, but at
+        # least verify the parameter contract so renames/removals don't silently break muscle
+        # memory, and drive the safe early-exit paths each function exposes.
+        Invoke-CommandProbe -Command 'Update-Profile' -Code {
+            $cmd = Get-Command Update-Profile
+            foreach ($p in @('Force', 'SkipHashCheck', 'ExpectedSha256', 'WhatIf')) {
+                if (-not $cmd.Parameters.ContainsKey($p)) { throw "Update-Profile missing expected parameter: $p" }
+            }
+            # -WhatIf must trip the ShouldProcess gate BEFORE the Phase 1 downloads so
+            # no psp-profile-*.ps1 / psp-theme-*.json / psp-terminal-*.json appears in %TEMP%.
+            $filters = @('psp-profile-*.ps1', 'psp-theme-*.json', 'psp-terminal-*.json')
+            $pre = foreach ($f in $filters) { Get-ChildItem -Path $env:TEMP -Filter $f -ErrorAction SilentlyContinue }
+            Update-Profile -WhatIf -Confirm:$false | Out-Null
+            $post = foreach ($f in $filters) { Get-ChildItem -Path $env:TEMP -Filter $f -ErrorAction SilentlyContinue }
+            if (@($post).Count -gt @($pre).Count) {
+                throw "Update-Profile -WhatIf created temp files (download ran): $(($post | Select-Object -ExpandProperty Name) -join ', ')"
+            }
+        }
+        Invoke-CommandProbe -Command 'Update-PowerShell' -Code {
+            # Safe early exits: PS5 prints a guidance message and returns; PS7 without winget
+            # prints a warning. Either way the function must not throw on first invocation.
+            Update-PowerShell *> $null
+        }
+        Invoke-CommandProbe -Command 'Update-Tools' -Code {
+            # Safe early exit when winget is absent; with winget we still need skip because
+            # it would actually mutate installed tools. Only run when winget is unavailable.
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+                Write-Host '        (skipping live invocation; winget present in CI host)' -ForegroundColor DarkGray
+            }
+            else {
+                Update-Tools *> $null
+            }
+            $cmd = Get-Command Update-Tools
+            if (-not $cmd) { throw 'Update-Tools missing' }
+        }
         Invoke-CommandProbe -Command 'Clear-ProfileCache' -Code {
             $origLocal = $env:LOCALAPPDATA
             try {
                 $fakeLocal = Join-Path $workspace 'localappdata'
                 $fakeCache = Join-Path $fakeLocal 'PowerShellProfile'
-                New-Item -ItemType Directory -Path $fakeCache -Force | Out-Null
+                $fakePlugins = Join-Path $fakeCache 'plugins'
+                New-Item -ItemType Directory -Path $fakePlugins -Force | Out-Null
                 [System.IO.File]::WriteAllText((Join-Path $fakeCache 'transient.cache'), 'x', $utf8NoBom)
                 [System.IO.File]::WriteAllText((Join-Path $fakeCache 'user-settings.json'), '{}', $utf8NoBom)
+                [System.IO.File]::WriteAllText((Join-Path $fakePlugins 'myplugin.ps1'), '# user plugin', $utf8NoBom)
                 $env:LOCALAPPDATA = $fakeLocal
                 Clear-ProfileCache
                 if (Test-Path (Join-Path $fakeCache 'transient.cache')) { throw 'Clear-ProfileCache did not remove transient file' }
                 if (-not (Test-Path (Join-Path $fakeCache 'user-settings.json'))) { throw 'Clear-ProfileCache removed user-settings.json' }
+                if (-not (Test-Path (Join-Path $fakePlugins 'myplugin.ps1'))) { throw 'Clear-ProfileCache removed user plugin' }
             }
             finally {
                 $env:LOCALAPPDATA = $origLocal
@@ -474,6 +511,27 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         }
         Invoke-CommandProbe -Command 'Clear-Cache' -Code { Clear-Cache -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Uninstall-Profile' -Code { Uninstall-Profile -All -WhatIf -Confirm:$false | Out-Null }
+        Invoke-CommandProbe -Command 'Invoke-ProfileWizard' -Code {
+            # SupportsShouldProcess lets us drive the invocation path without network download.
+            # -WhatIf returns before Invoke-DownloadWithRetry, so this is safe in CI.
+            # We also verify the ShouldProcess gate actually prevents the temp download by
+            # ensuring no psp-reconfigure-*.ps1 files exist in %TEMP% after the -WhatIf call.
+            $preFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+            Invoke-ProfileWizard -WhatIf -Confirm:$false | Out-Null
+            $postFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+            if ($postFiles.Count -gt $preFiles.Count) {
+                throw "Invoke-ProfileWizard -WhatIf created temp files it should not have: $($postFiles.Name -join ', ')"
+            }
+            $cmd = Get-Command Invoke-ProfileWizard
+            foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
+                if (-not $cmd.Parameters.ContainsKey($p)) { throw "Invoke-ProfileWizard missing expected parameter: $p" }
+            }
+        }
+        Invoke-CommandProbe -Command 'Reconfigure-Profile' -Code {
+            $alias = Get-Alias Reconfigure-Profile -ErrorAction SilentlyContinue
+            if (-not $alias) { throw 'Reconfigure-Profile alias missing' }
+            if ($alias.ResolvedCommandName -ne 'Invoke-ProfileWizard') { throw "Reconfigure-Profile points to $($alias.ResolvedCommandName), expected Invoke-ProfileWizard" }
+        }
         Invoke-CommandProbe -Command 'Invoke-DownloadWithRetry' -SkipReason 'Internal helper (covered by setup tests)'
         Invoke-CommandProbe -Command 'Invoke-WithTimeout' -SkipReason 'Internal helper (used by OMP/zoxide init)'
         Invoke-CommandProbe -Command 'Merge-JsonObject' -SkipReason 'Internal helper nested in Update-Profile'
@@ -594,6 +652,55 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             }
             finally { Set-Location $before }
         }
+        Invoke-CommandProbe -Command 'cdh' -Code {
+            # Seed the stack by cd'ing through two dirs, invoking Invoke-PromptStage
+            # manually since the probe does not render a prompt.
+            $before = Get-Location
+            try {
+                $sub = Join-Path $workspace 'cdh-probe'
+                New-Item -ItemType Directory -Path $sub -Force | Out-Null
+                Set-Location -LiteralPath $sub
+                Invoke-PromptStage
+                Set-Location -LiteralPath $workspace
+                Invoke-PromptStage
+                $out = cdh | Out-String
+                if ($out -notmatch 'cdh-probe') { throw "cdh output missing seeded entry: $out" }
+            }
+            finally { Set-Location $before }
+        }
+        Invoke-CommandProbe -Command 'cdb' -Code {
+            $before = Get-Location
+            try {
+                $sub = Join-Path $workspace 'cdb-probe'
+                New-Item -ItemType Directory -Path $sub -Force | Out-Null
+                Set-Location -LiteralPath $sub
+                Invoke-PromptStage
+                Set-Location -LiteralPath $workspace
+                Invoke-PromptStage
+                cdb 1
+                if ((Get-Location).Path -ne $sub) { throw "cdb 1 did not navigate back; got $((Get-Location).Path)" }
+            }
+            finally { Set-Location $before }
+        }
+        Invoke-CommandProbe -Command 'duration' -Code {
+            # Ensure a command is present in Get-History before calling duration
+            Get-Date | Out-Null
+            $out = duration | Out-String
+            if ([string]::IsNullOrWhiteSpace($out)) { throw 'duration produced no output' }
+        }
+        Invoke-CommandProbe -Command 'Test-ProfileHealth' -Code {
+            $report = Test-ProfileHealth
+            if (-not $report) { throw 'Test-ProfileHealth returned no rows' }
+            $expected = @('Tools', 'Caches', 'Config', 'PATH', 'Modules')
+            foreach ($cat in $expected) {
+                if (-not ($report | Where-Object Category -eq $cat)) { throw "Test-ProfileHealth missing category: $cat" }
+            }
+        }
+        Invoke-CommandProbe -Command 'psp-doctor' -Code {
+            $alias = Get-Alias psp-doctor -ErrorAction SilentlyContinue
+            if (-not $alias) { throw 'psp-doctor alias missing' }
+            if ($alias.ResolvedCommandName -ne 'Test-ProfileHealth') { throw "psp-doctor points to $($alias.ResolvedCommandName)" }
+        }
         Invoke-CommandProbe -Command 'bak' -Code {
             bak $textFile
             $baks = Get-ChildItem -Path $workspace -Filter 'sample.txt.*.bak' -ErrorAction SilentlyContinue
@@ -646,8 +753,8 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'speedtest' -SkipReason 'Long-running network benchmark'
         Invoke-CommandProbe -Command 'wifipass' -SkipReason 'Requires WLAN profile context and often elevation'
         Invoke-CommandProbe -Command 'hosts' -SkipReason 'Opens elevated editor UI'
-        Invoke-CommandProbe -Command 'winutil' -SkipReason 'Downloads and executes external script'
-        Invoke-CommandProbe -Command 'harden' -Code { harden | Out-Null }
+        Invoke-CommandProbe -Command 'winutil' -SkipReason 'Remote-script wrapper is unit-tested separately; live run intentionally skipped'
+        Invoke-CommandProbe -Command 'harden' -SkipReason 'Launches external hardening tool / GUI on developer machines'
 
         # Security and crypto
         $sha256 = $null
@@ -698,6 +805,22 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
 
         # Developer
         Invoke-CommandProbe -Command 'killport' -SkipReason 'Destructive process termination command'
+        Invoke-CommandProbe -Command 'Stop-ListeningPort' -SkipReason 'Interactive fzf picker; destructive'
+        Invoke-CommandProbe -Command 'killports' -SkipReason 'Alias to Stop-ListeningPort'
+        Invoke-CommandProbe -Command 'Find-FileLocker' -Code {
+            # Lock a temp file and verify Find-FileLocker reports our own PID.
+            $lockFile = Join-Path $workspace 'lock-probe.txt'
+            [System.IO.File]::WriteAllText($lockFile, 'x', $utf8NoBom)
+            $stream = [System.IO.File]::Open($lockFile, 'Open', 'ReadWrite', 'None')
+            try {
+                $lockers = @(Find-FileLocker $lockFile)
+                $selfPid = $PID
+                if (-not ($lockers | Where-Object PID -eq $selfPid)) { throw "Find-FileLocker did not report self PID $selfPid for locked file" }
+            }
+            finally { $stream.Close(); $stream.Dispose() }
+        }
+        Invoke-CommandProbe -Command 'Stop-StuckProcess' -SkipReason 'Destructive process termination'
+        Invoke-CommandProbe -Command 'Remove-LockedItem' -SkipReason 'Destructive: kills processes and deletes'
         Invoke-CommandProbe -Command 'http' -Code {
             $response = http "http://127.0.0.1:$httpPort/" -Method GET | Out-String
             if ($response -notmatch '"ok"\s*:\s*true') { throw "unexpected http response: $response" }
@@ -722,10 +845,27 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'dprune' -SkipReason 'Destructive: prunes docker resources'
 
         # SSH and remote
+        Invoke-CommandProbe -Command 'ssh' -SkipReason 'Wraps native ssh.exe; would initiate real TCP connect'
         Invoke-CommandProbe -Command 'Copy-SshKey' -SkipReason 'Requires reachable remote host'
         Invoke-CommandProbe -Command 'ssh-copy-key' -SkipReason 'Alias requiring reachable remote host'
         Invoke-CommandProbe -Command 'keygen' -SkipReason 'Writes SSH keys to user profile'
         Invoke-CommandProbe -Command 'rdp' -SkipReason 'Opens Remote Desktop UI'
+        Invoke-CommandProbe -Command 'wsl' -SkipReason 'Wraps wsl.exe; would launch a distro shell'
+        Invoke-CommandProbe -Command 'Get-WslDistro' -Code {
+            # Parses wsl -l -v; safe to call. May return empty list if no distros installed on runner.
+            Get-WslDistro | Out-Null
+        }
+        Invoke-CommandProbe -Command 'Enter-WslHere' -SkipReason 'Opens interactive WSL shell'
+        Invoke-CommandProbe -Command 'wsl-here' -SkipReason 'Alias to Enter-WslHere (interactive)'
+        Invoke-CommandProbe -Command 'ConvertTo-WslPath' -SkipReason 'Requires at least one installed WSL distro'
+        Invoke-CommandProbe -Command 'ConvertTo-WindowsPath' -SkipReason 'Requires at least one installed WSL distro'
+        Invoke-CommandProbe -Command 'Stop-Wsl' -SkipReason 'Destructive: terminates running distros'
+        Invoke-CommandProbe -Command 'Get-WslIp' -SkipReason 'Requires a running WSL distro'
+        Invoke-CommandProbe -Command 'Get-WslFile' -SkipReason 'Requires a running WSL distro (UNC path access)'
+        Invoke-CommandProbe -Command 'Show-WslTree' -SkipReason 'Requires a running WSL distro'
+        Invoke-CommandProbe -Command 'wsl-tree' -SkipReason 'Alias to Show-WslTree; requires a running WSL distro'
+        Invoke-CommandProbe -Command 'Open-WslExplorer' -SkipReason 'Opens Windows Explorer; requires running distro'
+        Invoke-CommandProbe -Command 'wsl-explorer' -SkipReason 'Alias to Open-WslExplorer'
 
         # Clipboard
         Invoke-CommandProbe -Command 'cpy' -Code { cpy 'psp-ci-clipboard' } -SkipReason $clipboardSkipReason
@@ -736,6 +876,171 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         $invokeClipboardSkipReason = if ($clipboardSkipReason) { $clipboardSkipReason } else { 'Clipboard insertion behavior is host-dependent in headless sessions' }
         Invoke-CommandProbe -Command 'Invoke-Clipboard' -SkipReason $invokeClipboardSkipReason
         Invoke-CommandProbe -Command 'icb' -SkipReason $invokeClipboardSkipReason
+
+        # Sysadmin / Linux-feel
+        Invoke-CommandProbe -Command 'journal' -Code { journal -Count 5 | Out-Null }
+        Invoke-CommandProbe -Command 'lsblk' -Code { lsblk | Out-Null }
+        Invoke-CommandProbe -Command 'htop' -SkipReason 'Launches interactive TUI process viewer'
+        Invoke-CommandProbe -Command 'mtr' -SkipReason 'Long-running traceroute + per-hop ping loop'
+        Invoke-CommandProbe -Command 'fwallow' -SkipReason 'Mutates Windows Firewall rules (requires elevation)'
+        Invoke-CommandProbe -Command 'fwblock' -SkipReason 'Mutates Windows Firewall rules (requires elevation)'
+
+        # Cybersec
+        Invoke-CommandProbe -Command 'nscan' -SkipReason 'Requires nmap binary'
+        Invoke-CommandProbe -Command 'sigcheck' -Code {
+            $sysExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            if (-not (Test-Path $sysExe)) { throw "Expected signed host binary not found: $sysExe" }
+            sigcheck $sysExe | Out-Null
+        }
+        Invoke-CommandProbe -Command 'ads' -Code {
+            $adsFile = Join-Path $workspace 'ads-target.txt'
+            [System.IO.File]::WriteAllText($adsFile, 'primary', $utf8NoBom)
+            Set-Content -LiteralPath $adsFile -Stream 'zone.hint' -Value 'ci-marker'
+            $result = @(ads $adsFile)
+            $match = $result | Where-Object { $_.Stream -eq 'zone.hint' }
+            if (-not $match) { throw "ads did not return object for zone.hint stream" }
+        }
+        Invoke-CommandProbe -Command 'defscan' -SkipReason 'Triggers Windows Defender scan'
+        Invoke-CommandProbe -Command 'pwnd' -Code { pwnd 'password' | Out-Null }
+        Invoke-CommandProbe -Command 'certcheck' -Code { certcheck 'example.com' | Out-Null }
+        Invoke-CommandProbe -Command 'entropy' -Code { entropy $textFile | Out-Null }
+
+        # Developer+
+        Invoke-CommandProbe -Command 'serve' -SkipReason 'Long-running HTTP server (blocks)'
+        Invoke-CommandProbe -Command 'gitignore' -Code {
+            $before = Get-Location
+            try {
+                $giDir = Join-Path $workspace 'gi-target'
+                New-Item -ItemType Directory -Path $giDir -Force | Out-Null
+                Set-Location $giDir
+                gitignore 'python' | Out-Null
+                if (-not (Test-Path (Join-Path $giDir '.gitignore'))) { throw 'gitignore did not create .gitignore' }
+            }
+            finally { Set-Location $before }
+        }
+        Invoke-CommandProbe -Command 'gcof' -SkipReason 'Interactive fzf branch picker'
+        Invoke-CommandProbe -Command 'envload' -Code {
+            $envFile = Join-Path $workspace 'probe.env'
+            [System.IO.File]::WriteAllText($envFile, "PSP_ENVLOAD_TEST=ok`n# comment`nexport PSP_ENVLOAD_QUOTED=`"quoted value`"", $utf8NoBom)
+            envload $envFile | Out-Null
+            if ($env:PSP_ENVLOAD_TEST -ne 'ok') { throw "envload did not set PSP_ENVLOAD_TEST: $env:PSP_ENVLOAD_TEST" }
+            if ($env:PSP_ENVLOAD_QUOTED -ne 'quoted value') { throw "envload did not strip quotes: $env:PSP_ENVLOAD_QUOTED" }
+        }
+        Invoke-CommandProbe -Command 'tldr' -Code { tldr 'ls' | Out-Null }
+        Invoke-CommandProbe -Command 'repeat' -Code {
+            $script:repeatCount = 0
+            repeat 3 { $script:repeatCount++ } | Out-Null
+            if ($script:repeatCount -ne 3) { throw "repeat expected 3 iterations, got $script:repeatCount" }
+        }
+        Invoke-CommandProbe -Command 'mkvenv' -SkipReason 'Creates Python venv directory and activates it'
+
+        # Detection / AST
+        Invoke-CommandProbe -Command 'outline' -Code {
+            $entries = @(outline $profilePath)
+            $fnHit = $entries | Where-Object { $_.Kind -eq 'Function' -and $_.Name -eq 'Update-Profile' }
+            if (-not $fnHit) { throw 'outline did not emit Function entry for Update-Profile' }
+        }
+        Invoke-CommandProbe -Command 'psym' -Code { psym 'Update-Profile' $repoRoot | Out-Null }
+        Invoke-CommandProbe -Command 'lint' -SkipReason 'Requires PSScriptAnalyzer module; covered by lint job'
+        Invoke-CommandProbe -Command 'Find-DeadCode' -Code {
+            $fixture = Join-Path $workspace 'dead.ps1'
+            [System.IO.File]::WriteAllText($fixture, "function used { param(`$a, `$b) `$a }`nused 1 2", $utf8NoBom)
+            Find-DeadCode $fixture | Out-Null
+        }
+        Invoke-CommandProbe -Command 'Test-Profile' -Code { Test-Profile | Out-Null }
+        Invoke-CommandProbe -Command 'Get-PwshVersions' -Code { Get-PwshVersions | Out-Null }
+        Invoke-CommandProbe -Command 'modinfo' -Code {
+            $info = @(modinfo 'PSReadLine')
+            if (-not $info) { throw 'modinfo returned nothing for PSReadLine' }
+            if ($info[0].Name -ne 'PSReadLine') { throw "modinfo Name mismatch: $($info[0].Name)" }
+        }
+        Invoke-CommandProbe -Command 'psgrep' -Code { psgrep 'Update-Profile' $repoRoot -Kind Function | Out-Null }
+
+        # Extensibility
+        Invoke-CommandProbe -Command 'Register-ProfileHook' -Code {
+            $script:hookFired = 0
+            Register-ProfileHook -EventName 'OnProfileLoad' -Action { $script:hookFired++ }
+            if ($script:PSP.Hooks.OnProfileLoad.Count -lt 1) { throw 'Register-ProfileHook did not add hook' }
+        }
+        Invoke-CommandProbe -Command 'Register-HelpSection' -Code {
+            $before = $script:PSP.HelpSections.Count
+            Register-HelpSection -Title 'CI Probe Section' -Lines @('line one', 'line two')
+            if ($script:PSP.HelpSections.Count -ne $before + 1) { throw 'Register-HelpSection did not add section' }
+        }
+        Invoke-CommandProbe -Command 'Register-ProfileCommand' -Code {
+            $before = $script:PSP.Commands.Count
+            Register-ProfileCommand -Name 'probe-cmd' -Category 'Probe' -Synopsis 'ci probe'
+            if ($script:PSP.Commands.Count -ne $before + 1) { throw 'Register-ProfileCommand did not add command' }
+        }
+        Invoke-CommandProbe -Command 'Get-ProfileCommand' -Code {
+            $all = Get-ProfileCommand
+            if (-not $all -or $all.Count -lt 50) { throw "Get-ProfileCommand returned only $($all.Count) entries" }
+            $filtered = Get-ProfileCommand -Category 'Git'
+            if (-not $filtered -or $filtered.Count -lt 3) { throw 'Category filter returned too few' }
+        }
+        Invoke-CommandProbe -Command 'Start-ProfileTour' -SkipReason 'Interactive walkthrough (Read-Host loop)'
+        Invoke-CommandProbe -Command 'Add-TrustedDirectory' -Code {
+            $origSettingsPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\user-settings.json'
+            $origContent = if (Test-Path $origSettingsPath) { Get-Content $origSettingsPath -Raw } else { $null }
+            try {
+                $trustDir = Join-Path $workspace 'trust-target'
+                New-Item -ItemType Directory -Path $trustDir -Force | Out-Null
+                Add-TrustedDirectory -Path $trustDir -Confirm:$false
+                if ($script:PSP.TrustedDirs -notcontains (Resolve-Path $trustDir).ProviderPath) {
+                    throw 'Add-TrustedDirectory did not register dir'
+                }
+                # Regression: parse-failure must NOT overwrite existing user-settings.json.
+                [System.IO.File]::WriteAllText($origSettingsPath, '{ this is not valid json', $utf8NoBom)
+                $preCorruptContent = Get-Content $origSettingsPath -Raw
+                $trustDir2 = Join-Path $workspace 'trust-target-2'
+                New-Item -ItemType Directory -Path $trustDir2 -Force | Out-Null
+                $trustedBefore = @($script:PSP.TrustedDirs).Count
+                Add-TrustedDirectory -Path $trustDir2 -Confirm:$false -ErrorAction SilentlyContinue
+                $postContent = Get-Content $origSettingsPath -Raw
+                if ($postContent -ne $preCorruptContent) { throw 'Add-TrustedDirectory overwrote corrupt user-settings.json instead of aborting' }
+                # Regression: failed Save must roll back in-memory Add so state matches disk.
+                $trustedAfter = @($script:PSP.TrustedDirs).Count
+                if ($trustedAfter -ne $trustedBefore) { throw "Add-TrustedDirectory did not roll back in-memory state (before=$trustedBefore after=$trustedAfter)" }
+            }
+            finally {
+                if ($origContent) { [System.IO.File]::WriteAllText($origSettingsPath, $origContent, $utf8NoBom) }
+            }
+        }
+        Invoke-CommandProbe -Command 'Remove-TrustedDirectory' -Code {
+            $origSettingsPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\user-settings.json'
+            $origContent = if (Test-Path $origSettingsPath) { Get-Content $origSettingsPath -Raw } else { $null }
+            try {
+                $trustDir = Join-Path $workspace 'untrust-target'
+                New-Item -ItemType Directory -Path $trustDir -Force | Out-Null
+                Add-TrustedDirectory -Path $trustDir -Confirm:$false
+                Remove-TrustedDirectory -Path $trustDir -Confirm:$false
+                if ($script:PSP.TrustedDirs -contains (Resolve-Path $trustDir).ProviderPath) {
+                    throw 'Remove-TrustedDirectory did not remove dir'
+                }
+            }
+            finally {
+                if ($origContent) { [System.IO.File]::WriteAllText($origSettingsPath, $origContent, $utf8NoBom) }
+            }
+        }
+        Invoke-CommandProbe -Command 'Set-TerminalBackground' -Code {
+            $origSettingsPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\user-settings.json'
+            $origContent = if (Test-Path $origSettingsPath) { Get-Content $origSettingsPath -Raw } else { $null }
+            try {
+                $bgImg = Join-Path $workspace 'probe-bg.png'
+                # Minimal PNG header + IEND to satisfy file-exists check
+                $pngBytes = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+                [System.IO.File]::WriteAllBytes($bgImg, $pngBytes)
+                Set-TerminalBackground -Path $bgImg -Opacity 0.5 -Confirm:$false
+                $settings = Get-Content $origSettingsPath -Raw | ConvertFrom-Json
+                if (-not $settings.defaults.backgroundImage) { throw 'Set-TerminalBackground did not persist image' }
+                Set-TerminalBackground -Clear -Confirm:$false
+                $settings2 = Get-Content $origSettingsPath -Raw | ConvertFrom-Json
+                if ($settings2.defaults.PSObject.Properties['backgroundImage']) { throw 'Set-TerminalBackground -Clear did not remove image' }
+            }
+            finally {
+                if ($origContent) { [System.IO.File]::WriteAllText($origSettingsPath, $origContent, $utf8NoBom) }
+            }
+        }
     }
     finally {
         if ($httpJob) {
@@ -793,6 +1098,16 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Invoke-WithTimeout'
         'Restart-TerminalToApply'
         'Clear-OhMyPoshCaches'
+        'Write-JournalLine'
+        'Invoke-PromptStage'
+        'Invoke-ProfileHook'
+        'Save-TrustedDirectories'
+        'Read-UserSettingsForWrite'
+        'Get-WindowsTerminalSettingsPath'
+        'Push-TabTitle'
+        'Pop-TabTitle'
+        'Resolve-WslUncPath'
+        'Initialize-RestartManagerType'
     )
     $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
 

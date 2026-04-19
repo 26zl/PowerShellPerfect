@@ -28,11 +28,10 @@ if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -
 $_q = [char]34
 $jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 
-# Opt-out of telemetry if running as admin (only set once)
+# Admin check (used by prompt suffix, firewall helpers, Get-SystemInfo, Invoke-ProfileWizard).
+# A profile must not silently mutate machine-scope env vars; telemetry opt-out is handled by
+# setup.ps1 with explicit user consent. Uninstall-Profile Phase 6 still cleans up legacy values.
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if ($isAdmin -and -not [System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
-    [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'true', [System.EnvironmentVariableTarget]::Machine)
-}
 
 # Canonical tool list - single source of truth for install, upgrade, cache invalidation, and version tracking.
 # Cache: init-script filename in $cacheDir that must be deleted when the tool is upgraded (or $null).
@@ -45,6 +44,96 @@ $script:ProfileTools = @(
     @{ Name = "bat"; Id = "sharkdp.bat"; Cmd = "bat"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
     @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
 )
+
+# Extensibility core. $PSP is the public namespace plugins, profile_user.ps1, and user-settings.json extend.
+# Hooks: OnProfileLoad fires once after all load steps; PrePrompt fires before every prompt; OnCd fires when $pwd changes.
+# Features: toggles heavy/optional behavior. Commands: registry consumed by Get-ProfileCommand and Show-Help.
+$script:PSP = @{
+    Hooks        = @{
+        OnProfileLoad = [System.Collections.Generic.List[scriptblock]]::new()
+        PrePrompt     = [System.Collections.Generic.List[scriptblock]]::new()
+        OnCd          = [System.Collections.Generic.List[scriptblock]]::new()
+    }
+    HelpSections = [System.Collections.Generic.List[object]]::new()
+    Commands     = [System.Collections.Generic.List[object]]::new()
+    Features     = @{
+        psfzf            = $true
+        predictions      = $true
+        startupMessage   = $true
+        perDirProfiles   = $true
+        # transientPrompt collapses the previous prompt to a minimal form on Enter (p10k-style).
+        # Requires a console host and PSReadLine; no-op in CI/non-interactive.
+        transientPrompt  = $false
+        # commandOverrides is a code-execution surface (JSON strings compiled to scriptblocks).
+        # Default off so a user-settings.json edit cannot silently redefine commands; users must
+        # opt in explicitly by setting features.commandOverrides = true.
+        commandOverrides = $false
+        # updateCheck hits the GitHub commits API at most once every 7 days (cached timestamp)
+        # to notify when main has advanced past the applied version. Default off so users
+        # running `irm | iex` inside scripts don't trigger a surprise network call per shell.
+        updateCheck      = $false
+    }
+    # Scriptblock that returns the collapsed prompt string used when features.transientPrompt
+    # is enabled. Override in profile_user.ps1 to customize. Return value is printed verbatim.
+    TransientPrompt = { "$ " }
+    TrustedDirs  = [System.Collections.Generic.List[string]]::new()
+    LastPwd      = $null
+    # Directory history stack - populated by Invoke-PromptStage on cd. Most-recent first.
+    PwdHistory   = [System.Collections.Generic.List[string]]::new()
+    PwdHistoryMax = 20
+    # When set to $true, the next Invoke-PromptStage call skips pushing LastPwd onto
+    # PwdHistory. Used by cdb so a stack-pop navigation does not re-push the directory
+    # being consumed (which would create back-and-forth history loops on repeat cdb).
+    SuppressPwdHistoryPush = $false
+    # Tab-title base (without context prefix). Set at profile load; used by the PrePrompt
+    # hook that prepends venv/aws/k8s/jobs indicators.
+    BaseTitle    = $null
+}
+
+# Fire all scriptblocks registered for a hook event. Errors are isolated per hook.
+function Invoke-ProfileHook {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateSet('OnProfileLoad', 'PrePrompt', 'OnCd')][string]$EventName)
+    if (-not $script:PSP -or -not $script:PSP.Hooks.ContainsKey($EventName)) { return }
+    foreach ($h in $script:PSP.Hooks[$EventName]) {
+        try { & $h }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Write-Warning "Hook '$EventName' failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Register a scriptblock to run on a profile lifecycle event (OnProfileLoad | PrePrompt | OnCd).
+function Register-ProfileHook {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('OnProfileLoad', 'PrePrompt', 'OnCd')][string]$EventName,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+    $script:PSP.Hooks[$EventName].Add($Action)
+}
+
+# Add a section to Show-Help output. Use from plugins or profile_user.ps1 to advertise custom commands.
+function Register-HelpSection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string[]]$Lines
+    )
+    $script:PSP.HelpSections.Add([PSCustomObject]@{ Title = $Title; Lines = $Lines })
+}
+
+# Add a command to the discovery registry consumed by Get-ProfileCommand.
+function Register-ProfileCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Category,
+        [string]$Synopsis = ''
+    )
+    $script:PSP.Commands.Add([PSCustomObject]@{ Name = $Name; Category = $Category; Synopsis = $Synopsis })
+}
 
 # Run a scriptblock in a job with timeout; returns result or $null on timeout/failure.
 # Used for native init commands where we want an explicit timeout but can pass a resolved exe path.
@@ -85,7 +174,7 @@ function Invoke-DownloadWithRetry {
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
-            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -ErrorAction Stop
+            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
             if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
                 Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 throw 'Downloaded file is missing or empty'
@@ -94,7 +183,7 @@ function Invoke-DownloadWithRetry {
         }
         catch {
             if ($attempt -lt $MaxAttempts) {
-                Write-Warning "Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..."
+                Write-Host "  Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..." -ForegroundColor Yellow
                 Start-Sleep -Seconds $BackoffSec
             }
             else {
@@ -119,8 +208,8 @@ function Get-ExternalCommandPath {
     }
 
     $pathCandidates = @($cmd.Path, $cmd.Source, $cmd.Definition) |
-        Where-Object { $_ -and [System.IO.Path]::IsPathRooted([string]$_) } |
-        Select-Object -Unique
+    Where-Object { $_ -and [System.IO.Path]::IsPathRooted([string]$_) } |
+    Select-Object -Unique
     foreach ($pathCandidate in $pathCandidates) {
         if (Test-Path -LiteralPath $pathCandidate -PathType Leaf) {
             return $pathCandidate
@@ -128,6 +217,54 @@ function Get-ExternalCommandPath {
     }
 
     return $null
+}
+
+# Tab-title helpers used by long-running wrappers (ssh/dex/dlogs/serve/watch/journal -Follow)
+# to make it obvious what each tab is doing. Push returns the prior title so Pop can restore
+# it; both are silent on terminals that don't support title setting. LIFO-safe (nest freely).
+function Push-TabTitle {
+    param([Parameter(Mandatory)][string]$Title)
+    $old = $null
+    try { $old = $Host.UI.RawUI.WindowTitle } catch { $null = $_ }
+    try { $Host.UI.RawUI.WindowTitle = $Title } catch { $null = $_ }
+    return $old
+}
+
+function Pop-TabTitle {
+    param([AllowNull()][string]$OldTitle)
+    if ($null -eq $OldTitle) { return }
+    try { $Host.UI.RawUI.WindowTitle = $OldTitle } catch { $null = $_ }
+}
+
+# Resolve the active Windows Terminal settings.json across install variants: Store, Preview,
+# Canary, and unpackaged (GitHub zip). Returns the first existing path, or $null if WT is not
+# installed. Callers that WRITE settings should use Get-WindowsTerminalSettingsPaths (plural)
+# instead so all installed variants stay in sync; the singular helper is kept for single-variant
+# reads (e.g. Uninstall-Profile restore picks the most-precedence variant's backup).
+function Get-WindowsTerminalSettingsPath {
+    $candidates = @(
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalCanary_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
+# Resolve ALL existing Windows Terminal settings.json files across installed variants so writers
+# can update every one a user has. Returns an array (possibly empty). Fixes the "wrote to Stable
+# but Preview was the active terminal" class of bugs.
+function Get-WindowsTerminalSettingsPaths {
+    $candidates = @(
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalCanary_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'
+    )
+    @($candidates | Where-Object { Test-Path -LiteralPath $_ })
 }
 
 # Merge PSCustomObject overrides recursively so nested user/theme/terminal keys are preserved.
@@ -230,7 +367,7 @@ function Get-OhMyPoshMsiProductCode {
     )
 
     $entries = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -eq 'Oh My Posh' }
+    Where-Object { $_.DisplayName -eq 'Oh My Posh' }
     foreach ($entry in $entries) {
         foreach ($uninstallString in @($entry.QuietUninstallString, $entry.UninstallString)) {
             if ($uninstallString -and $uninstallString -match '\{[0-9A-Fa-f\-]{36}\}') {
@@ -275,8 +412,8 @@ function Get-ProfileToolVersionText {
 
     try {
         $versionLine = & $ExecutablePath @versionArgs 2>$null |
-            Where-Object { $_ -match '\d+\.\d+' } |
-            Select-Object -First 1
+        Where-Object { $_ -match '\d+\.\d+' } |
+        Select-Object -First 1
         if ($versionLine) {
             return $versionLine.Trim()
         }
@@ -546,9 +683,12 @@ function Update-Profile {
         [switch]$Force
     )
 
-    $tempProfile = Join-Path $env:TEMP "Microsoft.PowerShell_profile.ps1"
-    $tempConfig = Join-Path $env:TEMP "theme.json"
-    $tempTerminalConfig = Join-Path $env:TEMP "terminal-config.json"
+    # Use randomized tempfile names so concurrent Update-Profile runs (and other processes
+    # writing fixed-name files under %TEMP%) can't race or clobber each other.
+    $tempSuffix = [System.IO.Path]::GetRandomFileName()
+    $tempProfile = Join-Path $env:TEMP "psp-profile-$tempSuffix.ps1"
+    $tempConfig = Join-Path $env:TEMP "psp-theme-$tempSuffix.json"
+    $tempTerminalConfig = Join-Path $env:TEMP "psp-terminal-$tempSuffix.json"
     $userSettingsPath = Join-Path $cacheDir "user-settings.json"
     $userSettingsStatePath = Join-Path $cacheDir "user-settings.applied.sha256"
 
@@ -561,6 +701,13 @@ function Update-Profile {
     $userWindowsTerminalOverridePresent = $false
     $userTerminalDefaultsOverridePresent = $false
     $userKeybindingsOverridePresent = $false
+
+    # Gate the network phase behind ShouldProcess so -WhatIf does not pull files from GitHub.
+    # Descriptive action label covers the entire download+hash+copy flow because we cannot
+    # know what will change without first downloading.
+    $updateSource = "$repo_root/$repo_name/main"
+    if (-not $PSCmdlet.ShouldProcess($updateSource, 'Download profile/theme/terminal-config and apply updates')) { return }
+
     try {
         # Phase 1: Download profile and config
         $profileUrl = "$repo_root/$repo_name/main/Microsoft.PowerShell_profile.ps1"
@@ -588,10 +735,32 @@ function Update-Profile {
             $phaseErrors += "terminal-config.json download: $_"
         }
 
-        # Phase 2: Hash verification (profile .ps1 only)
-        $oldHash = if (Test-Path $PROFILE) { (Get-FileHash -Path $PROFILE -Algorithm SHA256).Hash } else { "" }
+        # Phase 2: Hash verification (profile .ps1 only).
+        # Check BOTH edition dirs, not just $PROFILE: a user running Update-Profile from PS7
+        # when PS5 has a stale profile (or vice versa) needs the other edition resynced too.
         $newHash = (Get-FileHash -Path $tempProfile -Algorithm SHA256).Hash
-        $profileChanged = $newHash -ne $oldHash
+        $_docsRoot = Split-Path (Split-Path $PROFILE)
+        $_editionDirs = @(
+            (Join-Path $_docsRoot 'PowerShell')
+            (Join-Path $_docsRoot 'WindowsPowerShell')
+        )
+        $_installedProfiles = foreach ($_ed in $_editionDirs) {
+            $_p = Join-Path $_ed 'Microsoft.PowerShell_profile.ps1'
+            if (Test-Path $_p) { $_p }
+        }
+        $profileChanged = $false
+        if (-not $_installedProfiles) {
+            # Fresh install scenario - always copy
+            $profileChanged = $true
+        }
+        else {
+            foreach ($_ip in $_installedProfiles) {
+                if ((Get-FileHash -Path $_ip -Algorithm SHA256).Hash -ne $newHash) {
+                    $profileChanged = $true
+                    break
+                }
+            }
+        }
 
         # Check if config actually changed
         $configChanged = $false
@@ -649,7 +818,7 @@ function Update-Profile {
             finally { $sha.Dispose() }
 
             if (-not $ExpectedSha256) {
-                Write-Host "Downloaded file hashes:" -ForegroundColor Yellow
+                Write-Host "Downloaded file hashes (computed over what was just fetched):" -ForegroundColor Yellow
                 Write-Host "  profile.ps1:       $newHash" -ForegroundColor Yellow
                 if ($configDownloaded) {
                     Write-Host "  theme.json:        $newConfigHash" -ForegroundColor Yellow
@@ -664,8 +833,10 @@ function Update-Profile {
                     Write-Host "  terminal-config:   (not downloaded)" -ForegroundColor Yellow
                 }
                 Write-Host "  combined:          $combinedHash" -ForegroundColor Yellow
-                Write-Host "Verify at https://github.com/26zl/PowerShellPerfect" -ForegroundColor Yellow
-                throw "Hash verification required. Re-run with -ExpectedSha256 '$combinedHash' or -SkipHashCheck."
+                Write-Host "These hashes confirm FILE INTEGRITY of the current download (no truncation, no corruption)." -ForegroundColor DarkYellow
+                Write-Host "To pin against a specific upstream commit, verify the SHA out-of-band first:" -ForegroundColor DarkYellow
+                Write-Host "  https://github.com/26zl/PowerShellPerfect/commits/main" -ForegroundColor DarkYellow
+                throw "Hash input required. Re-run with -ExpectedSha256 '$combinedHash' (reproducible install) or -SkipHashCheck."
             }
             $expected = $ExpectedSha256.ToUpperInvariant()
             if ($combinedHash -ne $expected) {
@@ -673,7 +844,11 @@ function Update-Profile {
             }
         }
 
-        # Phase 3: Copy profile to PS5/PS7 dirs (only if changed)
+        # Phase 3: Copy profile to PS5/PS7 dirs (only if changed).
+        # On a fresh install the current edition's profile dir may not exist yet; create it for
+        # the edition that is actually running so the copy lands. We still avoid creating the
+        # OTHER edition's dir (if the user does not have that edition installed we have no business
+        # putting a profile there).
         if ($profileChanged) {
             if ($PSCmdlet.ShouldProcess($PROFILE, "Replace profile with downloaded version (hash: $newHash)")) {
                 $docsRoot = Split-Path (Split-Path $PROFILE)
@@ -681,6 +856,16 @@ function Update-Profile {
                     Join-Path $docsRoot "PowerShell"
                     Join-Path $docsRoot "WindowsPowerShell"
                 )
+                $currentEditionDir = Split-Path $PROFILE
+                if (-not (Test-Path $currentEditionDir)) {
+                    try {
+                        New-Item -ItemType Directory -Path $currentEditionDir -Force | Out-Null
+                        Write-Host "Created profile directory: $currentEditionDir" -ForegroundColor DarkGray
+                    }
+                    catch {
+                        Write-Warning "Failed to create profile directory $currentEditionDir`: $_"
+                    }
+                }
                 $copySuccess = 0
                 $copyFailed = @()
                 foreach ($dir in $profileDirs) {
@@ -781,15 +966,37 @@ function Update-Profile {
             }
         }
         else {
-            # Create starter template so users know the file exists
+            # Create starter template so users know the file exists. Must match the template
+            # created by setup.ps1 (around line 892) so users see the same override surface
+            # regardless of which command created the file.
             $userSettingsTemplate = @'
 {
-    "_comment": "User overrides for terminal and theme settings. Only add keys you want to override.",
+    "_comment": "User overrides for terminal, theme, and profile behavior. Only add keys you want to override.",
     "_examples": {
         "theme": { "name": "catppuccin", "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/catppuccin.omp.json" },
         "windowsTerminal": { "colorScheme": "One Half Dark", "cursorColor": "#ffffff" },
-        "defaults": { "opacity": 90, "font": { "size": 14 } },
-        "keybindings": [{ "keys": "ctrl+shift+t", "command": { "action": "newTab" } }]
+        "defaults": {
+            "opacity": 90,
+            "font": { "size": 14 },
+            "backgroundImage": "%USERPROFILE%\\Pictures\\bg.png",
+            "backgroundImageOpacity": 0.3,
+            "backgroundImageStretchMode": "uniformToFill",
+            "backgroundImageAlignment": "center"
+        },
+        "keybindings": [{ "keys": "ctrl+shift+t", "command": { "action": "newTab" } }],
+        "features": {
+            "psfzf": true,
+            "predictions": true,
+            "startupMessage": true,
+            "perDirProfiles": true,
+            "_commandOverrides_note": "set commandOverrides to true ONLY if you also populate the commandOverrides section below. Default off because JSON strings get compiled to scriptblocks at profile load.",
+            "commandOverrides": false
+        },
+        "commandOverrides": {
+            "_note": "entries here are ignored unless features.commandOverrides = true",
+            "gs": "git status --short"
+        },
+        "trustedDirs": []
     }
 }
 '@
@@ -887,11 +1094,12 @@ function Update-Profile {
             }
         }
 
-        # Phase 6: Windows Terminal sync
+        # Phase 6: Windows Terminal sync - iterate ALL installed WT variants so users running
+        # Stable + Preview (or Canary) get every variant updated, not just the first found.
         $terminalOverridesChanged = $userSettingsChanged -and ($userWindowsTerminalOverridePresent -or $userTerminalDefaultsOverridePresent -or $userKeybindingsOverridePresent)
         if (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
-            $wtSettingsPath = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
-            if (Test-Path $wtSettingsPath) {
+            $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
+            foreach ($wtSettingsPath in $wtSettingsPaths) {
                 if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Update Windows Terminal settings")) {
                     try {
                         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -960,6 +1168,21 @@ function Update-Profile {
                                 $schemeDefName = if ($schemeDef.name) { $schemeDef.name } else { $schemeName }
                                 $wt.schemes = @(@($wt.schemes | Where-Object { $_ -and $_.name -ne $schemeDefName }) + ([PSCustomObject]$schemeDef))
                             }
+
+                            # Upsert custom WT theme (tab bar colors, window chrome) from theme.json
+                            $themeDef = $config.windowsTerminal.themeDefinition
+                            $themeActive = $config.windowsTerminal.theme
+                            if ($themeDef) {
+                                if (-not $wt.themes) {
+                                    $wt | Add-Member -NotePropertyName "themes" -NotePropertyValue @() -Force
+                                }
+                                $themeDefName = $themeDef.name
+                                $wt.themes = @(@($wt.themes | Where-Object { $_ -and $_.name -ne $themeDefName }) + ([PSCustomObject]$themeDef))
+                            }
+                            if ($themeActive) {
+                                if ($wt.PSObject.Properties['theme']) { $wt.theme = $themeActive }
+                                else { $wt | Add-Member -NotePropertyName "theme" -NotePropertyValue $themeActive -Force }
+                            }
                         }
 
                         # Keybindings last
@@ -1009,7 +1232,9 @@ function Update-Profile {
                             }
                         }
 
-                        $wtJson = $wt | ConvertTo-Json -Depth 10
+                        # Depth 100: WT settings can have deeply nested action/command objects;
+                        # depth 10 silently truncates those to their type name string and corrupts settings.
+                        $wtJson = $wt | ConvertTo-Json -Depth 100
                         $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
                         [System.IO.File]::WriteAllText($wtSettingsPath, $wtJson, $utf8NoBom)
                         Write-Host "Windows Terminal settings updated." -ForegroundColor Green
@@ -1098,8 +1323,32 @@ function Update-Profile {
             }
         }
 
+        # Refresh the applied-commit baseline used by the opt-in update-check so it starts
+        # from the freshly-pulled version; best-effort - a network hiccup here is harmless.
         if ($profileActuallyUpdated) {
-            Restart-TerminalToApply -Message "Profile updated. Restarting terminal..."
+            try {
+                $_upOwner = ($repo_root -replace '^https?://(raw\.)?githubusercontent\.com/', '').Trim('/')
+                $_upApi = "https://api.github.com/repos/$_upOwner/$repo_name/commits/main"
+                $_upResp = Invoke-RestMethod -Uri $_upApi -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+                if ($_upResp -and $_upResp.sha) {
+                    $_upBaseline = Join-Path $cacheDir 'applied-commit.sha'
+                    [System.IO.File]::WriteAllText($_upBaseline, $_upResp.sha, [System.Text.UTF8Encoding]::new($false))
+                }
+            }
+            catch { $null = $_ }
+        }
+
+        # Restart the terminal whenever *anything* that the running session would load
+        # differently has changed - not just the profile.ps1 itself. Without this, changes
+        # to theme.json / terminal-config.json / user-settings.json land on disk but the
+        # current shell still shows old prompt/features until the user manually reloads.
+        $anyRuntimeChange = $profileActuallyUpdated -or $configChanged -or $terminalConfigChanged -or $userSettingsChanged
+        if ($anyRuntimeChange) {
+            $reason = if ($profileActuallyUpdated) { 'Profile updated' }
+                      elseif ($configChanged) { 'Theme config updated' }
+                      elseif ($terminalConfigChanged) { 'Terminal config updated' }
+                      else { 'User settings updated' }
+            Restart-TerminalToApply -Message "$reason. Restarting terminal..."
         }
     }
     catch {
@@ -1126,7 +1375,7 @@ function Update-PowerShell {
         $gitHubApiUrl = "https://api.github.com/repos/PowerShell/PowerShell/releases/latest"
         $headers = @{}
         if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
-        $latestReleaseInfo = Invoke-RestMethod -Uri $gitHubApiUrl -TimeoutSec 10 -Headers $headers
+        $latestReleaseInfo = Invoke-RestMethod -Uri $gitHubApiUrl -TimeoutSec 10 -Headers $headers -UseBasicParsing
         if (-not $latestReleaseInfo.tag_name) { Write-Error "Invalid GitHub API response (missing tag_name)."; return }
         $latestVersionStr = $latestReleaseInfo.tag_name.Trim('v') -replace '-.*$', ''
         $latestVersion = [version]$latestVersionStr
@@ -1288,10 +1537,115 @@ function Clear-Cache {
     }
 }
 
+# Show the execution time of the last command (fish-style `cmd_duration` / starship duration).
+# Reads $MaximumHistoryCount-bounded Get-History so it works even with large histories.
+function duration {
+    $last = Get-History -Count 1 -ErrorAction SilentlyContinue
+    if (-not $last) {
+        Write-Host 'No history yet.' -ForegroundColor Yellow
+        return
+    }
+    $span = $last.EndExecutionTime - $last.StartExecutionTime
+    $cmd = $last.CommandLine
+    if ($cmd.Length -gt 60) { $cmd = $cmd.Substring(0, 57) + '...' }
+    $secs = [math]::Round($span.TotalSeconds, 3)
+    Write-Host ("  {0}" -f $cmd) -ForegroundColor DarkGray
+    Write-Host ("  {0}s  ({1:hh\:mm\:ss\.fff})" -f $secs, $span) -ForegroundColor Cyan
+}
+
+# Jump back N directories in the cd history stack. Default N=1 (previous directory).
+# The stack is maintained by Invoke-PromptStage and bounded to $PSP.PwdHistoryMax.
+# Consumes entries 1..N from the stack (so repeat cdb walks further back instead of
+# oscillating) and sets SuppressPwdHistoryPush so the Set-Location doesn't cause the
+# prompt hook to re-push the departure.
+function cdb {
+    [CmdletBinding()]
+    param([int]$N = 1)
+    if (-not $script:PSP -or -not $script:PSP.PwdHistory -or $script:PSP.PwdHistory.Count -eq 0) {
+        Write-Host 'No directory history yet.' -ForegroundColor Yellow
+        return
+    }
+    if ($N -lt 1 -or $N -gt $script:PSP.PwdHistory.Count) {
+        Write-Host ("History has {0} entries; N must be 1..{0}." -f $script:PSP.PwdHistory.Count) -ForegroundColor Yellow
+        return
+    }
+    $target = $script:PSP.PwdHistory[$N - 1]
+    if (-not (Test-Path -LiteralPath $target)) {
+        Write-Warning "Directory no longer exists: $target (marked with '!' in cdh). Run 'cdh' to see the stack."
+        return
+    }
+    # Pop the consumed entries (0..N-1) so the stack reflects where we actually are.
+    for ($i = 0; $i -lt $N; $i++) { $script:PSP.PwdHistory.RemoveAt(0) }
+    # Suppress auto-push on the Set-Location that follows - we already cleaned up the stack.
+    $script:PSP.SuppressPwdHistoryPush = $true
+    Set-Location -LiteralPath $target
+}
+
+# List the cd history stack (most-recent first). `cdb N` jumps to entry [N].
+function cdh {
+    if (-not $script:PSP -or -not $script:PSP.PwdHistory -or $script:PSP.PwdHistory.Count -eq 0) {
+        Write-Host 'No directory history yet.' -ForegroundColor Yellow
+        return
+    }
+    $i = 1
+    foreach ($d in $script:PSP.PwdHistory) {
+        $exists = Test-Path -LiteralPath $d
+        $color = if ($exists) { 'White' } else { 'DarkGray' }
+        $mark = if ($exists) { ' ' } else { '!' }
+        Write-Host ("  [{0}]{1} {2}" -f $i, $mark, $d) -ForegroundColor $color
+        $i++
+    }
+}
+
 # Admin Check and Prompt Customization (fallback when Oh My Posh is not loaded)
 $adminSuffix = if ($isAdmin) { " [ADMIN]" } else { "" }
 # PowerShell prompt (fallback when Oh My Posh is not loaded)
+# Shared prompt-stage helper: fires PrePrompt hooks, detects cd, fires OnCd, and auto-loads
+# trusted .psprc.ps1 when the directory changes. Called from both fallback and OMP prompts.
+function Invoke-PromptStage {
+    if (-not $script:PSP) { return }
+    Invoke-ProfileHook -EventName 'PrePrompt'
+    try {
+        $current = $PWD.ProviderPath
+        if (-not $current) { return }
+        if ($current -eq $script:PSP.LastPwd) { return }
+        # Push previous pwd onto the history stack (most-recent first, bounded).
+        # Explicit null check: empty List<string> is falsy under -and in PowerShell.
+        # `cdb` sets SuppressPwdHistoryPush so its stack-pop navigation doesn't re-push the
+        # just-consumed entry (which would make repeat cdb oscillate instead of walk back).
+        if ($script:PSP.SuppressPwdHistoryPush) {
+            $script:PSP.SuppressPwdHistoryPush = $false
+        }
+        elseif ($script:PSP.LastPwd -and $null -ne $script:PSP.PwdHistory) {
+            $script:PSP.PwdHistory.Insert(0, $script:PSP.LastPwd)
+            while ($script:PSP.PwdHistory.Count -gt $script:PSP.PwdHistoryMax) {
+                $script:PSP.PwdHistory.RemoveAt($script:PSP.PwdHistory.Count - 1)
+            }
+        }
+        $script:PSP.LastPwd = $current
+        Invoke-ProfileHook -EventName 'OnCd'
+        if (-not $script:PSP.Features.perDirProfiles) { return }
+        $rc = Join-Path $current '.psprc.ps1'
+        if (-not (Test-Path -LiteralPath $rc)) { return }
+        if ($script:PSP.TrustedDirs -contains $current) {
+            try { . $rc }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+                Write-Warning ".psprc.ps1 failed: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Host ".psprc.ps1 found in this directory. Run Add-TrustedDirectory to auto-load it." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Warning "prompt stage: $($_.Exception.Message)"
+    }
+}
+
 function prompt {
+    Invoke-PromptStage
     if ($adminSuffix) { "[" + (Get-Location) + "] # " } else { "[" + (Get-Location) + "] $ " }
 }
 $script:FallbackPromptFunction = $Function:prompt
@@ -1365,42 +1719,105 @@ function pubip {
     }
 }
 
-# Open WinUtil full-release (downloads to temp file, then executes locally)
+# Open WinUtil (Chris Titus) - safe-by-default: downloads a random tempfile, shows SHA256 + URL,
+# and does NOT execute unless the caller opts in with -ExpectedSha256 <hash> (hash-pinned) or
+# -Force (trust-on-download). Even then, execution is gated behind ShouldProcess so interactive
+# users get a high-impact confirmation prompt and automation must opt out explicitly.
+# Source: https://christitus.com/win (remote script, not hash-pinned by upstream).
 function winutil {
-    $scriptPath = Join-Path $env:TEMP "winutil.ps1"
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+        [string]$ExpectedSha256,
+        [switch]$Force
+    )
+    if ($ExpectedSha256 -and $Force) {
+        Write-Error 'Use either -ExpectedSha256 or -Force, not both.'
+        return
+    }
+    $scriptPath = Join-Path $env:TEMP ("winutil-" + [System.IO.Path]::GetRandomFileName() + ".ps1")
     try {
-        Invoke-RestMethod https://christitus.com/win -OutFile $scriptPath -TimeoutSec 10 -ErrorAction Stop
-        & $scriptPath
+        Invoke-RestMethod -Uri 'https://christitus.com/win' -OutFile $scriptPath -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
+        if (-not (Test-Path $scriptPath) -or (Get-Item $scriptPath).Length -eq 0) {
+            throw 'Downloaded WinUtil script is empty.'
+        }
+        $actualHash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
+        Write-Host "Source: https://christitus.com/win"
+        Write-Host "SHA256: $actualHash" -ForegroundColor Cyan
+        $downloadLabel = "WinUtil script from https://christitus.com/win (SHA256: $actualHash)"
+        if ($ExpectedSha256) {
+            if ($actualHash -ine $ExpectedSha256.Trim()) {
+                Write-Error "SHA256 mismatch. Expected: $ExpectedSha256. Actual: $actualHash. Aborting."
+                return
+            }
+            if (-not $PSCmdlet.ShouldProcess($downloadLabel, 'Execute downloaded WinUtil script (hash matched)')) {
+                return
+            }
+            Write-Host "SHA256 matched expected value. Executing..." -ForegroundColor Green
+            & $scriptPath
+            return
+        }
+        if ($Force) {
+            Write-Warning 'Executing an external script without hash pinning. Review the source and SHA256 first.'
+            if (-not $PSCmdlet.ShouldProcess($downloadLabel, 'Execute downloaded WinUtil script without hash verification')) {
+                return
+            }
+            Write-Host "Executing with -Force (no hash verification)..." -ForegroundColor Yellow
+            & $scriptPath
+            return
+        }
+        Write-Host ''
+        Write-Host "NOT executing by default. Re-run with one of:" -ForegroundColor Yellow
+        Write-Host "  winutil -ExpectedSha256 '$actualHash'   (pin this version)"
+        Write-Host "  winutil -Force                          (trust without hash check)"
     }
     catch {
-        Write-Error "Failed to run WinUtil: $_"
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Failed to fetch WinUtil: $($_.Exception.Message)"
     }
     finally {
-        Remove-Item $scriptPath -ErrorAction SilentlyContinue
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
     }
 }
 
-# Launch Harden Windows Security (hss.exe) if installed
+# Launch Harden Windows Security (hss.exe) if installed. Even though this is a local binary,
+# it is a system-hardening tool, so require an explicit ShouldProcess confirmation.
 function harden {
-    if (Get-Command "hss.exe" -ErrorAction SilentlyContinue) {
-        Start-Process "hss.exe"
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param()
+    $hssPath = Get-ExternalCommandPath -CommandName 'hss.exe'
+    if ($hssPath) {
+        if ($PSCmdlet.ShouldProcess($hssPath, 'Launch Harden Windows Security')) {
+            Start-Process $hssPath
+        }
     }
     else {
         Write-Warning "hss.exe not found. Install Harden Windows Security from: https://github.com/HotCakeX/Harden-Windows-Security"
     }
 }
 
-# Open elevated Windows Terminal (detects PS edition)
+# Open an elevated terminal. Prefers Windows Terminal (`wt`) so you get tabs/theming;
+# falls back to a plain elevated pwsh/powershell window if wt isn't installed so the
+# command works on vanilla Windows hosts too.
 function admin {
     $shell = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+    $hasWt = [bool](Get-Command wt -ErrorAction SilentlyContinue)
     if ($args.Count -gt 0) {
         $escaped = $args | ForEach-Object { if ($_ -match '\s') { "'$($_ -replace "'","''")'" } else { $_ } }
         $command = $escaped -join ' '
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
-        Start-Process wt -Verb runAs -ArgumentList "$shell -NoExit -EncodedCommand $encoded"
+        if ($hasWt) {
+            Start-Process wt -Verb runAs -ArgumentList "$shell -NoExit -EncodedCommand $encoded"
+        }
+        else {
+            Start-Process -FilePath $shell -Verb runAs -ArgumentList @('-NoExit', '-EncodedCommand', $encoded)
+        }
+    }
+    elseif ($hasWt) {
+        Start-Process wt -Verb runAs
     }
     else {
-        Start-Process wt -Verb runAs
+        Start-Process -FilePath $shell -Verb runAs
     }
 }
 
@@ -1493,7 +1910,7 @@ function hb {
 
     $uri = "https://bin.christitus.com/documents"
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $Content -ErrorAction Stop -TimeoutSec 10
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $Content -ErrorAction Stop -TimeoutSec 10 -UseBasicParsing
         $hasteKey = $response.key
         $url = "https://bin.christitus.com/$hasteKey"
         Set-Clipboard $url
@@ -1999,7 +2416,7 @@ function vtscan {
         Write-Error "File too large ($sizeMB MB). VirusTotal free limit is 32 MB."
         return
     }
-    $sha = (Get-FileHash $resolved -Algorithm SHA256).Hash.ToLower()
+    $sha = (Get-FileHash -LiteralPath $resolved.Path -Algorithm SHA256).Hash.ToLower()
     $headers = @{ 'x-apikey' = $apiKey }
     $sizeLabel = if ($file.Length -ge 1MB) { "$sizeMB MB" } else { "$([math]::Round($file.Length / 1KB, 1)) KB" }
     Write-Host "`nFile:       $($file.Name) ($sizeLabel)" -ForegroundColor Cyan
@@ -2008,7 +2425,7 @@ function vtscan {
     # Lookup by hash first
     $found = $false
     try {
-        $report = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/files/$sha" -Headers $headers -ErrorAction Stop
+        $report = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/files/$sha" -Headers $headers -ErrorAction Stop -UseBasicParsing
         $found = $true
     }
     catch {
@@ -2056,7 +2473,7 @@ function vtscan {
     $uploadUrl = 'https://www.virustotal.com/api/v3/files'
     if ($file.Length -gt 10MB) {
         try {
-            $uploadUrl = (Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files/upload_url' -Headers $headers -ErrorAction Stop).data
+            $uploadUrl = (Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files/upload_url' -Headers $headers -ErrorAction Stop -UseBasicParsing).data
             if (-not $uploadUrl) { Write-Error "VirusTotal did not return an upload URL."; return }
             Write-Host 'Using large-file upload endpoint.' -ForegroundColor DarkGray
         }
@@ -2113,14 +2530,18 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     # dlogs: follow container logs; dex: exec into container
     function dlogs {
         param([Parameter(Mandatory)][string]$Container)
-        docker logs -f $Container
+        $old = Push-TabTitle "logs: $Container"
+        try { docker logs -f $Container }
+        finally { Pop-TabTitle $old }
     }
     function dex {
         param(
             [Parameter(Mandatory)][string]$Container,
             [string]$Shell = 'bash'
         )
-        docker exec -it $Container $Shell
+        $old = Push-TabTitle "docker: $Container"
+        try { docker exec -it $Container $Shell }
+        finally { Pop-TabTitle $old }
     }
     # dstop: stop all running containers; dprune: system prune
     function dstop {
@@ -2128,6 +2549,200 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         if ($running) { docker stop $running } else { Write-Host "No running containers." }
     }
     function dprune { docker system prune -f }
+}
+
+# WSL wrapper + QoL helpers. All defined only when wsl.exe is available.
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    # Wrapper: shows "wsl <distro>" in tab title during session. Uses & wsl.exe (with .exe
+    # suffix) so PS resolves to the native binary, not this function (avoids recursion).
+    function wsl {
+        $distro = 'default'
+        for ($i = 0; $i -lt $args.Count; $i++) {
+            $a = [string]$args[$i]
+            if ($a -eq '-d' -or $a -eq '--distribution') {
+                if ($i + 1 -lt $args.Count) { $distro = [string]$args[$i + 1] }
+                break
+            }
+        }
+        $oldTitle = Push-TabTitle "wsl: $distro"
+        try {
+            if ($MyInvocation.ExpectingInput) { $input | & wsl.exe @args }
+            else { & wsl.exe @args }
+        }
+        finally { Pop-TabTitle $oldTitle }
+    }
+
+    # List installed WSL distros with state + version. Parses wsl.exe -l -v output which is
+    # UTF-16 with a null-byte-interspersed encoding that PowerShell decodes inconsistently.
+    function Get-WslDistro {
+        [CmdletBinding()]
+        param()
+        $raw = & wsl.exe -l -v 2>&1
+        $results = @()
+        foreach ($line in $raw) {
+            $clean = ([string]$line) -replace "`0", ''
+            if ($clean -match '^\s*(\*?)\s*([A-Za-z0-9._-]+)\s+(Running|Stopped|Installing|Uninstalling|Converting)\s+(\d+)') {
+                $results += [PSCustomObject]@{
+                    Default = ($matches[1] -eq '*')
+                    Name    = $matches[2]
+                    State   = $matches[3]
+                    Version = [int]$matches[4]
+                }
+            }
+        }
+        $results
+    }
+
+    # Open a WSL shell in the current Windows directory. Uses wsl.exe --cd which auto-translates
+    # Windows path via wslpath. Tab title set by the ssh wrapper pattern via the main 'wsl' fn.
+    function Enter-WslHere {
+        [CmdletBinding()]
+        param([string]$Distro)
+        $wslArgs = @('--cd', (Get-Location).ProviderPath)
+        if ($Distro) { $wslArgs = @('-d', $Distro) + $wslArgs }
+        wsl @wslArgs
+    }
+    Set-Alias -Name wsl-here -Value Enter-WslHere
+
+    # Translate Windows path to WSL path via the in-distro 'wslpath -a' utility.
+    # Two things worth knowing:
+    #   1. wsl.exe drops single backslashes during argument handoff from Windows -> Linux
+    #      ('C:\foo' arrives as 'C:foo' inside wslpath). We pre-normalize '\' -> '/' since
+    #      wslpath accepts either form for Windows paths.
+    #   2. The '--' end-of-options marker stops wslpath from treating paths that start with '-'
+    #      (legal POSIX filename, e.g. '-foo') as flag arguments.
+    function ConvertTo-WslPath {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Path,
+            [string]$Distro
+        )
+        $normalized = $Path -replace '\\', '/'
+        $wslArgs = @()
+        if ($Distro) { $wslArgs += '-d', $Distro }
+        $wslArgs += 'wslpath', '-a', '--', $normalized
+        $result = (& wsl.exe @wslArgs 2>&1)
+        if ($LASTEXITCODE -ne 0) { Write-Error ($result -join ' '); return }
+        ($result | Select-Object -First 1).ToString().Trim()
+    }
+
+    # Translate WSL path to Windows path via 'wslpath -w'. Same protections as ConvertTo-WslPath.
+    # Normalize '\' -> '/' to survive wsl.exe's backslash-dropping arg handoff.
+    function ConvertTo-WindowsPath {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Path,
+            [string]$Distro
+        )
+        $normalized = $Path -replace '\\', '/'
+        $wslArgs = @()
+        if ($Distro) { $wslArgs += '-d', $Distro }
+        $wslArgs += 'wslpath', '-w', '--', $normalized
+        $result = (& wsl.exe @wslArgs 2>&1)
+        if ($LASTEXITCODE -ne 0) { Write-Error ($result -join ' '); return }
+        ($result | Select-Object -First 1).ToString().Trim()
+    }
+
+    # Shutdown all WSL distros, or terminate a specific one. Useful when a distro hangs or
+    # Docker Desktop / VPN adapters misbehave and need a clean restart.
+    function Stop-Wsl {
+        [CmdletBinding()]
+        param([string]$Distro)
+        if ($Distro) {
+            & wsl.exe --terminate $Distro
+            Write-Host "Terminated: $Distro" -ForegroundColor Green
+        }
+        else {
+            & wsl.exe --shutdown
+            Write-Host "All WSL distros stopped." -ForegroundColor Green
+        }
+    }
+
+    # Get IPv4 address of a WSL distro. Useful for connecting from Windows to a service
+    # running inside WSL (http server, db, etc.). Returns first IP if multiple.
+    function Get-WslIp {
+        [CmdletBinding()]
+        param([string]$Distro)
+        $wslArgs = @()
+        if ($Distro) { $wslArgs += '-d', $Distro }
+        $wslArgs += 'hostname', '-I'
+        $out = (& wsl.exe @wslArgs 2>$null | Out-String).Trim()
+        if (-not $out) { Write-Warning 'No IP returned; is the distro running?'; return }
+        ($out -split '\s+')[0]
+    }
+
+    # List files inside a WSL distro via the \\wsl$\<Distro>\... UNC path. Returns FileInfo
+    # objects (pipe-friendly): `Get-WslFile Debian /home | Where Name -like 'lenti*'`.
+    # The distro must be running for the UNC path to be accessible.
+    function Get-WslFile {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Distro,
+            [Parameter(Position = 1)][string]$Path = '/',
+            [switch]$Recurse,
+            [switch]$Force
+        )
+        $uncRoot = '\\wsl$\' + $Distro
+        $rel = ($Path -replace '^/', '') -replace '/', '\'
+        $unc = if ($rel) { Join-Path $uncRoot $rel } else { $uncRoot }
+        if (-not (Test-Path -LiteralPath $unc)) {
+            Write-Error "Not accessible: $unc. Distro may be stopped (try: wsl -d $Distro echo ready) or path is wrong."
+            return
+        }
+        Get-ChildItem -LiteralPath $unc -Recurse:$Recurse -Force:$Force
+    }
+
+    # Internal: resolve WSL UNC path + check reachable. Returns $null with error on failure.
+    function Resolve-WslUncPath {
+        param([string]$Distro, [string]$Path = '/')
+        $uncRoot = '\\wsl$\' + $Distro
+        $rel = ($Path -replace '^/', '') -replace '/', '\'
+        $unc = if ($rel) { Join-Path $uncRoot $rel } else { $uncRoot }
+        if (-not (Test-Path -LiteralPath $unc)) {
+            Write-Error "Not accessible: $unc. Distro may be stopped (try: wsl -d $Distro echo ready) or path is wrong."
+            return $null
+        }
+        return $unc
+    }
+
+    # Tree-view of a WSL directory. Uses eza when available (nice icons + colors), falls back
+    # to Get-ChildItem -Recurse -Depth. Default depth=2 to avoid flooding on '/' ; bump with -Depth.
+    function Show-WslTree {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Distro,
+            [Parameter(Position = 1)][string]$Path = '/',
+            [ValidateRange(1, 10)][int]$Depth = 2,
+            [switch]$All
+        )
+        $unc = Resolve-WslUncPath -Distro $Distro -Path $Path
+        if (-not $unc) { return }
+        if (Get-Command eza -ErrorAction SilentlyContinue) {
+            $ezaArgs = @('--tree', "--level=$Depth", '--icons', '--git-ignore')
+            if ($All) { $ezaArgs += '-a' }
+            & eza @ezaArgs $unc
+        }
+        else {
+            # Fallback: PS-native tree. -Depth counts levels INTO the directory.
+            Get-ChildItem -LiteralPath $unc -Recurse -Depth ($Depth - 1) -Force:$All |
+            Select-Object Mode, Length, LastWriteTime, FullName
+        }
+    }
+    Set-Alias -Name wsl-tree -Value Show-WslTree
+
+    # Open Windows Explorer at a WSL distro path for native GUI browsing. Quickest way to
+    # scroll through a whole distro filesystem visually, thumbnail previews for images, etc.
+    function Open-WslExplorer {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Distro,
+            [Parameter(Position = 1)][string]$Path = '/'
+        )
+        $unc = Resolve-WslUncPath -Distro $Distro -Path $Path
+        if (-not $unc) { return }
+        explorer.exe $unc
+    }
+    Set-Alias -Name wsl-explorer -Value Open-WslExplorer
 }
 
 # System Admin
@@ -2171,6 +2786,162 @@ function svc {
 # Reload profile in current session (useful after editing profile_user.ps1 or user-settings.json)
 function reload { . $PROFILE }
 
+# Diagnose a possibly-broken install: walks through tools, caches, fonts, PATH, modules,
+# and plugins, reporting OK / WARN / FAIL per check. Users hitting weird prompts or missing
+# predictions run this before filing an issue.
+function Test-ProfileHealth {
+    [CmdletBinding()]
+    param()
+
+    $results = @()
+
+    # Managed tools
+    foreach ($tool in $script:ProfileTools) {
+        $path = Get-ProfileToolExecutablePath -Tool $tool
+        if ($path) {
+            $results += [pscustomobject]@{ Category = 'Tools'; Check = $tool.Name; Status = 'OK'; Detail = $path }
+        }
+        else {
+            $results += [pscustomobject]@{ Category = 'Tools'; Check = $tool.Name; Status = 'FAIL'; Detail = 'not installed (Update-Profile or setup.ps1)' }
+        }
+    }
+
+    # Disk caches
+    foreach ($c in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json')) {
+        $p = Join-Path $cacheDir $c
+        if (-not (Test-Path $p)) {
+            $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'WARN'; Detail = 'missing (will regenerate on next load)' }
+            continue
+        }
+        $size = (Get-Item $p).Length
+        if ($size -eq 0) {
+            $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'FAIL'; Detail = 'empty file (corrupt)' }
+            continue
+        }
+        if ($c -like '*.json') {
+            try {
+                $null = Get-Content $p -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'OK'; Detail = "$size bytes, parses" }
+            }
+            catch {
+                $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'FAIL'; Detail = "JSON parse error: $($_.Exception.Message)" }
+            }
+        }
+        else {
+            $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'OK'; Detail = "$size bytes" }
+        }
+    }
+
+    # User-settings.json (overrides)
+    $us = Join-Path $cacheDir 'user-settings.json'
+    if (Test-Path $us) {
+        try {
+            $null = Get-Content $us -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $results += [pscustomobject]@{ Category = 'Config'; Check = 'user-settings.json'; Status = 'OK'; Detail = 'parses' }
+        }
+        catch {
+            $results += [pscustomobject]@{ Category = 'Config'; Check = 'user-settings.json'; Status = 'FAIL'; Detail = $_.Exception.Message }
+        }
+    }
+    else {
+        $results += [pscustomobject]@{ Category = 'Config'; Check = 'user-settings.json'; Status = 'WARN'; Detail = 'missing (no overrides applied)' }
+    }
+
+    # Font from terminal-config.json.fontInstall.displayName
+    $tcPath = Join-Path $cacheDir 'terminal-config.json'
+    if (Test-Path $tcPath) {
+        try {
+            $tc = Get-Content $tcPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $fontName = if ($tc.fontInstall) { $tc.fontInstall.displayName } else { $null }
+            if ($fontName) {
+                # System.Drawing ships on Windows PowerShell 5.1 and is available via the
+                # System.Drawing.Common package on PS 7 Windows. On Linux/Mac PS the type
+                # may not load; treat that as WARN (can't verify) rather than FAIL (missing).
+                if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
+                    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+                }
+                if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
+                    $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'WARN'; Detail = 'System.Drawing unavailable on this host; cannot verify' }
+                }
+                else {
+                    $installed = $false
+                    try {
+                        $fc = New-Object System.Drawing.Text.InstalledFontCollection
+                        $installed = $fc.Families.Name -contains $fontName
+                        $fc.Dispose()
+                    }
+                    catch { $null = $_ }
+                    if ($installed) {
+                        $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'OK'; Detail = 'installed' }
+                    }
+                    else {
+                        $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'FAIL'; Detail = 'not installed (run setup.ps1 -Wizard or Update-Profile)' }
+                    }
+                }
+            }
+        }
+        catch { $null = $_ }
+    }
+
+    # PATH - WindowsApps (winget shims location)
+    $wapps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    if (($env:PATH -split ';') -contains $wapps) {
+        $results += [pscustomobject]@{ Category = 'PATH'; Check = 'WindowsApps'; Status = 'OK'; Detail = 'in PATH' }
+    }
+    else {
+        $results += [pscustomobject]@{ Category = 'PATH'; Check = 'WindowsApps'; Status = 'WARN'; Detail = 'missing (winget shims may not resolve)' }
+    }
+
+    # Modules
+    if (Get-Module -ListAvailable -Name PSFzf) {
+        $results += [pscustomobject]@{ Category = 'Modules'; Check = 'PSFzf'; Status = 'OK'; Detail = 'available' }
+    }
+    else {
+        $results += [pscustomobject]@{ Category = 'Modules'; Check = 'PSFzf'; Status = 'WARN'; Detail = 'not installed (Ctrl+R/Ctrl+T disabled)' }
+    }
+    $prl = Get-Module PSReadLine
+    if ($prl) {
+        $results += [pscustomobject]@{ Category = 'Modules'; Check = 'PSReadLine'; Status = 'OK'; Detail = "v$($prl.Version)" }
+    }
+    else {
+        $results += [pscustomobject]@{ Category = 'Modules'; Check = 'PSReadLine'; Status = 'FAIL'; Detail = 'not loaded' }
+    }
+
+    # Plugins
+    $pluginDir = Join-Path $cacheDir 'plugins'
+    if (Test-Path $pluginDir) {
+        $plugins = @(Get-ChildItem $pluginDir -Filter *.ps1 -ErrorAction SilentlyContinue)
+        $results += [pscustomobject]@{ Category = 'Plugins'; Check = 'user plugins'; Status = 'OK'; Detail = "$($plugins.Count) file(s) in $pluginDir" }
+    }
+
+    # Extensibility state
+    $trustedCount = if ($script:PSP.TrustedDirs) { $script:PSP.TrustedDirs.Count } else { 0 }
+    $results += [pscustomobject]@{ Category = 'Extension'; Check = 'trusted directories'; Status = 'OK'; Detail = "$trustedCount entries" }
+
+    # Format + render
+    $okCount = @($results | Where-Object Status -eq 'OK').Count
+    $warnCount = @($results | Where-Object Status -eq 'WARN').Count
+    $failCount = @($results | Where-Object Status -eq 'FAIL').Count
+
+    Write-Host ''
+    Write-Host 'Profile Health Check' -ForegroundColor Cyan
+    Write-Host '===================='
+    $fmt = '{0,-10} {1,-30} {2,-5} {3}'
+    Write-Host ($fmt -f 'Category', 'Check', 'Stat', 'Detail') -ForegroundColor DarkGray
+    foreach ($r in $results) {
+        $color = switch ($r.Status) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'White' } }
+        $detail = if ($r.Detail.Length -gt 80) { $r.Detail.Substring(0, 77) + '...' } else { $r.Detail }
+        Write-Host ($fmt -f $r.Category, $r.Check, $r.Status, $detail) -ForegroundColor $color
+    }
+    Write-Host ''
+    $summaryColor = if ($failCount -gt 0) { 'Red' } elseif ($warnCount -gt 0) { 'Yellow' } else { 'Green' }
+    Write-Host ("Summary: {0} OK, {1} WARN, {2} FAIL" -f $okCount, $warnCount, $failCount) -ForegroundColor $summaryColor
+
+    # Return the objects too so scripts can query: Test-ProfileHealth | Where Status -eq 'FAIL'
+    $results
+}
+Set-Alias -Name psp-doctor -Value Test-ProfileHealth -Scope Script
+
 # Clear profile cache (Oh My Posh and our own) to resolve issues with stale data or after manual edits to cache files. Terminal restart is required to see changes.
 function Clear-ProfileCache {
     $cacheDir = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
@@ -2179,19 +2950,102 @@ function Clear-ProfileCache {
         Write-Host "No cache directory found." -ForegroundColor Yellow
         return
     }
-    $items = Get-ChildItem $cacheDir -Exclude "user-settings.json" -ErrorAction SilentlyContinue
+    # Preserve user-owned content: user-settings.json (config) and plugins/ (user-installed scripts).
+    # Everything else is regenerable cache and can be safely removed.
+    $preservedNames = @('user-settings.json', 'plugins')
+    $items = Get-ChildItem $cacheDir -ErrorAction SilentlyContinue | Where-Object { $preservedNames -notcontains $_.Name }
     if (-not $items) {
         Clear-OhMyPoshCaches -Quiet
         Write-Host "Cache is already clean." -ForegroundColor Green
         return
     }
     foreach ($item in $items) {
-        Remove-Item $item.FullName -Force -ErrorAction SilentlyContinue
+        if ($item.PSIsContainer) {
+            Remove-Item $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Remove-Item $item.FullName -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "  Removed $($item.Name)" -ForegroundColor DarkGray
     }
     Clear-OhMyPoshCaches -Quiet
     Restart-TerminalToApply -Message "Profile cache cleared. Restarting terminal..."
 }
+
+# Re-run setup.ps1 -Wizard so the user can pick a new OMP theme, WT scheme, font, and
+# features without reinstalling from scratch. Downloads a fresh setup.ps1 to %TEMP%
+# (to pick up the latest wizard logic) and relaunches elevated in a new pwsh window.
+#
+# Security: downloads remote code, so the user must either pin -ExpectedSha256 or explicitly
+# confirm -SkipHashCheck. Exit code of the child process is captured so we do not claim
+# "Wizard complete" on a failure.
+function Invoke-ProfileWizard {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [switch]$Resume,
+        [switch]$NoElevate,
+        [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+        [string]$ExpectedSha256,
+        [switch]$SkipHashCheck
+    )
+
+    $setupUrl = "$repo_root/$repo_name/main/setup.ps1"
+    $setupLocal = Join-Path ([System.IO.Path]::GetTempPath()) ("psp-reconfigure-{0}.ps1" -f ([System.IO.Path]::GetRandomFileName()))
+
+    Write-Host "Downloading latest setup.ps1 from $setupUrl" -ForegroundColor Cyan
+    if (-not $PSCmdlet.ShouldProcess($setupUrl, 'Download and execute remote setup.ps1')) { return }
+    try { Invoke-DownloadWithRetry -Uri $setupUrl -OutFile $setupLocal }
+    catch {
+        Write-Warning "Download failed: $($_.Exception.Message)"
+        return
+    }
+
+    try {
+        $actualHash = (Get-FileHash -LiteralPath $setupLocal -Algorithm SHA256).Hash
+        if ($ExpectedSha256) {
+            if ($actualHash -ine $ExpectedSha256.Trim()) {
+                Write-Error "SHA256 mismatch. Expected: $ExpectedSha256. Actual: $actualHash. Aborting."
+                return
+            }
+            Write-Host "  Hash verified: $actualHash" -ForegroundColor Green
+        }
+        elseif (-not $SkipHashCheck) {
+            Write-Host "  Downloaded setup.ps1 SHA256: $actualHash" -ForegroundColor Yellow
+            Write-Host "  (Hash is computed over the download just made; it confirms integrity," -ForegroundColor DarkYellow
+            Write-Host "   not upstream authenticity. Verify the commit out-of-band before pinning.)" -ForegroundColor DarkYellow
+            Write-Host "  Pin it:  Invoke-ProfileWizard -ExpectedSha256 '$actualHash'" -ForegroundColor Yellow
+            Write-Host "  Or skip: Invoke-ProfileWizard -SkipHashCheck" -ForegroundColor Yellow
+            throw "Hash input required. Re-run with -ExpectedSha256 or -SkipHashCheck."
+        }
+
+        $shellArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $setupLocal, '-Wizard')
+        if ($Resume) { $shellArgs += '-Resume' }
+
+        $pwshExe = if ((Get-Command pwsh -ErrorAction SilentlyContinue)) { 'pwsh' } else { 'powershell' }
+        $exitCode = 1
+
+        if ($isAdmin -or $NoElevate) {
+            & $pwshExe @shellArgs
+            $exitCode = $LASTEXITCODE
+        }
+        else {
+            Write-Host "Launching elevated wizard in a new window ..." -ForegroundColor Cyan
+            $proc = Start-Process -FilePath $pwshExe -ArgumentList $shellArgs -Verb RunAs -Wait -PassThru
+            $exitCode = if ($proc) { $proc.ExitCode } else { 1 }
+        }
+
+        if ($exitCode -eq 0) {
+            Write-Host "Wizard complete. Reload your shell (run 'reload') to apply changes." -ForegroundColor Green
+        }
+        else {
+            Write-Warning "Wizard exited with code $exitCode. Review the output above."
+        }
+    }
+    finally {
+        Remove-Item $setupLocal -Force -ErrorAction SilentlyContinue
+    }
+}
+Set-Alias -Name Reconfigure-Profile -Value Invoke-ProfileWizard -Scope Script
 
 # Uninstall profile components with granular options. By default, only non-user data caches and PSFzf module are removed to allow for quick resets without data loss.
 # Use -All to remove everything including user settings and fonts. Windows Terminal settings are handled in a way to allow easy restoration of previous state if not doing a hard reset.
@@ -2209,8 +3063,8 @@ function Uninstall-Profile {
     $preserved = @()
 
     # Phase 1: Windows Terminal settings
-    $wtSettingsPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
-    if (Test-Path (Split-Path $wtSettingsPath)) {
+    $wtSettingsPath = Get-WindowsTerminalSettingsPath
+    if ($wtSettingsPath -and (Test-Path (Split-Path $wtSettingsPath))) {
         $wtLocalState = Split-Path $wtSettingsPath
         $backups = Get-ChildItem -Path $wtLocalState -Filter 'settings.json.*.bak' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending
@@ -2419,6 +3273,9 @@ function Uninstall-Profile {
             Write-Warning '  Font removal requires an elevated (admin) terminal. Skipping.'
         }
         else {
+            # Derive the font filter from terminal-config.json's fontInstall.displayName so uninstall
+            # mirrors whatever font the current install actually placed. Falls back to CaskaydiaCove
+            # only if terminal-config.json is unreadable (install default).
             $fontDisplayName = 'CaskaydiaCove NF'
             try {
                 $tcPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\terminal-config.json'
@@ -2428,45 +3285,61 @@ function Uninstall-Profile {
                 }
             }
             catch { $null = $_ }
+            $tokens = $fontDisplayName -split '\s+' | Where-Object { $_ }
+            # Avoid -Filter globbing (which treats [ ] * ? as wildcards - can match unintended
+            # files if displayName contains those chars). Use -match with an anchored regex on .ttf.
+            $regexPattern = ($tokens | ForEach-Object { [regex]::Escape($_) }) -join '.*'
             $fontDir = Join-Path $env:SystemRoot 'Fonts'
             $regPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-            $fontFiles = Get-ChildItem $fontDir -Filter '*CaskaydiaCove*NF*.ttf' -ErrorAction SilentlyContinue
+            $fontFiles = Get-ChildItem $fontDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.ttf' -and $_.Name -match $regexPattern }
             if ($fontFiles) {
                 foreach ($f in $fontFiles) {
                     if ($PSCmdlet.ShouldProcess($f.Name, 'Remove font file')) {
                         Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
                     }
                 }
-                # Clean registry entries
                 $regEntries = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
                 if ($regEntries) {
-                    $regEntries.PSObject.Properties | Where-Object { $_.Name -match 'Caskaydia' -and $_.Name -match 'NF' } | ForEach-Object {
+                    $regEntries.PSObject.Properties | Where-Object { $_.Name -match $regexPattern } | ForEach-Object {
                         if ($PSCmdlet.ShouldProcess($_.Name, 'Remove font registry entry')) {
                             Remove-ItemProperty -Path $regPath -Name $_.Name -Force -ErrorAction SilentlyContinue
                         }
                     }
                 }
-                Write-Host "  Removed $($fontDisplayName) font files." -ForegroundColor Green
+                Write-Host "  Removed $fontDisplayName font files." -ForegroundColor Green
             }
             else {
-                Write-Host "  No Nerd Font files found to remove." -ForegroundColor DarkGray
+                Write-Host "  No Nerd Font files matching '$fontDisplayName' found to remove." -ForegroundColor DarkGray
             }
         }
     }
     else { $preserved += 'Nerd Fonts (use -RemoveFonts to remove, requires admin)' }
 
-    # Phase 6: Remove telemetry opt-out env var
+    # Phase 6: Remove telemetry opt-out env var (only if we set it).
+    # Ownership is tracked via $cacheDir\telemetry.owned (written by setup.ps1 when the user
+    # answered yes to the opt-out prompt). Without the marker we leave the env var alone,
+    # because other tools (or the user's own config) may depend on it.
     $isElevatedNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $telemetryMarker = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\telemetry.owned'
     if ([System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
-        if ($isElevatedNow) {
+        if (-not (Test-Path -LiteralPath $telemetryMarker)) {
+            Write-Host '  Leaving POWERSHELL_TELEMETRY_OPTOUT alone (no ownership marker; value may belong to another tool or user setting).' -ForegroundColor DarkGray
+        }
+        elseif ($isElevatedNow) {
             if ($PSCmdlet.ShouldProcess('POWERSHELL_TELEMETRY_OPTOUT', 'Remove machine environment variable')) {
                 [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', $null, [System.EnvironmentVariableTarget]::Machine)
+                Remove-Item -LiteralPath $telemetryMarker -Force -ErrorAction SilentlyContinue
                 Write-Host '  Removed POWERSHELL_TELEMETRY_OPTOUT env var.' -ForegroundColor Green
             }
         }
         else {
             Write-Host '  Skipping POWERSHELL_TELEMETRY_OPTOUT removal (requires admin).' -ForegroundColor DarkGray
         }
+    }
+    elseif (Test-Path -LiteralPath $telemetryMarker) {
+        # Env var already gone; clean up the stale marker so repeat uninstalls stay idempotent.
+        Remove-Item -LiteralPath $telemetryMarker -Force -ErrorAction SilentlyContinue
     }
 
     # Phase 7: Profile files
@@ -2521,7 +3394,7 @@ function weather {
     # Try wttr.in first, fall back to Open-Meteo if unreachable
     $url = if ($encoded) { "https://wttr.in/${encoded}?format=3" } else { "https://wttr.in/?format=3" }
     try {
-        $r = Invoke-RestMethod $url -TimeoutSec 10 -Headers @{ 'User-Agent' = 'curl' }
+        $r = Invoke-RestMethod $url -TimeoutSec 10 -Headers @{ 'User-Agent' = 'curl' } -UseBasicParsing
         $text = ($r | Out-String).Trim()
         if ($text -and $text -notmatch '(?i)unknown|error|not found') {
             $text
@@ -2533,12 +3406,12 @@ function weather {
     # Fallback: Open-Meteo (free, no API key)
     try {
         $loc = if ($City) {
-            $geo = Invoke-RestMethod "https://geocoding-api.open-meteo.com/v1/search?name=$encoded&count=1" -TimeoutSec 5
+            $geo = Invoke-RestMethod "https://geocoding-api.open-meteo.com/v1/search?name=$encoded&count=1" -TimeoutSec 5 -UseBasicParsing
             if (-not $geo -or -not $geo.results -or @($geo.results).Count -eq 0) { Write-Error "City '$City' not found."; return }
             $geo.results[0]
         }
         else {
-            $ip = Invoke-RestMethod "https://ipinfo.io/json" -TimeoutSec 5
+            $ip = Invoke-RestMethod "https://ipinfo.io/json" -TimeoutSec 5 -UseBasicParsing
             if (-not $ip -or -not $ip.loc -or $ip.loc -notmatch ',') { Write-Error "Could not determine location from IP."; return }
             $ll = $ip.loc -split ','
             if ($ll.Count -lt 2) { Write-Error "Malformed location data from IP lookup."; return }
@@ -2547,7 +3420,7 @@ function weather {
         if (-not $loc) { return }
         $lat = ([double]$loc.latitude).ToString([System.Globalization.CultureInfo]::InvariantCulture)
         $lon = ([double]$loc.longitude).ToString([System.Globalization.CultureInfo]::InvariantCulture)
-        $wx = Invoke-RestMethod "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,weather_code" -TimeoutSec 5
+        $wx = Invoke-RestMethod "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,weather_code" -TimeoutSec 5 -UseBasicParsing
         if (-not $wx -or -not $wx.current) { Write-Error "Weather API returned no data."; return }
         $temp = $wx.current.temperature_2m
         $unit = if ($wx.current_units -and $wx.current_units.temperature_2m) { $wx.current_units.temperature_2m } else { 'C' }
@@ -2609,8 +3482,9 @@ function speedtest {
     Write-Host "Testing download speed..." -ForegroundColor Cyan
     $url = "https://speed.cloudflare.com/__down?bytes=25000000"
     $start = Get-Date
+    $oldTitle = Push-TabTitle 'speedtest'
     try {
-        Invoke-RestMethod $url -TimeoutSec 30 -ErrorAction Stop | Out-Null
+        Invoke-RestMethod $url -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop | Out-Null
         $elapsed = [math]::Max(((Get-Date) - $start).TotalSeconds, 0.001)
         $mbps = [math]::Round((25 * 8) / $elapsed, 1)
         Write-Host "Download: ~${mbps} Mbps ($([math]::Round($elapsed, 1))s for 25 MB)" -ForegroundColor Green
@@ -2619,6 +3493,7 @@ function speedtest {
         if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Speed test failed: $_"
     }
+    finally { Pop-TabTitle $oldTitle }
 }
 
 # Get size of a file or directory in a human-readable format. For directories, it sums the sizes of all contained files recursively. Handles errors gracefully and formats output with appropriate units.
@@ -2651,6 +3526,40 @@ function eventlog {
 
 # SSH & Remote
 if (Get-Command ssh -ErrorAction SilentlyContinue) {
+    # Wrapper: inject short ConnectTimeout and keepalive defaults so ssh.exe fails fast
+    # instead of ignoring Ctrl+C during a hung TCP connect (long-standing Windows OpenSSH quirk).
+    # User-supplied -o values take precedence because we only inject when the option is absent.
+    function ssh {
+        # Match both OpenSSH forms: '-o Key=Val' (space) and '-oKey=Val' (no space).
+        # \s* = zero or more whitespace. Otherwise users passing '-oConnectTimeout=60' would
+        # get our default injected ahead, and OpenSSH takes first-wins so their override loses.
+        $argText = ($args -join ' ')
+        $extra = @()
+        if ($argText -notmatch '-o\s*ConnectTimeout') { $extra += '-o'; $extra += 'ConnectTimeout=10' }
+        if ($argText -notmatch '-o\s*ServerAliveInterval') { $extra += '-o'; $extra += 'ServerAliveInterval=30' }
+        if ($argText -notmatch '-o\s*ServerAliveCountMax') { $extra += '-o'; $extra += 'ServerAliveCountMax=3' }
+        # Tab title: first non-flag, non-option-value arg is typically the target (user@host).
+        # Skips flags (-X) and values of options that take one (-p 22, -i keyfile, etc.).
+        $target = $null
+        $skipNext = $false
+        $flagsWithValue = @('-p', '-i', '-l', '-o', '-F', '-L', '-R', '-D', '-W', '-B', '-b', '-c', '-E', '-e', '-I', '-J', '-m', '-O', '-Q', '-S', '-w')
+        foreach ($a in $args) {
+            if ($skipNext) { $skipNext = $false; continue }
+            if ($a -is [string] -and $a.StartsWith('-')) {
+                if ($flagsWithValue -contains $a) { $skipNext = $true }
+                continue
+            }
+            $target = [string]$a
+            break
+        }
+        $oldTitle = if ($target) { Push-TabTitle "ssh $target" } else { $null }
+        try {
+            if ($MyInvocation.ExpectingInput) { $input | & ssh.exe @extra @args }
+            else { & ssh.exe @extra @args }
+        }
+        finally { Pop-TabTitle $oldTitle }
+    }
+
     # Copy SSH public key to remote host (ssh-copy-id equivalent)
     function Copy-SshKey {
         param([Parameter(Mandatory)][string]$RemoteHost)
@@ -2707,6 +3616,252 @@ function killport {
     }
     if ($killed -gt 0) { Write-Host "Port $Port freed." -ForegroundColor Green }
     else { Write-Warning "No processes were stopped on port $Port." }
+}
+
+# Interactive port killer. Lists every listening TCP port with PID + process name,
+# opens fzf (multi-select with Tab) or Out-GridView as fallback, kills everything picked.
+# Perfect for "I started 5 dev servers today, which ones are still running?".
+function Stop-ListeningPort {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    $conns = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Sort-Object LocalPort)
+    if (-not $conns) { Write-Host "No listening TCP ports." -ForegroundColor Yellow; return }
+    $rows = foreach ($c in $conns) {
+        $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            Port    = $c.LocalPort
+            Address = $c.LocalAddress
+            PID     = $c.OwningProcess
+            Process = if ($proc) { $proc.ProcessName } else { '-' }
+        }
+    }
+    $selected = @()
+    if (Get-Command fzf -ErrorAction SilentlyContinue) {
+        # Format each row into a single fzf line; parse selection back to PID via last column.
+        $lines = $rows | ForEach-Object {
+            ('{0,-7} {1,-20} {2,-8} {3}' -f $_.Port, $_.Address, $_.PID, $_.Process)
+        }
+        $picked = $lines | fzf --multi --header='Tab to multi-select, Enter to kill' --prompt='killport> '
+        if (-not $picked) { Write-Host 'Nothing selected.' -ForegroundColor DarkGray; return }
+        foreach ($line in @($picked)) {
+            # PID is the third whitespace-separated column in our formatted line.
+            $cols = $line -split '\s+' | Where-Object { $_ }
+            if ($cols.Count -ge 3) {
+                $selected += ($rows | Where-Object { [string]$_.PID -eq $cols[2] } | Select-Object -First 1)
+            }
+        }
+    }
+    else {
+        $selected = @($rows | Out-GridView -Title 'Select ports to kill (Ctrl/Shift for multi)' -PassThru)
+        if (-not $selected) { Write-Host 'Nothing selected.' -ForegroundColor DarkGray; return }
+    }
+    foreach ($row in $selected) {
+        if ($row.PID -eq 0 -or $row.PID -eq 4) {
+            Write-Warning "Skipping system PID $($row.PID) on port $($row.Port)."
+            continue
+        }
+        if ($PSCmdlet.ShouldProcess("PID $($row.PID) ($($row.Process)) on port $($row.Port)", 'Stop process')) {
+            try {
+                Stop-Process -Id $row.PID -Force -ErrorAction Stop
+                Write-Host ("Killed: {0} (PID {1}) on port {2}" -f $row.Process, $row.PID, $row.Port) -ForegroundColor Green
+            }
+            catch { Write-Warning ("Could not stop PID {0}: {1}" -f $row.PID, $_.Exception.Message) }
+        }
+    }
+}
+Set-Alias -Name killports -Value Stop-ListeningPort
+
+# ==========================================================================
+# Stuck processes / locked files
+# ==========================================================================
+
+# Internal: compile the Restart-Manager P/Invoke wrapper once per session.
+# Uses the same Windows API Explorer uses when it says "The action can't be completed
+# because the file is open in X". Reliable across NTFS, mapped drives, network shares.
+function Initialize-RestartManagerType {
+    if ('PSP.RestartManager' -as [type]) { return }
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace PSP {
+    public static class RestartManager {
+        [StructLayout(LayoutKind.Sequential)]
+        struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+        const int CCH_RM_MAX_APP_NAME = 255;
+        const int CCH_RM_MAX_SVC_NAME = 63;
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)] public string strServiceShortName;
+            public int ApplicationType; public uint AppStatus; public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Auto)]
+        static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+        [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint pSessionHandle);
+        [DllImport("rstrtmgr.dll")]
+        static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+        public static List<int> WhoIsLocking(string path) {
+            uint handle; string key = Guid.NewGuid().ToString();
+            List<int> ids = new List<int>();
+            int r = RmStartSession(out handle, 0, key);
+            if (r != 0) throw new Exception("RmStartSession failed: " + r);
+            try {
+                r = RmRegisterResources(handle, 1, new string[] { path }, 0, null, 0, null);
+                if (r != 0) throw new Exception("RmRegisterResources failed: " + r);
+                uint needed = 0; uint count = 0; uint reason = 0;
+                r = RmGetList(handle, out needed, ref count, new RM_PROCESS_INFO[0], ref reason);
+                if (r == 234) {
+                    RM_PROCESS_INFO[] info = new RM_PROCESS_INFO[needed]; count = needed;
+                    r = RmGetList(handle, out needed, ref count, info, ref reason);
+                    if (r != 0) throw new Exception("RmGetList failed: " + r);
+                    for (int i = 0; i < count; i++) ids.Add(info[i].Process.dwProcessId);
+                }
+                else if (r != 0) throw new Exception("RmGetList failed: " + r);
+            }
+            finally { RmEndSession(handle); }
+            return ids;
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
+# Find which processes are holding a file or directory open. Works for any reason a file
+# is locked: antivirus scanning, Explorer preview, IDE index, shared mapping, etc.
+function Find-FileLocker {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+    try { Initialize-RestartManagerType }
+    catch { Write-Error "Could not load Restart-Manager API: $($_.Exception.Message)"; return }
+    $ids = [PSP.RestartManager]::WhoIsLocking($resolved.ProviderPath)
+    if (-not $ids -or $ids.Count -eq 0) {
+        Write-Host "No process is holding a lock on: $($resolved.ProviderPath)" -ForegroundColor Green
+        return
+    }
+    foreach ($procId in $ids) {
+        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($p) {
+            [PSCustomObject]@{
+                PID         = $procId
+                Name        = $p.ProcessName
+                WindowTitle = $p.MainWindowTitle
+                Started     = $p.StartTime
+                Path        = try { $p.Path } catch { '<access denied>' }
+            }
+        }
+        else {
+            [PSCustomObject]@{
+                PID = $procId; Name = '<terminated>'; WindowTitle = ''; Started = $null; Path = $null
+            }
+        }
+    }
+}
+
+# Aggressively kill a process that won't die with ordinary Stop-Process. Escalates:
+# Stop-Process -Force -> taskkill /F -> taskkill /F /T (child tree).
+# Accepts process name (all instances), PID (single), or pipeline of either.
+function Stop-StuckProcess {
+    [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'ByName')]
+    param(
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'ByName', ValueFromPipeline)]
+        [string[]]$Name,
+        [Parameter(Mandatory, ParameterSetName = 'ById')][int[]]$Id,
+        [switch]$Tree
+    )
+    begin { $targets = [System.Collections.Generic.List[int]]::new() }
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            foreach ($i in $Id) { [void]$targets.Add($i) }
+        }
+        else {
+            foreach ($n in $Name) {
+                $found = @(Get-Process -Name ($n -replace '\.exe$', '') -ErrorAction SilentlyContinue)
+                if (-not $found) { Write-Warning "No process matching: $n"; continue }
+                foreach ($p in $found) { [void]$targets.Add($p.Id) }
+            }
+        }
+    }
+    end {
+        if ($targets.Count -eq 0) { return }
+        $targets = $targets | Select-Object -Unique
+        foreach ($procId in $targets) {
+            $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+            if (-not $p) { Write-Host "PID $procId already gone." -ForegroundColor DarkGray; continue }
+            $label = "$($p.ProcessName) (PID $procId)"
+            if (-not $PSCmdlet.ShouldProcess($label, 'Stop process (escalating)')) { continue }
+            # Stage 1: Stop-Process -Force
+            try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { $null = $_ }
+            Start-Sleep -Milliseconds 200
+            if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {
+                Write-Host "Stopped: $label" -ForegroundColor Green
+                continue
+            }
+            # Stage 2: taskkill /F (with /T if requested)
+            $tkArgs = @('/F', '/PID', $procId)
+            if ($Tree) { $tkArgs += '/T' }
+            & taskkill.exe @tkArgs 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 300
+            if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {
+                Write-Host "Force-killed: $label" -ForegroundColor Yellow
+            }
+            else {
+                Write-Error "Could not stop: $label. Likely needs SYSTEM privileges (protected process, antivirus, driver-held handle)."
+            }
+        }
+    }
+}
+
+# Convenience: find what's holding a lock, kill those processes (aggressive), then delete.
+# Backs off gracefully if the item still can't be removed (e.g. SYSTEM-held, in use by driver).
+function Remove-LockedItem {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Path,
+        [switch]$Recurse,
+        [switch]$KillSystem  # include PID 0/4 lockers (usually pointless, always dangerous)
+    )
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+    if (-not $PSCmdlet.ShouldProcess($resolved.ProviderPath, 'Kill lockers and delete')) { return }
+    # Try a plain delete first. Fastest path when nothing is actually locking.
+    try {
+        Remove-Item -LiteralPath $resolved.ProviderPath -Recurse:$Recurse -Force -ErrorAction Stop
+        Write-Host "Deleted: $($resolved.ProviderPath)" -ForegroundColor Green
+        return
+    }
+    catch {
+        Write-Host "Initial delete failed, investigating lockers..." -ForegroundColor Yellow
+    }
+    $lockers = @(Find-FileLocker -Path $resolved.ProviderPath)
+    if (-not $lockers) {
+        Write-Error "Delete failed but no lockers reported. Check permissions or path." -ErrorAction Continue
+        return
+    }
+    Write-Host "Lockers found:" -ForegroundColor Cyan
+    $lockers | Format-Table PID, Name, WindowTitle | Out-Host
+    foreach ($l in $lockers) {
+        if (-not $KillSystem -and ($l.PID -eq 0 -or $l.PID -eq 4 -or $l.Name -eq 'System')) {
+            Write-Warning "Skipping system process $($l.Name) (PID $($l.PID)). Use -KillSystem to override (usually pointless)."
+            continue
+        }
+        Stop-StuckProcess -Id $l.PID -Tree -Confirm:$false
+    }
+    Start-Sleep -Milliseconds 500
+    try {
+        Remove-Item -LiteralPath $resolved.ProviderPath -Recurse:$Recurse -Force -ErrorAction Stop
+        Write-Host "Deleted after unlocking: $($resolved.ProviderPath)" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Still locked after killing reported lockers: $($_.Exception.Message)"
+        Write-Host 'Next steps: reboot, or check for SYSTEM/driver lock via Sysinternals Handle/Process Explorer.' -ForegroundColor DarkGray
+    }
 }
 
 # Make HTTP requests with flexible options for method, body, headers, and content type. By default, it performs a GET request and attempts to parse JSON responses for pretty output.
@@ -2850,9 +4005,13 @@ function urldecode {
 # Measure execution time of a scriptblock
 function timer {
     param([Parameter(Mandatory)][scriptblock]$Command)
+    $oldTitle = Push-TabTitle 'timer'
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & $Command
-    $sw.Stop()
+    try { & $Command }
+    finally {
+        $sw.Stop()
+        Pop-TabTitle $oldTitle
+    }
     Write-Host ('Elapsed: {0:N3}s' -f $sw.Elapsed.TotalSeconds) -ForegroundColor Cyan
 }
 
@@ -2940,7 +4099,7 @@ function ipinfo {
     param([string]$IpAddress)
     $url = if ($IpAddress) { "http://ip-api.com/json/$IpAddress" } else { "http://ip-api.com/json/" }
     try {
-        $info = Invoke-RestMethod -Uri $url -TimeoutSec 10
+        $info = Invoke-RestMethod -Uri $url -TimeoutSec 10 -UseBasicParsing
         if (-not $info) { Write-Error "IP lookup returned no data."; return }
         if ($info.status -eq 'fail') { Write-Error "Lookup failed: $($info.message)"; return }
         Write-Host "  IP:       $($info.query)" -ForegroundColor White
@@ -2971,21 +4130,27 @@ function watch {
         [Parameter(Mandatory)][scriptblock]$Command,
         [int]$Interval = 2
     )
-    Write-Host "Every ${Interval}s. Ctrl+C to stop." -ForegroundColor DarkGray
-    while ($true) {
-        Clear-Host
-        Write-Host ("watch: every {0}s | {1}" -f $Interval, (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
-        Write-Host ""
-        try { & $Command }
-        catch {
-            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        try { Start-Sleep -Seconds $Interval }
-        catch {
-            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+    $cmdLabel = ($Command.ToString().Trim() -replace '\s+', ' ')
+    if ($cmdLabel.Length -gt 40) { $cmdLabel = $cmdLabel.Substring(0, 40) + '...' }
+    $oldTitle = Push-TabTitle "watch: $cmdLabel"
+    try {
+        Write-Host "Every ${Interval}s. Ctrl+C to stop." -ForegroundColor DarkGray
+        while ($true) {
+            Clear-Host
+            Write-Host ("watch: every {0}s | {1}" -f $Interval, (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+            Write-Host ""
+            try { & $Command }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+                Write-Host $_.Exception.Message -ForegroundColor Red
+            }
+            try { Start-Sleep -Seconds $Interval }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            }
         }
     }
+    finally { Pop-TabTitle $oldTitle }
 }
 
 # WHOIS domain lookup via RDAP (IANA standard, no external tools needed)
@@ -2993,7 +4158,7 @@ function whois {
     param([Parameter(Mandatory)][string]$Domain)
     $Domain = $Domain -replace '^https?://', '' -replace '/.*$', ''
     try {
-        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$Domain" -TimeoutSec 10
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$Domain" -TimeoutSec 10 -UseBasicParsing
         Write-Host "  Domain:     $($rdap.ldhName)" -ForegroundColor White
         Write-Host "  Status:     $(@($rdap.status) -join ', ')" -ForegroundColor White
         if ($rdap.entities) {
@@ -3058,32 +4223,1062 @@ function Invoke-Clipboard {
 }
 Set-Alias -Name icb -Value Invoke-Clipboard
 
-# Enhanced PSReadLine Configuration
+# Argument completers (tab-complete for custom commands)
+
+# Common ports for fwallow/fwblock -Port
+Register-ArgumentCompleter -CommandName fwallow, fwblock -ParameterName Port -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    @(22, 53, 80, 139, 143, 443, 445, 465, 587, 993, 995, 1194, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017) |
+    Where-Object { [string]$_ -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new([string]$_, [string]$_, 'ParameterValue', [string]$_) }
+}
+
+# Available Windows event logs for journal -LogName
+Register-ArgumentCompleter -CommandName journal -ParameterName LogName -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    try {
+        Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
+        Where-Object { $_.LogName -like "$wordToComplete*" } |
+        Select-Object -First 25 |
+        ForEach-Object { [System.Management.Automation.CompletionResult]::new("'$($_.LogName)'", $_.LogName, 'ParameterValue', $_.LogName) }
+    }
+    catch { $null = $_ }
+}
+
+# Common gitignore.io templates for gitignore <language>
+Register-ArgumentCompleter -CommandName gitignore -ParameterName Language -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    @('python', 'node', 'go', 'rust', 'java', 'windows', 'visualstudio', 'macos', 'linux',
+        'vim', 'emacs', 'vscode', 'pycharm', 'intellij', 'sublimetext', 'ruby', 'swift',
+        'kotlin', 'scala', 'cpp', 'c', 'dotnetcore', 'android', 'ios', 'unity', 'unreal',
+        'jekyll', 'wordpress', 'laravel', 'django', 'flask', 'terraform', 'ansible',
+        'docker', 'kubernetes', 'svelte', 'nextjs', 'gatsby', 'angular', 'react') |
+    Where-Object { $_ -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+}
+
+# Nmap modes for nscan -Mode (redundant with ValidateSet but gives richer descriptions)
+Register-ArgumentCompleter -CommandName nscan -ParameterName Mode -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    $modes = @{
+        'Quick'    = 'Top ports with aggressive timing'
+        'Full'     = 'All 65535 ports'
+        'Services' = 'Service and default-script detection'
+        'Stealth'  = 'SYN scan with fragmentation'
+        'Vuln'     = 'Vuln NSE scripts + service detection'
+        'Ports'    = 'Custom -Ports list'
+    }
+    $modes.GetEnumerator() | Where-Object { $_.Key -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
+}
+
+# Defender scan modes
+Register-ArgumentCompleter -CommandName defscan -ParameterName Mode -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    @('Quick', 'Full') | Where-Object { $_ -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+}
+
+# Lint mode presets
+Register-ArgumentCompleter -CommandName lint -ParameterName Mode -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    $modes = @{
+        'Standard' = 'Default PSScriptAnalyzer rule set'
+        'Strict'   = 'Include Information-level issues'
+        'Security' = 'Security-relevant rules only'
+        'CI'       = 'Match the project CI ExcludeRule list'
+    }
+    $modes.GetEnumerator() | Where-Object { $_.Key -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
+}
+
+# Existing trusted directories for Remove-TrustedDirectory -Path
+Register-ArgumentCompleter -CommandName Remove-TrustedDirectory -ParameterName Path -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    if (-not $script:PSP) { return }
+    $script:PSP.TrustedDirs | Where-Object { $_ -like "*$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new("'$_'", $_, 'ParameterValue', $_) }
+}
+
+# Set-TerminalBackground: StretchMode / Alignment with human-readable descriptions
+Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName StretchMode -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    $modes = @{
+        'none'          = 'Original image size (no stretch)'
+        'fill'          = 'Stretch to fill, ignore aspect ratio'
+        'uniform'       = 'Scale to fit while preserving aspect'
+        'uniformToFill' = 'Scale to fill while preserving aspect (crop)'
+    }
+    $modes.GetEnumerator() | Where-Object { $_.Key -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
+}
+
+Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName Alignment -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    @('center', 'left', 'top', 'right', 'bottom', 'topLeft', 'topRight', 'bottomLeft', 'bottomRight') |
+    Where-Object { $_ -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+}
+
+# WSL distro name completion for all WSL helpers that take a -Distro parameter.
+# Calls Get-WslDistro at completion time; silently returns nothing if wsl.exe is unavailable.
+Register-ArgumentCompleter -CommandName Enter-WslHere, ConvertTo-WslPath, ConvertTo-WindowsPath, Stop-Wsl, Get-WslIp, Get-WslFile, Show-WslTree, Open-WslExplorer -ParameterName Distro -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    if (-not (Get-Command Get-WslDistro -ErrorAction SilentlyContinue)) { return }
+    try {
+        Get-WslDistro | Where-Object { $_.Name -like "$wordToComplete*" } |
+        ForEach-Object {
+            $tip = "$($_.State), WSL$($_.Version)" + $(if ($_.Default) { ' (default)' } else { '' })
+            [System.Management.Automation.CompletionResult]::new($_.Name, $_.Name, 'ParameterValue', $tip)
+        }
+    }
+    catch { $null = $_ }
+}
+
+# Stop-StuckProcess -Name: live list of running processes (unique names).
+Register-ArgumentCompleter -CommandName Stop-StuckProcess -ParameterName Name -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    try {
+        Get-Process -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty ProcessName -Unique |
+        Where-Object { $_ -like "$wordToComplete*" } |
+        Sort-Object |
+        ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+    }
+    catch { $null = $_ }
+}
+
+# Register-ProfileHook -EventName completion
+Register-ArgumentCompleter -CommandName Register-ProfileHook -ParameterName EventName -ScriptBlock {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
+    $events = @{
+        'OnProfileLoad' = 'Fires once after profile has loaded'
+        'PrePrompt'     = 'Fires before every prompt render'
+        'OnCd'          = 'Fires when the current directory changes'
+    }
+    $events.GetEnumerator() | Where-Object { $_.Key -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
+}
+
+# Sysadmin / Linux-feel
+
+# Tail Windows Event Log in journalctl style. Default: last 50 System events.
+# -Follow polls every 2s for new entries. -Level filters by severity name.
+function journal {
+    param(
+        [string]$LogName = 'System',
+        [int]$Count = 50,
+        [switch]$Follow,
+        [ValidateSet('Critical', 'Error', 'Warning', 'Information', 'Verbose')]
+        [string]$Level
+    )
+    $filter = @{ LogName = $LogName }
+    if ($Level) {
+        $filter.Level = switch ($Level) {
+            'Critical' { 1 } 'Error' { 2 } 'Warning' { 3 } 'Information' { 4 } 'Verbose' { 5 }
+        }
+    }
+    function Write-JournalLine {
+        param($Entry)
+        $color = switch ($Entry.LevelDisplayName) {
+            'Critical' { 'Red' } 'Error' { 'Red' } 'Warning' { 'Yellow' } default { 'Gray' }
+        }
+        $msg = ($Entry.Message -replace "`r?`n", ' ')
+        if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) + '...' }
+        Write-Host ("{0} [{1,-11}] {2}: {3}" -f $Entry.TimeCreated, $Entry.LevelDisplayName, $Entry.ProviderName, $msg) -ForegroundColor $color
+    }
+    $events = Get-WinEvent -FilterHashtable $filter -MaxEvents $Count -ErrorAction SilentlyContinue
+    if (-not $events) { Write-Host "No events matched." -ForegroundColor Yellow; return }
+    $events | Sort-Object TimeCreated | ForEach-Object { Write-JournalLine $_ }
+    if (-not $Follow) { return }
+    Write-Host "Following $LogName. Ctrl+C to stop." -ForegroundColor DarkGray
+    $lastTime = ($events | Sort-Object TimeCreated | Select-Object -Last 1).TimeCreated
+    $oldTitle = Push-TabTitle "journal: $LogName"
+    try {
+        while ($true) {
+            Start-Sleep -Seconds 2
+            $follow = $filter.Clone()
+            $follow.StartTime = $lastTime.AddMilliseconds(1)
+            $newEvents = Get-WinEvent -FilterHashtable $follow -ErrorAction SilentlyContinue
+            if ($newEvents) {
+                foreach ($entry in ($newEvents | Sort-Object TimeCreated)) {
+                    Write-JournalLine $entry
+                    $lastTime = $entry.TimeCreated
+                }
+            }
+        }
+    }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# List disks and partitions in a pretty tree (Linux lsblk equivalent).
+function lsblk {
+    $disks = Get-Disk -ErrorAction SilentlyContinue | Sort-Object Number
+    if (-not $disks) { Write-Warning "Get-Disk returned no disks."; return }
+    foreach ($disk in $disks) {
+        $sizeGB = [math]::Round($disk.Size / 1GB, 1)
+        Write-Host ("Disk {0}: {1} ({2} GB, {3})" -f $disk.Number, $disk.FriendlyName, $sizeGB, $disk.BusType) -ForegroundColor Cyan
+        $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue | Sort-Object PartitionNumber
+        foreach ($p in $partitions) {
+            $pSize = [math]::Round($p.Size / 1GB, 1)
+            $letter = if ($p.DriveLetter) { ('{0}:' -f $p.DriveLetter) } else { '' }
+            $label = ''
+            if ($p.DriveLetter) {
+                $vol = Get-Volume -DriveLetter $p.DriveLetter -ErrorAction SilentlyContinue
+                if ($vol) {
+                    $usedGB = [math]::Round(($vol.Size - $vol.SizeRemaining) / 1GB, 1)
+                    $label = ("{0} [{1}, {2}/{3} GB]" -f $vol.FileSystemLabel, $vol.FileSystem, $usedGB, $pSize)
+                }
+            }
+            Write-Host ("  {0,-3} {1,-6} {2,7} GB  {3,-22} {4}" -f $p.PartitionNumber, $letter, $pSize, $p.Type, $label)
+        }
+    }
+}
+
+# Interactive process viewer. Prefers btop/ntop/htop if installed, otherwise falls back
+# to the existing 'svc -Live' helper so the command always does something useful.
+function htop {
+    foreach ($c in @('btop', 'ntop', 'htop')) {
+        $cmd = Get-Command $c -ErrorAction SilentlyContinue
+        if ($cmd) { & $cmd.Source; return }
+    }
+    Write-Host 'No TUI process viewer installed. Tip: winget install aristocratos.btop4win' -ForegroundColor Yellow
+    Write-Host 'Falling back to svc -Live.' -ForegroundColor DarkGray
+    svc -Live
+}
+
+# Combined traceroute + per-hop ping (my traceroute). -Count pings per hop (default 3).
+function mtr {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [ValidateRange(1, 50)][int]$Count = 3,
+        [ValidateRange(1, 64)][int]$MaxHops = 30
+    )
+    $oldTitle = Push-TabTitle "mtr: $Target"
+    try {
+    Write-Host "Tracing route to $Target..." -ForegroundColor Cyan
+    $trace = Test-NetConnection $Target -TraceRoute -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+    if (-not $trace -or -not $trace.TraceRoute) { Write-Error "Traceroute failed for $Target"; return }
+    Write-Host ("  {0,-4} {1,-20} {2,7} {3,7} {4,7}  Samples" -f 'Hop', 'Address', 'Loss%', 'Avg', 'Best') -ForegroundColor DarkGray
+    $i = 0
+    foreach ($hop in @($trace.TraceRoute | Where-Object { $_ })) {
+        $i++
+        if ($i -gt $MaxHops) { break }
+        $times = @()
+        $lost = 0
+        for ($j = 0; $j -lt $Count; $j++) {
+            try {
+                $p = Test-Connection -ComputerName $hop -Count 1 -ErrorAction Stop
+                if ($p) {
+                    $lat = if ($p.PSObject.Properties['ResponseTime']) { [int]$p.ResponseTime } elseif ($p.PSObject.Properties['Latency']) { [int]$p.Latency } else { 0 }
+                    $times += $lat
+                }
+                else { $lost++ }
+            }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+                $lost++
+            }
+        }
+        $lossPct = [math]::Round(($lost / $Count) * 100, 0)
+        $avg = if ($times.Count) { [math]::Round(($times | Measure-Object -Average).Average, 0) } else { '-' }
+        $best = if ($times.Count) { ($times | Measure-Object -Minimum).Minimum } else { '-' }
+        $color = if ($lossPct -gt 20) { 'Red' } elseif ($lossPct -gt 5) { 'Yellow' } else { 'Green' }
+        Write-Host ("  {0,-4} {1,-20} {2,6}% {3,7} {4,7}   {5}" -f $i, $hop, $lossPct, $avg, $best, $times.Count) -ForegroundColor $color
+    }
+    }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# Quick Windows Firewall allow rule. Requires elevation and confirms before changing
+# global firewall state unless the caller passes -Confirm:$false.
+function fwallow {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Port,
+        [ValidateSet('TCP', 'UDP', 'Any')][string]$Protocol = 'TCP',
+        [ValidateSet('Inbound', 'Outbound')][string]$Direction = 'Inbound'
+    )
+    if (-not $isAdmin) { Write-Error 'Firewall changes require an elevated shell.'; return }
+    $splat = @{ DisplayName = $Name; Direction = $Direction; Action = 'Allow'; Protocol = $Protocol }
+    if ($Port) { $splat.LocalPort = $Port }
+    $portText = if ($Port) { " port $Port" } else { '' }
+    if (-not $PSCmdlet.ShouldProcess($Name, "Add firewall allow rule ($Direction $Protocol$portText)")) { return }
+    New-NetFirewallRule @splat | Out-Null
+    Write-Host ("Allow rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Green
+}
+
+# Quick Windows Firewall block rule. Requires elevation and confirms before changing
+# global firewall state unless the caller passes -Confirm:$false.
+function fwblock {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Port,
+        [ValidateSet('TCP', 'UDP', 'Any')][string]$Protocol = 'TCP',
+        [ValidateSet('Inbound', 'Outbound')][string]$Direction = 'Inbound'
+    )
+    if (-not $isAdmin) { Write-Error 'Firewall changes require an elevated shell.'; return }
+    $splat = @{ DisplayName = $Name; Direction = $Direction; Action = 'Block'; Protocol = $Protocol }
+    if ($Port) { $splat.LocalPort = $Port }
+    $portText = if ($Port) { " port $Port" } else { '' }
+    if (-not $PSCmdlet.ShouldProcess($Name, "Add firewall block rule ($Direction $Protocol$portText)")) { return }
+    New-NetFirewallRule @splat | Out-Null
+    Write-Host ("Block rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Yellow
+}
+
+# Cybersec
+
+# Nmap wrapper with curated scan profiles. Mode 'Ports' uses -Ports list.
+function nscan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [ValidateSet('Quick', 'Full', 'Services', 'Stealth', 'Vuln', 'Ports')]
+        [string]$Mode = 'Quick',
+        [int[]]$Ports
+    )
+    if (-not (Get-Command nmap -ErrorAction SilentlyContinue)) {
+        Write-Error 'nmap is not installed. Install with: winget install Insecure.Nmap'
+        return
+    }
+    $nmapArgs = switch ($Mode) {
+        'Quick' { @('-F', '-T4') }
+        'Full' { @('-p-', '-T4') }
+        'Services' { @('-sV', '-sC', '--top-ports', '1000') }
+        'Stealth' { @('-sS', '-T2', '-f') }
+        'Vuln' { @('--script', 'vuln', '-sV') }
+        'Ports' { @() }
+    }
+    if ($Mode -eq 'Ports' -and $Ports) { $nmapArgs += @('-p', ($Ports -join ',')) }
+    Write-Host ("nmap {0} {1}" -f ($nmapArgs -join ' '), $Target) -ForegroundColor DarkGray
+    $oldTitle = Push-TabTitle "nscan $Mode`: $Target"
+    try { nmap @nmapArgs $Target }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# Authenticode signature inspector. Accepts file or directory. Reports status, signer, expiry.
+function sigcheck {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+    $targets = if ((Get-Item $resolved).PSIsContainer) {
+        Get-ChildItem -LiteralPath $resolved -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -match '^\.(exe|dll|sys|ps1|psm1|psd1|msi|cat|ocx|cpl)$' }
+    }
+    else { Get-Item -LiteralPath $resolved }
+    foreach ($t in $targets) {
+        $sig = Get-AuthenticodeSignature -LiteralPath $t.FullName -ErrorAction SilentlyContinue
+        if (-not $sig) { continue }
+        $color = switch ($sig.Status) {
+            'Valid' { 'Green' } 'NotSigned' { 'DarkGray' } default { 'Red' }
+        }
+        Write-Host ''
+        Write-Host ("File:      {0}" -f $t.FullName) -ForegroundColor Cyan
+        Write-Host ("Status:    {0}" -f $sig.Status) -ForegroundColor $color
+        if ($sig.StatusMessage) { Write-Host ("Message:   {0}" -f $sig.StatusMessage) -ForegroundColor DarkGray }
+        if ($sig.SignerCertificate) {
+            Write-Host ("Signer:    {0}" -f $sig.SignerCertificate.Subject)
+            Write-Host ("Issuer:    {0}" -f $sig.SignerCertificate.Issuer)
+            Write-Host ("Expires:   {0}" -f $sig.SignerCertificate.NotAfter)
+            Write-Host ("Thumb:     {0}" -f $sig.SignerCertificate.Thumbprint) -ForegroundColor DarkGray
+        }
+        if ($sig.TimeStamperCertificate) {
+            Write-Host ("Timestamp: {0}" -f $sig.TimeStamperCertificate.Subject) -ForegroundColor DarkGray
+        }
+    }
+}
+
+# List NTFS alternate data streams (a classic malware hiding spot). Works on files or dirs.
+function ads {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+    $items = if ((Get-Item $resolved).PSIsContainer) {
+        Get-ChildItem -LiteralPath $resolved -Recurse -File -ErrorAction SilentlyContinue
+    }
+    else { Get-Item -LiteralPath $resolved }
+    # Emit structured objects so callers can filter/select/measure. PS's default formatter
+    # still renders a human-readable table in the interactive case.
+    foreach ($item in $items) {
+        $streams = Get-Item -LiteralPath $item.FullName -Stream * -ErrorAction SilentlyContinue |
+        Where-Object { $_.Stream -ne ':$DATA' }
+        foreach ($s in $streams) {
+            [PSCustomObject]@{
+                File   = $item.FullName
+                Stream = $s.Stream
+                Length = $s.Length
+            }
+        }
+    }
+}
+
+# Windows Defender scan wrapper. No path = Quick (or Full with -Mode Full). With path = custom.
+function defscan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)][string]$Path,
+        [ValidateSet('Quick', 'Full')][string]$Mode = 'Quick'
+    )
+    if (-not (Get-Command Start-MpScan -ErrorAction SilentlyContinue)) {
+        Write-Error 'Windows Defender cmdlets not available on this system.'
+        return
+    }
+    $titleLabel = if ($Path) { "defscan: $Path" } else { "defscan: $Mode" }
+    $oldTitle = Push-TabTitle $titleLabel
+    try {
+        if ($Path) {
+            $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+            if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+            Write-Host ("Custom scan: {0}" -f $resolved.Path) -ForegroundColor Cyan
+            Start-MpScan -ScanType CustomScan -ScanPath $resolved.Path
+        }
+        else {
+            $scanType = if ($Mode -eq 'Full') { 'FullScan' } else { 'QuickScan' }
+            Write-Host ("Running {0}..." -f $scanType) -ForegroundColor Cyan
+            Start-MpScan -ScanType $scanType
+        }
+        $threats = Get-MpThreat -ErrorAction SilentlyContinue
+        if ($threats) {
+            Write-Host 'Recent threats:' -ForegroundColor Yellow
+            $threats | Select-Object -First 10 | Format-Table ThreatName, SeverityID, DetectionID -AutoSize
+        }
+        else { Write-Host 'No threats recorded.' -ForegroundColor Green }
+    }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# HaveIBeenPwned k-anonymity password check. Only first 5 SHA1 chars leave the machine.
+function pwnd {
+    param([Parameter(Mandatory)][string]$Candidate)
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hashBytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Candidate))
+        $hashHex = [BitConverter]::ToString($hashBytes).Replace('-', '').ToUpper()
+    }
+    finally { $sha1.Dispose() }
+    $prefix = $hashHex.Substring(0, 5)
+    $suffix = $hashHex.Substring(5)
+    try {
+        $response = Invoke-RestMethod -Uri "https://api.pwnedpasswords.com/range/$prefix" -Headers @{ 'Add-Padding' = 'true' } -TimeoutSec 10 -UseBasicParsing
+        $lines = $response -split "`r?`n"
+        $match = $lines | Where-Object { $_ -match ('^' + [regex]::Escape($suffix) + ':(\d+)') }
+        if ($match) {
+            $count = [int](($match -split ':')[1])
+            if ($count -gt 0) {
+                Write-Host ("PWNED: seen in {0} breach(es). Do not use this password." -f $count) -ForegroundColor Red
+                return
+            }
+        }
+        Write-Host 'Safe: password not found in known breaches.' -ForegroundColor Green
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "HIBP lookup failed: $_"
+    }
+}
+
+# Full TLS cert probe: protocol, cipher, chain, SAN, SHA256 pin. Extends tlscert.
+function certcheck {
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [int]$Port = 443
+    )
+    $tcp = $null; $ssl = $null; $chain = $null
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        $async = $tcp.BeginConnect($Domain, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne(5000)) { throw "Connection to ${Domain}:${Port} timed out" }
+        $tcp.EndConnect($async)
+        $stream = $tcp.GetStream()
+        $stream.ReadTimeout = 10000
+        $ssl = [System.Net.Security.SslStream]::new($stream, $false, { $true })
+        $ssl.AuthenticateAsClient($Domain)
+        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+        $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+        $chainValid = $chain.Build($cert)
+        $daysLeft = [math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays)
+        $expiryColor = if ($daysLeft -lt 30) { 'Red' } elseif ($daysLeft -lt 90) { 'Yellow' } else { 'Green' }
+        Write-Host ("Host:         {0}:{1}" -f $Domain, $Port) -ForegroundColor Cyan
+        Write-Host ("TLS:          {0}" -f $ssl.SslProtocol)
+        Write-Host ("Cipher:       {0} {1} bits" -f $ssl.CipherAlgorithm, $ssl.CipherStrength)
+        Write-Host ("Subject:      {0}" -f $cert.Subject)
+        Write-Host ("Issuer:       {0}" -f $cert.Issuer)
+        Write-Host ("Serial:       {0}" -f $cert.SerialNumber) -ForegroundColor DarkGray
+        Write-Host ("SHA256 pin:   {0}" -f $cert.GetCertHashString('SHA256')) -ForegroundColor DarkGray
+        Write-Host ("Not before:   {0}" -f $cert.NotBefore)
+        Write-Host ("Not after:    {0}" -f $cert.NotAfter)
+        Write-Host ("Days left:    {0}" -f $daysLeft) -ForegroundColor $expiryColor
+        Write-Host ("Chain valid:  {0}" -f $chainValid) -ForegroundColor $(if ($chainValid) { 'Green' } else { 'Red' })
+        $sanExt = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
+        if ($sanExt) {
+            $san = ($sanExt.Format($false) -replace 'DNS Name=', '' -replace ',\s*', ', ')
+            Write-Host ("SAN:          {0}" -f $san) -ForegroundColor DarkGray
+        }
+        Write-Host 'Chain:' -ForegroundColor DarkGray
+        foreach ($element in $chain.ChainElements) {
+            $ec = $element.Certificate
+            Write-Host ("  {0} (exp {1})" -f $ec.Subject, $ec.NotAfter.ToString('yyyy-MM-dd')) -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "certcheck failed for ${Domain}:${Port} - $_"
+    }
+    finally {
+        if ($chain) { $chain.Dispose() }
+        if ($ssl) { $ssl.Dispose() }
+        if ($tcp) { $tcp.Dispose() }
+    }
+}
+
+# Shannon entropy of file bytes (0.0 = uniform, 8.0 = random). High values hint at packing/encryption.
+function entropy {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "File not found: $Path"; return }
+    $bytes = [System.IO.File]::ReadAllBytes($resolved.Path)
+    if ($bytes.Length -eq 0) { Write-Host 'Empty file.' -ForegroundColor Yellow; return }
+    $counts = New-Object 'int[]' 256
+    foreach ($b in $bytes) { $counts[$b]++ }
+    $e = 0.0
+    foreach ($c in $counts) {
+        if ($c -gt 0) {
+            $p = $c / $bytes.Length
+            $e -= $p * [math]::Log($p, 2)
+        }
+    }
+    $label = if ($e -gt 7.5) { 'very high (packed/encrypted)' }
+    elseif ($e -gt 6.5) { 'high (compressed)' }
+    elseif ($e -gt 4.5) { 'medium (code/data)' }
+    else { 'low (plain text)' }
+    $color = if ($e -gt 7.5) { 'Red' } elseif ($e -gt 6.5) { 'Yellow' } else { 'Green' }
+    Write-Host ("File:    {0} ({1} bytes)" -f (Split-Path $resolved.Path -Leaf), $bytes.Length) -ForegroundColor Cyan
+    Write-Host ("Entropy: {0:N3} / 8.000 ({1})" -f $e, $label) -ForegroundColor $color
+}
+
+# Developer
+
+# One-line HTTP server for current (or given) directory. Prefers python -m http.server, then npx.
+function serve {
+    param(
+        [int]$Port = 8000,
+        [string]$Path = '.'
+    )
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Path not found: $Path"; return }
+    $oldTitle = Push-TabTitle "serve :$Port"
+    try {
+        if (Get-Command python -ErrorAction SilentlyContinue) {
+            Write-Host ("Serving {0} on http://127.0.0.1:{1} (Ctrl+C to stop)" -f $resolved.Path, $Port) -ForegroundColor Cyan
+            Push-Location $resolved.Path
+            try { & python -m http.server $Port }
+            finally { Pop-Location }
+            return
+        }
+        if (Get-Command npx -ErrorAction SilentlyContinue) {
+            Write-Host ("Serving {0} via npx http-server on http://127.0.0.1:{1}" -f $resolved.Path, $Port) -ForegroundColor Cyan
+            Push-Location $resolved.Path
+            try { & npx --yes http-server -p $Port }
+            finally { Pop-Location }
+            return
+        }
+        Write-Error 'Install python or node/npx first. E.g. winget install Python.Python.3.12'
+    }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# Generate a .gitignore from toptal.com/developers/gitignore/api. Multiple languages allowed.
+function gitignore {
+    param([Parameter(Mandatory, ValueFromRemainingArguments)][string[]]$Language)
+    $joined = ($Language -join ',').ToLower()
+    try {
+        $content = Invoke-RestMethod -Uri "https://www.toptal.com/developers/gitignore/api/$joined" -TimeoutSec 15 -UseBasicParsing
+        if (-not $content) { Write-Error 'Empty response from gitignore service.'; return }
+        $target = Join-Path (Get-Location) '.gitignore'
+        if (Test-Path $target) {
+            $backup = "$target.$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+            Copy-Item $target $backup
+            Write-Host ("Backed up existing .gitignore to {0}" -f $backup) -ForegroundColor DarkGray
+        }
+        [System.IO.File]::WriteAllText($target, $content, [System.Text.UTF8Encoding]::new($false))
+        Write-Host ("Wrote .gitignore for: {0}" -f $joined) -ForegroundColor Green
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "gitignore fetch failed: $_"
+    }
+}
+
+# Fuzzy git branch checkout using fzf. Handles local and remote branches.
+function gcof {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Error 'git is not installed'; return }
+    if (-not (Get-Command fzf -ErrorAction SilentlyContinue)) { Write-Error 'fzf is not installed (winget install junegunn.fzf)'; return }
+    $branches = git branch --all --format='%(refname:short)' 2>$null | Where-Object { $_ -and $_ -notmatch '^origin/HEAD' }
+    if (-not $branches) { Write-Error 'No branches found'; return }
+    $selected = $branches | fzf --height 40% --reverse --prompt 'checkout> '
+    if ($selected) {
+        $clean = ($selected -replace '^origin/', '').Trim()
+        git checkout $clean
+    }
+}
+
+# Load a .env file into the current session. Handles export prefix and quoted values.
+function envload {
+    param([string]$Path = '.env')
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "File not found: $Path"; return }
+    $loaded = 0
+    Get-Content $resolved.Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#')) { return }
+        if ($line -match '^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+            $k = $matches[1]; $v = $matches[2].Trim()
+            if ($v.Length -ge 2 -and $v.StartsWith('"') -and $v.EndsWith('"')) { $v = $v.Substring(1, $v.Length - 2) }
+            elseif ($v.Length -ge 2 -and $v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1, $v.Length - 2) }
+            Set-Item -LiteralPath "env:$k" -Value $v
+            $loaded++
+        }
+    }
+    Write-Host ("Loaded {0} variable(s) from {1}" -f $loaded, $resolved.Path) -ForegroundColor Green
+}
+
+# Quick command-example lookup via tldr-pages. Uses native tldr client if installed.
+function tldr {
+    if (Get-Command tldr.exe -ErrorAction SilentlyContinue) { & tldr.exe @args; return }
+    if (-not $args) { Write-Error 'Usage: tldr <command>'; return }
+    $cmd = ($args[0]).ToString().ToLower()
+    foreach ($platform in @('common', 'windows', 'linux', 'osx')) {
+        try {
+            $url = "https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/$platform/$cmd.md"
+            $page = Invoke-RestMethod -Uri $url -TimeoutSec 10 -ErrorAction Stop -UseBasicParsing
+            Write-Host $page -ForegroundColor White
+            return
+        }
+        catch { continue }
+    }
+    Write-Error "No tldr page found for '$cmd'. Install native client: winget install tldr-pages.tldr"
+}
+
+# Run a scriptblock N times. -UntilSuccess stops early on zero exit code.
+function repeat {
+    param(
+        [Parameter(Mandatory, Position = 0)][ValidateRange(1, 10000)][int]$Count,
+        [Parameter(Mandatory, Position = 1)][scriptblock]$Command,
+        [switch]$UntilSuccess,
+        [int]$DelaySeconds = 0
+    )
+    # Save the title ONCE; we re-Push on every iteration to update the counter in-place
+    # and restore to the original on exit. Cheaper than Push/Pop per iteration.
+    $originalTitle = $null
+    try { $originalTitle = $Host.UI.RawUI.WindowTitle } catch { $null = $_ }
+    try {
+        for ($i = 1; $i -le $Count; $i++) {
+            try { $Host.UI.RawUI.WindowTitle = "repeat $i/$Count" } catch { $null = $_ }
+            Write-Host ("[{0}/{1}]" -f $i, $Count) -ForegroundColor DarkGray
+            # Clear $LASTEXITCODE so a stale value from before this loop cannot cause -UntilSuccess
+            # to terminate on iteration 1 when the scriptblock contains no native commands.
+            $global:LASTEXITCODE = $null
+            $threwError = $false
+            try {
+                & $Command
+            }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+                Write-Host $_.Exception.Message -ForegroundColor Red
+                $threwError = $true
+            }
+            if ($UntilSuccess -and -not $threwError -and ($null -eq $LASTEXITCODE -or $LASTEXITCODE -eq 0)) {
+                Write-Host ("Success on attempt {0}." -f $i) -ForegroundColor Green
+                return
+            }
+            if ($DelaySeconds -gt 0 -and $i -lt $Count) { Start-Sleep -Seconds $DelaySeconds }
+        }
+        if ($UntilSuccess) { Write-Warning ("Command did not succeed in {0} attempts." -f $Count) }
+    }
+    finally { Pop-TabTitle $originalTitle }
+}
+
+# Create a Python venv and activate it. Default folder: .venv.
+function mkvenv {
+    param(
+        [string]$Name = '.venv',
+        [string]$PythonPath
+    )
+    $python = if ($PythonPath) { $PythonPath }
+    elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
+    elseif (Get-Command py -ErrorAction SilentlyContinue) { 'py' }
+    else { $null }
+    if (-not $python) { Write-Error 'python not found on PATH (winget install Python.Python.3.12)'; return }
+    Write-Host ("Creating venv at ./{0}..." -f $Name) -ForegroundColor Cyan
+    & $python -m venv $Name
+    if ($LASTEXITCODE -ne 0) { Write-Error 'venv creation failed'; return }
+    $venvRoot = Resolve-Path -LiteralPath $Name
+    $activate = Join-Path $venvRoot 'Scripts\Activate.ps1'
+    if (-not (Test-Path $activate)) { $activate = Join-Path $venvRoot 'bin/Activate.ps1' }
+    if (Test-Path $activate) {
+        . $activate
+        Write-Host ("Activated {0}." -f $Name) -ForegroundColor Green
+    }
+    else { Write-Warning "Created $Name but Activate.ps1 not found." }
+}
+
+# Detection / AST (inspired by vscode-powershell language service)
+
+# Parse a .ps1 file and emit Function/Alias outline entries as objects. Pipe-friendly:
+# `outline file.ps1 | Where Kind -eq Function`, `outline | Format-Table`, etc.
+function outline {
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "File not found: $Path"; return }
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($resolved.Path, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors -and $parseErrors.Count -gt 0) {
+        foreach ($err in $parseErrors) {
+            Write-Warning ("L{0}: {1}" -f $err.Extent.StartLineNumber, $err.Message)
+        }
+    }
+    $fns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    foreach ($f in $fns) {
+        $paramNames = @()
+        if ($f.Parameters) { $paramNames = $f.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } }
+        elseif ($f.Body -and $f.Body.ParamBlock) { $paramNames = $f.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } }
+        [PSCustomObject]@{
+            Kind   = 'Function'
+            Line   = $f.Extent.StartLineNumber
+            Name   = $f.Name
+            Params = ($paramNames -join ', ')
+        }
+    }
+    $raw = Get-Content $resolved.Path -Raw
+    $aliases = [regex]::Matches($raw, 'Set-Alias\s+-Name\s+(\S+)\s+-Value\s+(\S+)')
+    foreach ($m in $aliases) {
+        [PSCustomObject]@{
+            Kind   = 'Alias'
+            Line   = $null
+            Name   = $m.Groups[1].Value
+            Params = "-> $($m.Groups[2].Value)"
+        }
+    }
+}
+
+# AST-based symbol search across .ps1 files. Regex matches on function names.
+function psym {
+    param(
+        [Parameter(Position = 0)][string]$Pattern,
+        [Parameter(Position = 1)][string]$Root = '.'
+    )
+    $resolved = Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Root not found: $Root"; return }
+    $results = [System.Collections.Generic.List[object]]::new()
+    Get-ChildItem -Path $resolved -Filter *.ps1 -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $tokens = $null; $parseErrors = $null
+        $ast = $null
+        try { $ast = [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) }
+        catch { return }
+        if (-not $ast) { return }
+        $fns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+        foreach ($f in $fns) {
+            if ([string]::IsNullOrEmpty($Pattern) -or $f.Name -match $Pattern) {
+                $results.Add([PSCustomObject]@{
+                        Name = $f.Name
+                        Line = $f.Extent.StartLineNumber
+                        File = $_.FullName
+                    })
+            }
+        }
+    }
+    if ($results.Count -eq 0) { Write-Host 'No matches.' -ForegroundColor Yellow; return }
+    $results | Sort-Object Name | Format-Table Name, Line, File -AutoSize
+}
+
+# PSScriptAnalyzer wrapper with useful presets. -Fix applies auto-fixes where possible.
+function lint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)][string]$Path = '.',
+        [ValidateSet('Standard', 'Strict', 'Security', 'CI')][string]$Mode = 'Standard',
+        [switch]$Fix
+    )
+    if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+        Write-Error 'PSScriptAnalyzer not installed. Install-Module PSScriptAnalyzer -Scope CurrentUser'
+        return
+    }
+    Import-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
+    $splat = @{ Path = $Path; Recurse = $true }
+    switch ($Mode) {
+        'Strict' { $splat.Severity = @('Error', 'Warning', 'Information') }
+        'Security' {
+            $splat.IncludeRule = @(
+                'PSAvoidUsingPlainTextForPassword',
+                'PSAvoidUsingUsernameAndPasswordParams',
+                'PSUsePSCredentialType',
+                'PSAvoidUsingConvertToSecureStringWithPlainText',
+                'PSAvoidUsingInvokeExpression',
+                'PSAvoidUsingComputerNameHardcoded'
+            )
+        }
+        'CI' {
+            $splat.ExcludeRule = @(
+                'PSAvoidUsingWriteHost',
+                'PSAvoidUsingWMICmdlet',
+                'PSUseShouldProcessForStateChangingFunctions',
+                'PSUseBOMForUnicodeEncodedFile',
+                'PSReviewUnusedParameter',
+                'PSUseSingularNouns'
+            )
+        }
+    }
+    if ($Fix) { $splat.Fix = $true }
+    $results = Invoke-ScriptAnalyzer @splat
+    if (-not $results) { Write-Host 'No issues found.' -ForegroundColor Green; return }
+    $byRule = $results | Group-Object RuleName | Sort-Object Count -Descending
+    Write-Host ''
+    foreach ($g in $byRule) {
+        Write-Host ("[{0}] {1}" -f $g.Count, $g.Name) -ForegroundColor Cyan
+        foreach ($r in $g.Group) {
+            $color = switch ($r.Severity) { 'Error' { 'Red' } 'Warning' { 'Yellow' } default { 'DarkGray' } }
+            $rel = try { Resolve-Path -LiteralPath $r.ScriptPath -Relative } catch { $r.ScriptPath }
+            Write-Host ("  {0,-40} L{1,-5} {2}" -f $rel, $r.Line, $r.Message) -ForegroundColor $color
+        }
+    }
+    Write-Host ''
+    Write-Host ("Total: {0}" -f $results.Count) -ForegroundColor Magenta
+}
+
+# AST walker that finds unused parameters and top-level functions with no call sites in the same file.
+function Find-DeadCode {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "File not found: $Path"; return }
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($resolved.Path, [ref]$tokens, [ref]$parseErrors)
+    $fns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+
+    Write-Host 'Unused parameters:' -ForegroundColor Cyan
+    $anyUnused = $false
+    foreach ($f in $fns) {
+        $params = @()
+        if ($f.Body -and $f.Body.ParamBlock) { $params = $f.Body.ParamBlock.Parameters }
+        foreach ($p in $params) {
+            $name = $p.Name.VariablePath.UserPath
+            $refs = $f.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $n.VariablePath.UserPath -eq $name -and
+                    $n.Extent.StartOffset -ne $p.Name.Extent.StartOffset
+                }, $true)
+            if (-not $refs -or $refs.Count -eq 0) {
+                Write-Host ("  {0} L{1}: `${2}" -f $f.Name, $p.Extent.StartLineNumber, $name) -ForegroundColor Yellow
+                $anyUnused = $true
+            }
+        }
+    }
+    if (-not $anyUnused) { Write-Host '  (none)' -ForegroundColor DarkGray }
+
+    Write-Host ''
+    Write-Host 'Possibly uncalled functions (same-file check):' -ForegroundColor Cyan
+    $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { $_.CommandElements[0].Extent.Text }
+    $anyUncalled = $false
+    foreach ($f in $fns) {
+        if ($calls -notcontains $f.Name) {
+            Write-Host ("  {0} (L{1})" -f $f.Name, $f.Extent.StartLineNumber) -ForegroundColor Yellow
+            $anyUncalled = $true
+        }
+    }
+    if (-not $anyUncalled) { Write-Host '  (none)' -ForegroundColor DarkGray }
+}
+
+# Profile self-diagnostics: version, policy, caches, tools, environment flags.
+function Test-Profile {
+    Write-Host 'Profile Diagnostics' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host ("  PS Version:        {0} ({1})" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition)
+    Write-Host ("  Language Mode:     {0}" -f $ExecutionContext.SessionState.LanguageMode)
+    Write-Host ("  Execution Policy:  {0}" -f (Get-ExecutionPolicy))
+    Write-Host ("  Profile Path:      {0}" -f $PROFILE)
+    Write-Host ("  Profile Exists:    {0}" -f (Test-Path $PROFILE))
+    $userOverride = Join-Path (Split-Path $PROFILE) 'profile_user.ps1'
+    Write-Host ("  profile_user.ps1:  {0}" -f $(if (Test-Path $userOverride) { 'present' } else { 'absent' }))
+    $cache = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
+    Write-Host ("  Cache Dir:         {0}" -f $cache)
+    if (Test-Path $cache) {
+        $cacheFiles = Get-ChildItem $cache -File -ErrorAction SilentlyContinue
+        Write-Host ("  Cache Files:       {0}" -f $cacheFiles.Count)
+        foreach ($cf in $cacheFiles) {
+            $sz = if ($cf.Length -gt 1024) { '{0} KB' -f [math]::Round($cf.Length / 1KB, 1) } else { '{0} B' -f $cf.Length }
+            Write-Host ("    {0,-28} {1}" -f $cf.Name, $sz) -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ("  Modules Loaded:    {0}" -f (Get-Module).Count)
+    Write-Host ''
+    Write-Host 'Managed Tools:' -ForegroundColor Cyan
+    foreach ($tool in $script:ProfileTools) {
+        $found = Get-Command $tool.Cmd -ErrorAction SilentlyContinue
+        $status = if ($found) { 'OK' } else { 'MISSING' }
+        $color = if ($found) { 'Green' } else { 'Yellow' }
+        Write-Host ("  {0,-14} {1}" -f $tool.Cmd, $status) -ForegroundColor $color
+    }
+    Write-Host ''
+    Write-Host 'Environment:' -ForegroundColor Cyan
+    Write-Host ("  Interactive:       {0}" -f $isInteractive)
+    Write-Host ("  Admin:             {0}" -f $isAdmin)
+    Write-Host ("  CI:                {0}" -f [bool]$env:CI)
+    Write-Host ("  AI_AGENT:          {0}" -f [bool]$env:AI_AGENT)
+}
+
+# Enumerate every installed PowerShell (5.1 Desktop + all Core/7+ locations).
+function Get-PwshVersions {
+    $found = [System.Collections.Generic.List[object]]::new()
+    $ps5 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $ps5) {
+        try {
+            $ver = (& $ps5 -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' 2>$null)
+            if ($ver) { $found.Add([PSCustomObject]@{ Edition = 'Desktop'; Version = $ver; Path = $ps5 }) }
+        }
+        catch { $null = $_ }
+    }
+    $candidates = @()
+    $candidates += (Get-Command pwsh -ErrorAction SilentlyContinue -All | ForEach-Object { $_.Source })
+    $candidates += (Get-ChildItem 'C:\Program Files\PowerShell' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'pwsh.exe' })
+    $candidates += (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WindowsApps" -Filter 'pwsh*.exe' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $candidates = $candidates | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
+    foreach ($path in $candidates) {
+        try {
+            $ver = & $path -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' 2>$null
+            if ($ver) { $found.Add([PSCustomObject]@{ Edition = 'Core'; Version = $ver; Path = $path }) }
+        }
+        catch { $null = $_ }
+    }
+    if ($found.Count -eq 0) { Write-Warning 'No PowerShell installations found.'; return }
+    $found | Sort-Object Edition, Version | Format-Table Edition, Version, Path -AutoSize
+}
+
+# Inspect an installed module: all versions, path, exports, signature.
+# Emits one PSCustomObject per installed version so callers can filter/select.
+function modinfo {
+    param([Parameter(Mandatory)][string]$Name)
+    $installed = Get-Module -ListAvailable -Name $Name -ErrorAction SilentlyContinue | Sort-Object Version -Descending
+    if (-not $installed) { Write-Warning "Module not found: $Name"; return }
+    foreach ($m in $installed) {
+        $signed = $null
+        $signer = $null
+        if ($m.Path) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $m.Path -ErrorAction SilentlyContinue
+            if ($sig) {
+                $signed = [string]$sig.Status
+                if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+            }
+        }
+        [PSCustomObject]@{
+            Name        = $m.Name
+            Version     = $m.Version
+            ModuleType  = $m.ModuleType
+            Path        = $m.Path
+            Author      = $m.Author
+            Description = $m.Description
+            Requires    = if ($m.RequiredModules) { ($m.RequiredModules | ForEach-Object { $_.Name }) -join ', ' } else { '' }
+            Functions   = $m.ExportedFunctions.Count
+            Cmdlets     = $m.ExportedCmdlets.Count
+            Aliases     = $m.ExportedAliases.Count
+            Signed      = $signed
+            Signer      = $signer
+        }
+    }
+}
+
+# AST-based code-pattern search (grep but structural). -Kind narrows to one AST node type.
+function psgrep {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Pattern,
+        [Parameter(Position = 1)][string]$Root = '.',
+        [ValidateSet('Command', 'Variable', 'String', 'Function', 'Any')][string]$Kind = 'Any'
+    )
+    $resolved = Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "Root not found: $Root"; return }
+    $predicate = switch ($Kind) {
+        'Command' { { param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.CommandElements[0].Extent.Text -match $Pattern } }
+        'Variable' { { param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -match $Pattern } }
+        'String' { { param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -match $Pattern } }
+        'Function' { { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -match $Pattern } }
+        'Any' { { param($n) $n.Extent.Text -match $Pattern } }
+    }
+    Get-ChildItem -Path $resolved -Filter *.ps1 -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $file = $_.FullName
+        $tokens = $null; $parseErrors = $null
+        $ast = $null
+        try { $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$parseErrors) }
+        catch { return }
+        if (-not $ast) { return }
+        $hits = $ast.FindAll($predicate, $true)
+        foreach ($h in $hits) {
+            $snippet = ($h.Extent.Text -split "`r?`n")[0].Trim()
+            if ($snippet.Length -gt 120) { $snippet = $snippet.Substring(0, 120) + '...' }
+            Write-Host ("{0}:{1}: {2}" -f $file, $h.Extent.StartLineNumber, $snippet)
+        }
+    }
+}
+
+# Enhanced PSReadLine Configuration. Colors read from theme.json (shipped palette) and
+# then overridden from user-settings.json (wizard / manual overrides). EditMode/BellStyle
+# remain here as behavior defaults (users override via profile_user.ps1 or Set-PSReadLineOption).
+$_readlineColors = $null
+try {
+    $_cachedTheme = Join-Path $cacheDir 'theme.json'
+    if (Test-Path $_cachedTheme) {
+        $_themeConfig = Get-Content $_cachedTheme -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($_themeConfig.psreadline -and $_themeConfig.psreadline.colors) {
+            $_readlineColors = @{}
+            foreach ($prop in $_themeConfig.psreadline.colors.PSObject.Properties) {
+                $_readlineColors[$prop.Name] = $prop.Value
+            }
+        }
+    }
+    # Merge user-settings.json.psreadline.colors on top so wizard/manual overrides win.
+    $_userSettingsForRL = Join-Path $cacheDir 'user-settings.json'
+    if (Test-Path $_userSettingsForRL) {
+        $_rlUser = Get-Content $_userSettingsForRL -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($_rlUser.psreadline -and $_rlUser.psreadline.colors) {
+            if ($null -eq $_readlineColors) { $_readlineColors = @{} }
+            foreach ($prop in $_rlUser.psreadline.colors.PSObject.Properties) {
+                $_readlineColors[$prop.Name] = $prop.Value
+            }
+        }
+    }
+}
+catch { $null = $_ }
 $PSReadLineOptions = @{
     EditMode                      = 'Windows'
     HistoryNoDuplicates           = $true
     HistorySearchCursorMovesToEnd = $true
-    Colors                        = @{
-        Command   = '#61AFEF'  # Blue
-        Parameter = '#98C379'  # Green
-        Operator  = '#56B6C2'  # Cyan
-        Variable  = '#E5C07B'  # Yellow
-        String    = '#98C379'  # Green
-        Number    = '#D19A66'  # Orange
-        Type      = '#61AFEF'  # Blue
-        Comment   = '#5C6370'  # Gray
-        Keyword   = '#C678DD'  # Soft purple
-        Error     = '#E06C75'  # Red
-    }
     BellStyle                     = 'None'
 }
+if ($_readlineColors) { $PSReadLineOptions.Colors = $_readlineColors }
 Set-PSReadLineOption @PSReadLineOptions
 
 # PSReadLine features that require an interactive console host
 if ($isInteractive -and (Get-Module PSReadLine)) {
     # Core-only prediction settings (PredictionSource/PredictionViewStyle don't exist on Desktop)
     # Guard against hosts without VT support (e.g. agent terminals, redirected output)
-    if ($PSVersionTable.PSEdition -eq "Core") {
+    # Disable via user-settings.json: { "features": { "predictions": false } }
+    if ($PSVersionTable.PSEdition -eq "Core" -and $script:PSP.Features.predictions) {
         $supportsPrediction = $false
         try {
             $supportsPrediction = [bool]$Host.UI.SupportsVirtualTerminal -and -not [Console]::IsOutputRedirected
@@ -3121,8 +5316,34 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     }
     Set-PSReadLineKeyHandler -Chord 'Alt+v' -BriefDescription SmartPaste -Description 'Paste clipboard as one block into prompt' -ScriptBlock $smartPasteHandler
 
+    # Transient prompt: on Enter, redraw the current prompt using a minimal scriptblock so
+    # the scrollback shows just the collapsed form. The full prompt still renders for the
+    # NEW line after AcceptLine. Opt-in via features.transientPrompt in user-settings.json.
+    # Customize via `$script:PSP.TransientPrompt = { ... }` in profile_user.ps1.
+    if ($script:PSP.Features.transientPrompt) {
+        Set-PSReadLineKeyHandler -Key Enter -BriefDescription TransientPrompt -Description 'Collapse the prior prompt to a minimal form before accepting' -ScriptBlock {
+            $parseErrors = $null
+            [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$null, [ref]$null, [ref]$parseErrors, [ref]$null)
+            if ($parseErrors.Count -eq 0) {
+                $originalPrompt = $Function:prompt
+                try {
+                    $Function:prompt = {
+                        if ($script:PSP -and $script:PSP.TransientPrompt) {
+                            try { & $script:PSP.TransientPrompt } catch { '$ ' }
+                        }
+                        else { '$ ' }
+                    }
+                    [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+                }
+                finally { $Function:prompt = $originalPrompt }
+            }
+            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+        }
+    }
+
     # fzf integration via PSFzf (fuzzy history search on Ctrl+R, file finder on Ctrl+T)
-    if (Get-Command fzf -ErrorAction SilentlyContinue) {
+    # Disable via user-settings.json: { "features": { "psfzf": false } }
+    if ($script:PSP.Features.psfzf -and (Get-Command fzf -ErrorAction SilentlyContinue)) {
         if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -ErrorAction SilentlyContinue)) {
             $env:FZF_DEFAULT_COMMAND = 'rg --files --hidden --glob "!.git"'
         }
@@ -3143,6 +5364,72 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
         $sensitive = @('password', 'secret', 'token', 'api[_-]?key', 'connectionstring', 'credential', 'bearer')
         $hasSensitive = $sensitive | Where-Object { $line -match $_ }
         return ($null -eq $hasSensitive)
+    }
+
+    # Native tool completers. Each tool emits its own PowerShell completion script; we cache
+    # it to disk so shell start does not launch a subprocess per tool. Cache is cleared by
+    # Update-Profile (tool upgrades) and Clear-ProfileCache.
+    $_nativeCompleters = @(
+        @{ Cmd = 'kubectl'; Cache = 'kubectl-completion.ps1'; Args = @('completion', 'powershell') }
+        @{ Cmd = 'gh';      Cache = 'gh-completion.ps1';      Args = @('completion', '-s', 'powershell') }
+        @{ Cmd = 'docker';  Cache = 'docker-completion.ps1';  Args = @('completion', 'powershell') }
+    )
+    foreach ($_nc in $_nativeCompleters) {
+        if (-not (Get-Command $_nc.Cmd -ErrorAction SilentlyContinue)) { continue }
+        $_ncCachePath = Join-Path $cacheDir $_nc.Cache
+        $_ncReady = (Test-Path $_ncCachePath) -and ((Get-Item $_ncCachePath -ErrorAction SilentlyContinue).Length -gt 0)
+        if (-not $_ncReady) {
+            try {
+                $_ncOutput = & $_nc.Cmd @($_nc.Args) 2>$null | Out-String
+                if ($_ncOutput -and $_ncOutput.Trim().Length -gt 0) {
+                    [System.IO.File]::WriteAllText($_ncCachePath, $_ncOutput, [System.Text.UTF8Encoding]::new($false))
+                    $_ncReady = $true
+                }
+            }
+            catch { $null = $_ }
+        }
+        if ($_ncReady) {
+            try { . $_ncCachePath }
+            catch {
+                # Corrupt cache; delete so next load regenerates.
+                Remove-Item -LiteralPath $_ncCachePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Tab-title context indicators (starship / p10k style): prepend venv/conda/AWS/K8s/jobs
+    # to the base window title on every prompt. Kubernetes context is read directly from
+    # ~/.kube/config (file read, no subprocess). Jobs-count only appears when > 0.
+    $script:PSP.BaseTitle = "PowerShell {0}{1}" -f $PSVersionTable.PSVersion, $adminSuffix
+    Register-ProfileHook -EventName PrePrompt -Action {
+        try {
+            $parts = @()
+            if ($env:VIRTUAL_ENV) { $parts += "venv:$(Split-Path $env:VIRTUAL_ENV -Leaf)" }
+            if ($env:CONDA_DEFAULT_ENV) { $parts += "conda:$env:CONDA_DEFAULT_ENV" }
+            if ($env:AWS_PROFILE) { $parts += "aws:$env:AWS_PROFILE" }
+            if ($env:AWS_VAULT) { $parts += "aws-vault:$env:AWS_VAULT" }
+            # Kubernetes context via direct file read - zero subprocess overhead per prompt.
+            $kubeConfig = Join-Path $HOME '.kube/config'
+            if (Test-Path -LiteralPath $kubeConfig) {
+                try {
+                    $match = Select-String -Path $kubeConfig -Pattern '^current-context:\s*(.+)$' -ErrorAction Stop | Select-Object -First 1
+                    if ($match) {
+                        # YAML may quote the context value (current-context: "foo" or 'foo');
+                        # strip surrounding quotes so the tab title shows `foo` not `"foo"`.
+                        $kubeCtx = $match.Matches[0].Groups[1].Value.Trim().Trim('"').Trim("'")
+                        if ($kubeCtx) { $parts += "k8s:$kubeCtx" }
+                    }
+                }
+                catch { $null = $_ }
+            }
+            $jobCount = @(Get-Job -State Running -ErrorAction SilentlyContinue).Count
+            if ($jobCount -gt 0) { $parts += "jobs:$jobCount" }
+
+            $prefix = if ($parts.Count -gt 0) { '[' + ($parts -join ' ') + '] ' } else { '' }
+            $base = if ($script:PSP.BaseTitle) { $script:PSP.BaseTitle } else { '' }
+            try { $Host.UI.RawUI.WindowTitle = $prefix + $base } catch { $null = $_ }
+        }
+        catch { $null = $_ }
     }
 }
 
@@ -3261,6 +5548,7 @@ if ($isInteractive) {
                 $Function:prompt = {
                     $originalSuccess = $?
                     $originalLastExitCode = $global:LASTEXITCODE
+                    Invoke-PromptStage
                     try {
                         $output = Get-OhMyPoshPromptText `
                             -Type 'primary' `
@@ -3376,6 +5664,307 @@ if ($isInteractive) {
     }
 }
 
+# Query the profile command registry. Core commands are seeded at load time; plugins may
+# add more via Register-ProfileCommand. Filter by category substring or name substring.
+function Get-ProfileCommand {
+    [CmdletBinding()]
+    param(
+        [string]$Category,
+        [string]$Name
+    )
+    $cmds = @($script:PSP.Commands)
+    if ($Category) { $cmds = $cmds | Where-Object { $_.Category -like "*$Category*" } }
+    if ($Name) { $cmds = $cmds | Where-Object { $_.Name -like "*$Name*" } }
+    $cmds | Sort-Object Category, Name
+}
+
+# First-run walkthrough. Shows each category plus a handful of commands and pauses between sections.
+function Start-ProfileTour {
+    if (-not [Environment]::UserInteractive) { Write-Warning 'Tour requires an interactive session.'; return }
+    $categories = @($script:PSP.Commands | Group-Object Category | Sort-Object Name)
+    if ($categories.Count -eq 0) { Write-Warning 'Command registry is empty. Is the profile loaded?'; return }
+    $oldTitle = Push-TabTitle 'profile tour'
+    try {
+    Write-Host ''
+    Write-Host 'PowerShellPerfect Tour' -ForegroundColor Cyan
+    Write-Host '======================' -ForegroundColor Cyan
+    Write-Host 'Press Enter to see each category, Ctrl+C to quit.' -ForegroundColor DarkGray
+    Write-Host ''
+    $null = Read-Host 'Ready'
+    foreach ($cat in $categories) {
+        Write-Host ''
+        Write-Host ("-- {0} ({1} commands) --" -f $cat.Name, $cat.Count) -ForegroundColor Cyan
+        foreach ($entry in ($cat.Group | Sort-Object Name | Select-Object -First 8)) {
+            $synopsis = if ($entry.Synopsis) { $entry.Synopsis } else { '' }
+            Write-Host ("  {0,-22} {1}" -f $entry.Name, $synopsis) -ForegroundColor Gray
+        }
+        if ($cat.Group.Count -gt 8) {
+            Write-Host ("  ...{0} more (Get-ProfileCommand -Category '{1}')" -f ($cat.Group.Count - 8), $cat.Name) -ForegroundColor DarkGray
+        }
+        $null = Read-Host 'Press Enter'
+    }
+    Write-Host ''
+    Write-Host 'Extend the profile:' -ForegroundColor Cyan
+    Write-Host '  profile_user.ps1   - dot-sourced last; persistent overrides'
+    Write-Host '  plugins\*.ps1      - drop files in %LOCALAPPDATA%\PowerShellProfile\plugins'
+    Write-Host '  user-settings.json - features toggles, commandOverrides, trustedDirs'
+    Write-Host '  .psprc.ps1         - per-directory profile (opt-in via Add-TrustedDirectory)'
+    Write-Host ''
+    Write-Host 'Tour complete.' -ForegroundColor Green
+    }
+    finally { Pop-TabTitle $oldTitle }
+}
+
+# Trust the given directory so its .psprc.ps1 auto-loads on cd. Default: current directory.
+# Persists to user-settings.json so the trust survives profile reloads.
+function Add-TrustedDirectory {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$Path)
+    if (-not $Path) { $Path = (Get-Location).ProviderPath }
+    # Resolve-Path must succeed: a raw (unresolved) string in TrustedDirs would never equal
+    # $PWD.ProviderPath later, silently breaking the trust check on cd into that directory.
+    $resolved = try { (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath }
+    catch {
+        Write-Error "Cannot trust '$Path': path does not exist or is not resolvable."
+        return
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+        Write-Error "Cannot trust '$resolved': not a directory."
+        return
+    }
+    if ($script:PSP.TrustedDirs -contains $resolved) {
+        Write-Host "Already trusted: $resolved" -ForegroundColor DarkGray
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess($resolved, 'Trust for .psprc.ps1 auto-load')) { return }
+    $script:PSP.TrustedDirs.Add($resolved)
+    # Belt-and-suspenders: even though Save-TrustedDirectories is supposed to return $false on
+    # failure, wrap in try/catch so any unexpected throw still triggers rollback and we never
+    # report "Trusted:" when disk state doesn't match memory.
+    $saved = $false
+    try { $saved = Save-TrustedDirectories }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Warning "Save failed: $($_.Exception.Message)"
+    }
+    if (-not $saved) {
+        [void]$script:PSP.TrustedDirs.Remove($resolved)
+        Write-Warning "Trust was not persisted. Fix user-settings.json and retry."
+        return
+    }
+    Write-Host "Trusted: $resolved" -ForegroundColor Green
+    if (Test-Path -LiteralPath (Join-Path $resolved '.psprc.ps1')) {
+        Write-Host 'Reloading .psprc.ps1 now...' -ForegroundColor DarkGray
+        try { . (Join-Path $resolved '.psprc.ps1') }
+        catch { Write-Warning ".psprc.ps1 failed: $($_.Exception.Message)" }
+    }
+}
+
+# Remove a directory from the trust list. Default: current directory.
+# Accepts stale/deleted paths so users can clean up entries for directories that no longer
+# exist. Matching is case-insensitive to mirror Windows filesystem semantics.
+function Remove-TrustedDirectory {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$Path)
+    if (-not $Path) { $Path = (Get-Location).ProviderPath }
+    $resolved = try { (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath } catch { $Path }
+    # Case-insensitive match so Windows path casing differences don't hide the entry.
+    $match = $script:PSP.TrustedDirs | Where-Object { $_ -ieq $resolved } | Select-Object -First 1
+    if (-not $match) {
+        Write-Host "Not trusted: $resolved" -ForegroundColor DarkGray
+        return
+    }
+    $resolved = $match
+    if (-not $PSCmdlet.ShouldProcess($resolved, 'Remove from trusted directories')) { return }
+    [void]$script:PSP.TrustedDirs.Remove($resolved)
+    $saved = $false
+    try { $saved = Save-TrustedDirectories }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Warning "Save failed: $($_.Exception.Message)"
+    }
+    if (-not $saved) {
+        [void]$script:PSP.TrustedDirs.Add($resolved)
+        Write-Warning "Untrust was not persisted. Fix user-settings.json and retry."
+        return
+    }
+    Write-Host "Untrusted: $resolved" -ForegroundColor Yellow
+}
+
+# Set or clear the Windows Terminal background image.
+# Persists to user-settings.json (so Update-Profile re-applies it) and writes the change
+# live to WT settings.json so open windows reload without a restart.
+# Pass -Clear (or omit -Path) to remove the background. WT supports jpg/png/gif/tif/bmp.
+function Set-TerminalBackground {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Position = 0)][string]$Path,
+        [ValidateRange(0.0, 1.0)][double]$Opacity = 0.3,
+        [ValidateSet('none', 'fill', 'uniform', 'uniformToFill')][string]$StretchMode = 'uniformToFill',
+        [ValidateSet('center', 'left', 'top', 'right', 'bottom', 'topLeft', 'topRight', 'bottomLeft', 'bottomRight')][string]$Alignment = 'center',
+        # When set, resize the image to this pixel width (preserving aspect ratio) before
+        # applying. Windows Terminal has no native size knob, so resizing the source file
+        # is the only way to get a smaller watermark. Resized copy is cached in the profile
+        # cache dir and re-used if you pass the same width again.
+        [ValidateRange(32, 4096)][int]$ResizeWidth,
+        [switch]$Clear
+    )
+    $bgProps = @('backgroundImage', 'backgroundImageOpacity', 'backgroundImageStretchMode', 'backgroundImageAlignment')
+    if (-not $Clear -and -not $Path) { Write-Error 'Usage: Set-TerminalBackground <path> | Set-TerminalBackground -Clear'; return }
+    $resolved = $null
+    if (-not $Clear) {
+        try { $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath }
+        catch { Write-Error "Image not found: $Path"; return }
+        if ($resolved -notmatch '\.(jpg|jpeg|png|gif|tif|tiff|bmp)$') {
+            Write-Warning 'Unusual image extension. Windows Terminal supports jpg/png/gif/tif/bmp.'
+        }
+        # Resize step. Writes resized PNG into $cacheDir\bg-<sourcename>-<width>.png so the
+        # same input+width combination re-uses a cached copy and the next call is instant.
+        if ($ResizeWidth) {
+            try {
+                Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+                $srcName = [System.IO.Path]::GetFileNameWithoutExtension($resolved)
+                $resizedPath = Join-Path $cacheDir ("bg-{0}-{1}.png" -f $srcName, $ResizeWidth)
+                $regen = $true
+                if (Test-Path -LiteralPath $resizedPath) {
+                    $srcTime = (Get-Item -LiteralPath $resolved).LastWriteTimeUtc
+                    $cachedTime = (Get-Item -LiteralPath $resizedPath).LastWriteTimeUtc
+                    if ($cachedTime -ge $srcTime) { $regen = $false }
+                }
+                if ($regen) {
+                    $img = [System.Drawing.Image]::FromFile($resolved)
+                    try {
+                        $h = [int]($img.Height * ($ResizeWidth / $img.Width))
+                        $bmp = [System.Drawing.Bitmap]::new($ResizeWidth, $h)
+                        $g = [System.Drawing.Graphics]::FromImage($bmp)
+                        try {
+                            $g.InterpolationMode = 'HighQualityBicubic'
+                            $g.DrawImage($img, 0, 0, $ResizeWidth, $h)
+                            $bmp.Save($resizedPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                        }
+                        finally { $g.Dispose(); $bmp.Dispose() }
+                    }
+                    finally { $img.Dispose() }
+                    Write-Host ("Resized to {0}px wide: {1}" -f $ResizeWidth, $resizedPath) -ForegroundColor DarkGray
+                }
+                $resolved = $resizedPath
+            }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+                Write-Warning "Resize failed (using original image): $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # 1. Persist to user-settings.json under defaults.*
+    $settingsPath = Join-Path $cacheDir 'user-settings.json'
+    try {
+        $settings = Read-UserSettingsForWrite -Path $settingsPath
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Could not read user-settings.json: $($_.Exception.Message). Background not persisted."
+        return
+    }
+    if (-not $settings.PSObject.Properties['defaults']) {
+        $settings | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force
+    }
+    foreach ($p in $bgProps) {
+        if ($settings.defaults.PSObject.Properties[$p]) { $settings.defaults.PSObject.Properties.Remove($p) }
+    }
+    if (-not $Clear) {
+        $settings.defaults | Add-Member -NotePropertyName 'backgroundImage' -NotePropertyValue $resolved -Force
+        $settings.defaults | Add-Member -NotePropertyName 'backgroundImageOpacity' -NotePropertyValue $Opacity -Force
+        $settings.defaults | Add-Member -NotePropertyName 'backgroundImageStretchMode' -NotePropertyValue $StretchMode -Force
+        $settings.defaults | Add-Member -NotePropertyName 'backgroundImageAlignment' -NotePropertyValue $Alignment -Force
+    }
+    if ($PSCmdlet.ShouldProcess($settingsPath, 'Persist terminal background in user-settings.json')) {
+        $json = $settings | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($settingsPath, $json, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    # 2. Apply live to WT settings.json so change is visible immediately. Iterate ALL installed
+    # WT variants (Stable / Preview / Canary / unpackaged) so multi-variant users get a
+    # consistent background everywhere, not just whichever comes first in precedence order.
+    $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
+    if (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
+        Write-Host 'Windows Terminal settings.json not found (Store/Preview/Canary/unpackaged). Change persisted; will apply after next Update-Profile.' -ForegroundColor DarkGray
+        return
+    }
+    foreach ($wtSettingsPath in $wtSettingsPaths) {
+        try {
+            $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
+            $wt = $wtRaw | ConvertFrom-Json
+            if (-not $wt.profiles) { $wt | Add-Member -NotePropertyName 'profiles' -NotePropertyValue ([PSCustomObject]@{}) -Force }
+            if (-not $wt.profiles.defaults) { $wt.profiles | Add-Member -NotePropertyName 'defaults' -NotePropertyValue ([PSCustomObject]@{}) -Force }
+            foreach ($p in $bgProps) {
+                if ($wt.profiles.defaults.PSObject.Properties[$p]) { $wt.profiles.defaults.PSObject.Properties.Remove($p) }
+            }
+            if (-not $Clear) {
+                $wt.profiles.defaults | Add-Member -NotePropertyName 'backgroundImage' -NotePropertyValue $resolved -Force
+                $wt.profiles.defaults | Add-Member -NotePropertyName 'backgroundImageOpacity' -NotePropertyValue $Opacity -Force
+                $wt.profiles.defaults | Add-Member -NotePropertyName 'backgroundImageStretchMode' -NotePropertyValue $StretchMode -Force
+                $wt.profiles.defaults | Add-Member -NotePropertyName 'backgroundImageAlignment' -NotePropertyValue $Alignment -Force
+            }
+            if ($PSCmdlet.ShouldProcess($wtSettingsPath, 'Apply terminal background live')) {
+                $wtJson = $wt | ConvertTo-Json -Depth 100
+                [System.IO.File]::WriteAllText($wtSettingsPath, $wtJson, [System.Text.UTF8Encoding]::new($false))
+            }
+        }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Write-Warning "Live apply to WT settings.json failed for $wtSettingsPath`: $($_.Exception.Message)"
+        }
+    }
+    if ($Clear) { Write-Host 'Terminal background cleared.' -ForegroundColor Yellow }
+    else { Write-Host ("Terminal background: {0} (opacity {1}, {2}, {3})" -f $resolved, $Opacity, $StretchMode, $Alignment) -ForegroundColor Green }
+}
+
+# Internal: read user-settings.json into a PSCustomObject. Throws on unreadable/invalid JSON
+# so callers MUST wrap in try/catch (throw is used rather than Write-Error so the behavior
+# is identical regardless of the caller's $ErrorActionPreference). Returns an empty
+# PSCustomObject when the file does not exist (first run).
+function Read-UserSettingsForWrite {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return [PSCustomObject]@{} }
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($raw)) { return [PSCustomObject]@{} }
+    return $raw | ConvertFrom-Json -ErrorAction Stop
+}
+
+# Internal: persist $script:PSP.TrustedDirs to user-settings.json under trustedDirs.
+# Returns $true on success, $false if the file could not be read or written. Never throws
+# (except PipelineStoppedException) so callers can rely on the bool for rollback decisions
+# regardless of $ErrorActionPreference.
+function Save-TrustedDirectories {
+    $settingsPath = Join-Path $cacheDir 'user-settings.json'
+    try {
+        $settings = Read-UserSettingsForWrite -Path $settingsPath
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Could not read user-settings.json: $($_.Exception.Message). Trust changes not persisted."
+        return $false
+    }
+    $dirs = @($script:PSP.TrustedDirs)
+    if ($settings.PSObject.Properties['trustedDirs']) {
+        $settings.trustedDirs = $dirs
+    }
+    else {
+        $settings | Add-Member -NotePropertyName 'trustedDirs' -NotePropertyValue $dirs -Force
+    }
+    try {
+        $json = $settings | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($settingsPath, $json, [System.Text.UTF8Encoding]::new($false))
+        return $true
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+        Write-Error "Could not write user-settings.json: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Help Function (PS5-compatible - $PSStyle only exists in PS7.2+)
 function Show-Help {
     if ($null -ne $PSStyle) {
@@ -3399,6 +5988,8 @@ ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
 ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system temp caches.
+${g}duration${r} - Elapsed time of the last command.
+${g}Test-ProfileHealth${r} / ${g}psp-doctor${r} - Diagnose install: tools, caches, fonts, PATH.
 ${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults.
 
 ${c}Git${r}
@@ -3418,6 +6009,8 @@ ${g}extract${r} <file> - Universal extractor (.zip, .tar, .gz, .7z, .rar).
 ${g}file${r} <path> - Identify file type via magic bytes (like Linux file command).
 ${g}sizeof${r} <path> - Human-readable file/directory size.
 ${g}docs${r} / ${g}dtop${r} - Jump to Documents / Desktop.
+${g}cdb${r} [N] - cd back N entries in directory history (default 1, previous dir).
+${g}cdh${r} - List the cd history stack (most-recent first).
 
 ${c}Unix-like${r}
 ${g}grep${r} <regex> [dir] - Search for pattern in files (uses ripgrep when available).
@@ -3446,8 +6039,8 @@ ${g}weather${r} [city] - Quick weather lookup.
 ${g}speedtest${r} - Download speed test.
 ${g}wifipass${r} [ssid] - Show saved WiFi passwords.
 ${g}hosts${r} - Open hosts file in elevated editor.
-${g}winutil${r} - Launch Chris Titus WinUtil.
-${g}harden${r} - Open Harden Windows Security.
+${g}winutil${r} [-ExpectedSha256 <hash>] [-Force] - Safe-by-default Chris Titus WinUtil fetch. Shows SHA256 + URL, then requires explicit confirmation before any execution.
+${g}harden${r} - Open Harden Windows Security (prompts before launch).
 
 ${c}Security & Crypto${r}
 ${g}hash${r} <file> [algo] - File hash (default SHA256).
@@ -3463,6 +6056,7 @@ ${g}vt${r} <subcommand> - Full VirusTotal CLI (vt-cli). Run ${g}vt --help${r} fo
 
 ${c}Developer${r}
 ${g}killport${r} <port> - Kill process on a TCP port.
+${g}killports${r} / ${g}Stop-ListeningPort${r} - Interactive picker: lists all listening ports, pick one or many via fzf, kill.
 ${g}http${r} <url> [-Method POST] [-Body '...'] - HTTP requests, auto-formats JSON.
 ${g}prettyjson${r} <file> - Pretty-print JSON (or pipe: ${g}cat data.json | prettyjson${r}).
 ${g}hb${r} <file> - Upload to hastebin, copy URL.
@@ -3476,9 +6070,59 @@ ${g}dlogs${r} <container> - Follow logs.  ${g}dex${r} <container> [shell] - Exec
 ${g}dstop${r} - Stop all.  ${g}dprune${r} - System prune.
 
 ${c}SSH & Remote${r} (ssh/keygen when installed)
+${g}ssh${r} <user@host> - Wraps ssh.exe with ConnectTimeout=10 + keepalive so hangs respond to Ctrl+C.
 ${g}Copy-SshKey${r} / ${g}ssh-copy-key${r} <user@host> - Copy SSH key to remote.
 ${g}keygen${r} [name] - Generate ED25519 key pair.
 ${g}rdp${r} <host> - Launch RDP session.
+
+${c}WSL${r} (when wsl.exe is installed)
+${g}wsl${r} [args] - Wraps wsl.exe; sets tab title to distro name.
+${g}Get-WslDistro${r} - List distros with state + version + default flag.
+${g}Enter-WslHere${r} [-Distro] / ${g}wsl-here${r} - Open WSL shell in the current Windows directory.
+${g}Get-WslFile${r} <distro> [path] [-Recurse] - List files in a distro via UNC (pipe-friendly).
+${g}Show-WslTree${r} / ${g}wsl-tree${r} <distro> [path] [-Depth N] - Tree view (eza when available).
+${g}Open-WslExplorer${r} / ${g}wsl-explorer${r} <distro> [path] - Open in Windows Explorer (GUI).
+${g}ConvertTo-WslPath${r} <winpath> / ${g}ConvertTo-WindowsPath${r} <wslpath> - Path translation.
+${g}Get-WslIp${r} [-Distro] - IPv4 of a running distro (for connecting to services).
+${g}Stop-Wsl${r} [-Distro] - Shutdown all distros, or terminate one by name.
+
+${c}Sysadmin${r}
+${g}journal${r} [log] [-Count n] [-Follow] [-Level ...] - Tail Windows Event Log (journalctl-style).
+${g}lsblk${r} - List disks and partitions with volume info.
+${g}htop${r} - Interactive process viewer (uses btop/ntop/htop if installed, else svc -Live).
+${g}mtr${r} <host> - Traceroute with per-hop ping stats.
+${g}fwallow${r} / ${g}fwblock${r} <name> [-Port n] - Quick Windows Firewall rule (needs admin; supports -WhatIf/-Confirm).
+${g}Find-FileLocker${r} <path> - Show which processes hold a file/folder lock (uses Restart-Manager API, same as Explorer).
+${g}Stop-StuckProcess${r} <name|-Id n> [-Tree] - Escalating kill for processes that ignore Stop-Process.
+${g}Remove-LockedItem${r} <path> [-Recurse] - Find lockers, kill them, then delete. For "file is in use" errors.
+
+${c}Cybersec${r}
+${g}nscan${r} <target> [-Mode Quick/Full/Services/Stealth/Vuln/Ports] - Curated nmap profiles.
+${g}sigcheck${r} <path> - Authenticode signature details (file or directory).
+${g}ads${r} <path> - List NTFS alternate data streams.
+${g}defscan${r} [path] [-Mode Quick/Full] - Windows Defender scan wrapper.
+${g}pwnd${r} <password> - HIBP k-anonymity breach lookup (only first 5 SHA1 chars leave the host).
+${g}certcheck${r} <host> [port] - Full TLS probe: chain, SAN, SHA256 pin, cipher.
+${g}entropy${r} <file> - Shannon entropy (detect packed/encrypted payloads).
+
+${c}Developer+${r}
+${g}serve${r} [port] [path] - One-line HTTP server (python or npx).
+${g}gitignore${r} <lang...> - Generate .gitignore from gitignore.io.
+${g}gcof${r} - Fuzzy git branch checkout (fzf).
+${g}envload${r} [path] - Load .env file into current session.
+${g}tldr${r} <cmd> - Quick command-example lookup (tldr-pages).
+${g}repeat${r} <count> { cmd } [-UntilSuccess] [-DelaySeconds n] - Repeat a scriptblock.
+${g}mkvenv${r} [name] - Create and activate a Python venv.
+
+${c}Detection & AST${r}
+${g}outline${r} <file> - List functions/params/aliases via AST parser.
+${g}psym${r} [pattern] [root] - Symbol search across .ps1 files.
+${g}lint${r} [path] [-Mode Standard/Strict/Security/CI] [-Fix] - PSScriptAnalyzer wrapper.
+${g}Find-DeadCode${r} <file> - Unused params and same-file uncalled functions.
+${g}Test-Profile${r} - Profile diagnostics: version, policy, caches, tools, env.
+${g}Get-PwshVersions${r} - Enumerate every installed PowerShell.
+${g}modinfo${r} <name> - Module details: path, version(s), exports, signature.
+${g}psgrep${r} <pattern> [-Kind Command/Variable/String/Function] - AST-based code search.
 
 ${c}Clipboard${r}
 ${g}cpy${r} <text> - Copy to clipboard.  ${g}pst${r} - Paste from clipboard.
@@ -3488,10 +6132,189 @@ ${c}Keybindings${r}
 ${g}Ctrl+R${r} - Fuzzy history search (fzf).  ${g}Ctrl+T${r} - Fuzzy file finder (fzf).
 ${g}Alt+V${r} - Smart paste into prompt.
 
-Edit '${m}profile_user.ps1${r}' in your profile directory for customizations that survive updates.
+${c}Extensibility${r}
+${g}Get-ProfileCommand${r} [-Category ...] [-Name ...] - Query the command registry.
+${g}Start-ProfileTour${r} - Interactive walkthrough of every category.
+${g}Register-ProfileHook${r} -Event OnProfileLoad/PrePrompt/OnCd -Action { ... } - Hook lifecycle events.
+${g}Register-HelpSection${r} -Title ... -Lines @(...) - Add a section to this help.
+${g}Register-ProfileCommand${r} -Name ... -Category ... [-Synopsis ...] - Add to command registry.
+${g}Add-TrustedDirectory${r} / ${g}Remove-TrustedDirectory${r} [path] - Trust a dir so .psprc.ps1 auto-loads.
+
+${c}Theme${r}
+${g}Set-TerminalBackground${r} <image> [-Opacity 0.3] [-StretchMode ...] [-Alignment ...] - Set WT background image (live + persisted).
+${g}Set-TerminalBackground${r} -Clear - Remove the background image.
+
+Extend the profile without forking:
+  ${m}profile_user.ps1${r}                        - dot-sourced last; PS-level overrides.
+  ${m}%LOCALAPPDATA%\PowerShellProfile\plugins\*.ps1${r} - drop-in plugins (auto-loaded).
+  ${m}user-settings.json${r}                      - features toggles, commandOverrides, trustedDirs.
+  ${m}.psprc.ps1${r}                              - per-directory profile (opt-in via Add-TrustedDirectory).
+    For lasting functions/aliases inside .psprc.ps1, use ${g}function global:foo${r} or ${g}Set-Alias -Scope Global${r}.
+    ${y}`$env:VAR = ...${r} always persists. Plain function/alias definitions are scoped and disappear after prompt render.
 "@
     Write-Host $helpText
+    if ($script:PSP -and $script:PSP.HelpSections.Count -gt 0) {
+        foreach ($section in $script:PSP.HelpSections) {
+            Write-Host ''
+            Write-Host ("${c}$($section.Title)${r}")
+            foreach ($line in $section.Lines) { Write-Host $line }
+        }
+    }
 }
+
+# Seed the command registry so Get-ProfileCommand and Start-ProfileTour return useful results.
+# Data-only; plugins and profile_user.ps1 may append via Register-ProfileCommand.
+$script:_seedCommands = @(
+    @{ Name = 'Update-Profile'; Category = 'Profile'; Synopsis = 'Sync profile, theme, caches, WT settings' }
+    @{ Name = 'Update-PowerShell'; Category = 'Profile'; Synopsis = 'Check for new PowerShell releases' }
+    @{ Name = 'Update-Tools'; Category = 'Profile'; Synopsis = 'Upgrade winget-managed tools' }
+    @{ Name = 'Edit-Profile'; Category = 'Profile'; Synopsis = 'Open profile in preferred editor' }
+    @{ Name = 'Show-Help'; Category = 'Profile'; Synopsis = 'Show this help message' }
+    @{ Name = 'reload'; Category = 'Profile'; Synopsis = 'Reload the profile in-place' }
+    @{ Name = 'Clear-ProfileCache'; Category = 'Profile'; Synopsis = 'Reset caches except user settings' }
+    @{ Name = 'Clear-Cache'; Category = 'Profile'; Synopsis = 'Clear user/system temp caches' }
+    @{ Name = 'Uninstall-Profile'; Category = 'Profile'; Synopsis = 'Remove profile, caches, WT changes' }
+    @{ Name = 'Invoke-ProfileWizard'; Category = 'Profile'; Synopsis = 'Re-run install wizard (alias: Reconfigure-Profile)' }
+    @{ Name = 'Test-Profile'; Category = 'Profile'; Synopsis = 'Profile diagnostics' }
+    @{ Name = 'gs'; Category = 'Git'; Synopsis = 'git status' }
+    @{ Name = 'ga'; Category = 'Git'; Synopsis = 'git add .' }
+    @{ Name = 'gc'; Category = 'Git'; Synopsis = 'git commit -m' }
+    @{ Name = 'gpush'; Category = 'Git'; Synopsis = 'git push' }
+    @{ Name = 'gpull'; Category = 'Git'; Synopsis = 'git pull' }
+    @{ Name = 'gcl'; Category = 'Git'; Synopsis = 'git clone' }
+    @{ Name = 'gcom'; Category = 'Git'; Synopsis = 'add + commit' }
+    @{ Name = 'lazyg'; Category = 'Git'; Synopsis = 'add + commit + push' }
+    @{ Name = 'g'; Category = 'Git'; Synopsis = 'zoxide jump to github dir' }
+    @{ Name = 'gcof'; Category = 'Git'; Synopsis = 'Fuzzy git branch checkout (fzf)' }
+    @{ Name = 'gitignore'; Category = 'Git'; Synopsis = 'Generate .gitignore from gitignore.io' }
+    @{ Name = 'ls'; Category = 'Files'; Synopsis = 'eza listing' }
+    @{ Name = 'la'; Category = 'Files'; Synopsis = 'eza listing with hidden' }
+    @{ Name = 'll'; Category = 'Files'; Synopsis = 'eza long + git listing' }
+    @{ Name = 'lt'; Category = 'Files'; Synopsis = 'eza tree listing' }
+    @{ Name = 'cat'; Category = 'Files'; Synopsis = 'Syntax-highlighted viewer (bat)' }
+    @{ Name = 'ff'; Category = 'Files'; Synopsis = 'Find files recursively' }
+    @{ Name = 'nf'; Category = 'Files'; Synopsis = 'Create new file' }
+    @{ Name = 'touch'; Category = 'Files'; Synopsis = 'Create file or update timestamp' }
+    @{ Name = 'mkcd'; Category = 'Files'; Synopsis = 'Create dir and cd into it' }
+    @{ Name = 'trash'; Category = 'Files'; Synopsis = 'Move to Recycle Bin' }
+    @{ Name = 'extract'; Category = 'Files'; Synopsis = 'Universal archive extractor' }
+    @{ Name = 'file'; Category = 'Files'; Synopsis = 'Identify file type via magic bytes' }
+    @{ Name = 'sizeof'; Category = 'Files'; Synopsis = 'Human-readable size' }
+    @{ Name = 'docs'; Category = 'Files'; Synopsis = 'Jump to Documents' }
+    @{ Name = 'dtop'; Category = 'Files'; Synopsis = 'Jump to Desktop' }
+    @{ Name = 'cdb'; Category = 'Files'; Synopsis = 'cd back N entries in history (default 1)' }
+    @{ Name = 'cdh'; Category = 'Files'; Synopsis = 'List the cd history stack' }
+    @{ Name = 'duration'; Category = 'Profile'; Synopsis = 'Show elapsed time of the last command' }
+    @{ Name = 'Test-ProfileHealth'; Category = 'Profile'; Synopsis = 'Diagnose install: tools, caches, fonts, PATH, modules' }
+    @{ Name = 'psp-doctor'; Category = 'Profile'; Synopsis = 'Alias for Test-ProfileHealth' }
+    @{ Name = 'bak'; Category = 'Files'; Synopsis = 'Timestamped backup' }
+    @{ Name = 'grep'; Category = 'Unix'; Synopsis = 'Search for pattern in files' }
+    @{ Name = 'head'; Category = 'Unix'; Synopsis = 'First n lines' }
+    @{ Name = 'tail'; Category = 'Unix'; Synopsis = 'Last n lines' }
+    @{ Name = 'sed'; Category = 'Unix'; Synopsis = 'Find and replace in file' }
+    @{ Name = 'which'; Category = 'Unix'; Synopsis = 'Show command path' }
+    @{ Name = 'pgrep'; Category = 'Unix'; Synopsis = 'List processes by name' }
+    @{ Name = 'pkill'; Category = 'Unix'; Synopsis = 'Kill processes by name' }
+    @{ Name = 'export'; Category = 'Unix'; Synopsis = 'Set environment variable' }
+    @{ Name = 'env'; Category = 'System'; Synopsis = 'Search/list environment variables' }
+    @{ Name = 'admin'; Category = 'System'; Synopsis = 'Open elevated terminal' }
+    @{ Name = 'pubip'; Category = 'System'; Synopsis = 'Public IP' }
+    @{ Name = 'localip'; Category = 'System'; Synopsis = 'Local IPv4 addresses' }
+    @{ Name = 'uptime'; Category = 'System'; Synopsis = 'System uptime' }
+    @{ Name = 'sysinfo'; Category = 'System'; Synopsis = 'Detailed system info' }
+    @{ Name = 'df'; Category = 'System'; Synopsis = 'Disk volumes' }
+    @{ Name = 'svc'; Category = 'System'; Synopsis = 'htop-like process viewer' }
+    @{ Name = 'path'; Category = 'System'; Synopsis = 'Display PATH entries' }
+    @{ Name = 'eventlog'; Category = 'System'; Synopsis = 'Last event log entries' }
+    @{ Name = 'winutil'; Category = 'System'; Synopsis = 'Fetch Chris Titus WinUtil (safe-by-default; -ExpectedSha256/-Force to run)' }
+    @{ Name = 'harden'; Category = 'System'; Synopsis = 'Open Harden Windows Security (prompts before launch)' }
+    @{ Name = 'hosts'; Category = 'System'; Synopsis = 'Open hosts file (elevated)' }
+    @{ Name = 'wifipass'; Category = 'System'; Synopsis = 'Show saved WiFi passwords' }
+    @{ Name = 'journal'; Category = 'Sysadmin'; Synopsis = 'Tail Windows Event Log' }
+    @{ Name = 'lsblk'; Category = 'Sysadmin'; Synopsis = 'List disks and partitions' }
+    @{ Name = 'htop'; Category = 'Sysadmin'; Synopsis = 'Interactive process viewer' }
+    @{ Name = 'mtr'; Category = 'Sysadmin'; Synopsis = 'Traceroute + per-hop ping' }
+    @{ Name = 'fwallow'; Category = 'Sysadmin'; Synopsis = 'Quick firewall allow rule (supports -WhatIf/-Confirm)' }
+    @{ Name = 'fwblock'; Category = 'Sysadmin'; Synopsis = 'Quick firewall block rule (supports -WhatIf/-Confirm)' }
+    @{ Name = 'flushdns'; Category = 'Network'; Synopsis = 'Clear DNS cache' }
+    @{ Name = 'ports'; Category = 'Network'; Synopsis = 'Listening TCP ports' }
+    @{ Name = 'checkport'; Category = 'Network'; Synopsis = 'Test TCP connectivity' }
+    @{ Name = 'portscan'; Category = 'Network'; Synopsis = 'Quick TCP port scan' }
+    @{ Name = 'tlscert'; Category = 'Network'; Synopsis = 'TLS certificate details' }
+    @{ Name = 'ipinfo'; Category = 'Network'; Synopsis = 'IP geolocation lookup' }
+    @{ Name = 'whois'; Category = 'Network'; Synopsis = 'WHOIS domain lookup' }
+    @{ Name = 'nslook'; Category = 'Network'; Synopsis = 'DNS lookup' }
+    @{ Name = 'weather'; Category = 'Network'; Synopsis = 'Weather lookup' }
+    @{ Name = 'speedtest'; Category = 'Network'; Synopsis = 'Download speed test' }
+    @{ Name = 'hash'; Category = 'Cybersec'; Synopsis = 'File hash (default SHA256)' }
+    @{ Name = 'checksum'; Category = 'Cybersec'; Synopsis = 'Verify file hash' }
+    @{ Name = 'genpass'; Category = 'Cybersec'; Synopsis = 'Random password (clipboard)' }
+    @{ Name = 'b64'; Category = 'Cybersec'; Synopsis = 'Base64 encode' }
+    @{ Name = 'b64d'; Category = 'Cybersec'; Synopsis = 'Base64 decode' }
+    @{ Name = 'jwtd'; Category = 'Cybersec'; Synopsis = 'Decode JWT' }
+    @{ Name = 'uuid'; Category = 'Cybersec'; Synopsis = 'Generate UUID' }
+    @{ Name = 'urlencode'; Category = 'Cybersec'; Synopsis = 'URL encode' }
+    @{ Name = 'urldecode'; Category = 'Cybersec'; Synopsis = 'URL decode' }
+    @{ Name = 'epoch'; Category = 'Cybersec'; Synopsis = 'Unix timestamp converter' }
+    @{ Name = 'vtscan'; Category = 'Cybersec'; Synopsis = 'VirusTotal quick scan' }
+    @{ Name = 'nscan'; Category = 'Cybersec'; Synopsis = 'Nmap wrapper' }
+    @{ Name = 'sigcheck'; Category = 'Cybersec'; Synopsis = 'Authenticode signature details' }
+    @{ Name = 'ads'; Category = 'Cybersec'; Synopsis = 'Alternate data streams' }
+    @{ Name = 'defscan'; Category = 'Cybersec'; Synopsis = 'Defender scan wrapper' }
+    @{ Name = 'pwnd'; Category = 'Cybersec'; Synopsis = 'HIBP breach check' }
+    @{ Name = 'certcheck'; Category = 'Cybersec'; Synopsis = 'TLS cert chain + pinning' }
+    @{ Name = 'entropy'; Category = 'Cybersec'; Synopsis = 'Shannon entropy' }
+    @{ Name = 'killport'; Category = 'Developer'; Synopsis = 'Kill process on TCP port' }
+    @{ Name = 'Stop-ListeningPort'; Category = 'Developer'; Synopsis = 'Interactive picker for listening ports (alias: killports)' }
+    @{ Name = 'Find-FileLocker'; Category = 'Sysadmin'; Synopsis = 'Show processes holding a file/folder lock' }
+    @{ Name = 'Stop-StuckProcess'; Category = 'Sysadmin'; Synopsis = 'Escalating kill: Stop-Process -> taskkill /F -> /F /T' }
+    @{ Name = 'Remove-LockedItem'; Category = 'Sysadmin'; Synopsis = 'Find lockers, kill, and delete (combo)' }
+    @{ Name = 'http'; Category = 'Developer'; Synopsis = 'HTTP requests with auto JSON format' }
+    @{ Name = 'prettyjson'; Category = 'Developer'; Synopsis = 'Pretty-print JSON' }
+    @{ Name = 'hb'; Category = 'Developer'; Synopsis = 'Upload to hastebin' }
+    @{ Name = 'timer'; Category = 'Developer'; Synopsis = 'Measure execution time' }
+    @{ Name = 'watch'; Category = 'Developer'; Synopsis = 'Repeat command every n seconds' }
+    @{ Name = 'serve'; Category = 'Developer'; Synopsis = 'One-line HTTP server' }
+    @{ Name = 'envload'; Category = 'Developer'; Synopsis = 'Load .env file' }
+    @{ Name = 'tldr'; Category = 'Developer'; Synopsis = 'Quick command examples' }
+    @{ Name = 'repeat'; Category = 'Developer'; Synopsis = 'Repeat scriptblock N times' }
+    @{ Name = 'mkvenv'; Category = 'Developer'; Synopsis = 'Create + activate Python venv' }
+    @{ Name = 'outline'; Category = 'Detection'; Synopsis = 'AST outline of a .ps1 file' }
+    @{ Name = 'psym'; Category = 'Detection'; Synopsis = 'Symbol search across .ps1 files' }
+    @{ Name = 'lint'; Category = 'Detection'; Synopsis = 'PSScriptAnalyzer wrapper with presets' }
+    @{ Name = 'Find-DeadCode'; Category = 'Detection'; Synopsis = 'Unused params / uncalled fns' }
+    @{ Name = 'Get-PwshVersions'; Category = 'Detection'; Synopsis = 'All installed PowerShell versions' }
+    @{ Name = 'modinfo'; Category = 'Detection'; Synopsis = 'Module details' }
+    @{ Name = 'psgrep'; Category = 'Detection'; Synopsis = 'AST-based code search' }
+    @{ Name = 'Copy-SshKey'; Category = 'SSH'; Synopsis = 'Copy SSH key to remote' }
+    @{ Name = 'wsl'; Category = 'WSL'; Synopsis = 'Wraps wsl.exe; shows distro in tab title' }
+    @{ Name = 'Get-WslDistro'; Category = 'WSL'; Synopsis = 'List installed distros with state + version' }
+    @{ Name = 'Enter-WslHere'; Category = 'WSL'; Synopsis = 'Open WSL in current Windows directory (alias: wsl-here)' }
+    @{ Name = 'ConvertTo-WslPath'; Category = 'WSL'; Synopsis = 'Windows -> WSL path (wslpath -a)' }
+    @{ Name = 'ConvertTo-WindowsPath'; Category = 'WSL'; Synopsis = 'WSL -> Windows path (wslpath -w)' }
+    @{ Name = 'Stop-Wsl'; Category = 'WSL'; Synopsis = 'Shutdown all distros or terminate one' }
+    @{ Name = 'Get-WslIp'; Category = 'WSL'; Synopsis = 'Get IPv4 of a running distro' }
+    @{ Name = 'Get-WslFile'; Category = 'WSL'; Synopsis = 'List files inside a distro via UNC; pipe-friendly' }
+    @{ Name = 'Show-WslTree'; Category = 'WSL'; Synopsis = 'Tree view of a distro path (alias: wsl-tree)' }
+    @{ Name = 'Open-WslExplorer'; Category = 'WSL'; Synopsis = 'Open distro in Windows Explorer (alias: wsl-explorer)' }
+    @{ Name = 'keygen'; Category = 'SSH'; Synopsis = 'Generate ed25519 key pair' }
+    @{ Name = 'rdp'; Category = 'SSH'; Synopsis = 'Launch RDP session' }
+    @{ Name = 'cpy'; Category = 'Clipboard'; Synopsis = 'Copy text to clipboard' }
+    @{ Name = 'pst'; Category = 'Clipboard'; Synopsis = 'Paste from clipboard' }
+    @{ Name = 'icb'; Category = 'Clipboard'; Synopsis = 'Insert clipboard into prompt' }
+    @{ Name = 'Get-ProfileCommand'; Category = 'Extensibility'; Synopsis = 'Query command registry' }
+    @{ Name = 'Start-ProfileTour'; Category = 'Extensibility'; Synopsis = 'Interactive walkthrough' }
+    @{ Name = 'Register-ProfileHook'; Category = 'Extensibility'; Synopsis = 'Hook lifecycle events' }
+    @{ Name = 'Register-HelpSection'; Category = 'Extensibility'; Synopsis = 'Add section to Show-Help' }
+    @{ Name = 'Register-ProfileCommand'; Category = 'Extensibility'; Synopsis = 'Register a command for discovery' }
+    @{ Name = 'Add-TrustedDirectory'; Category = 'Extensibility'; Synopsis = 'Trust a dir for .psprc.ps1 auto-load' }
+    @{ Name = 'Remove-TrustedDirectory'; Category = 'Extensibility'; Synopsis = 'Remove trusted directory' }
+    @{ Name = 'Set-TerminalBackground'; Category = 'Theme'; Synopsis = 'Set/clear WT background image (live + persisted)' }
+)
+foreach ($entry in $script:_seedCommands) {
+    $script:PSP.Commands.Add([PSCustomObject]$entry)
+}
+Remove-Variable -Name _seedCommands -Scope Script -ErrorAction SilentlyContinue
 
 # User overrides (survives Update-Profile)
 $userProfile = Join-Path (Split-Path $PROFILE) "profile_user.ps1"
@@ -3500,9 +6323,141 @@ if (Test-Path $userProfile) {
     catch { Write-Warning "Failed to load profile_user.ps1: $_" }
 }
 
+# Consume user-settings.json: feature toggles, command overrides, trusted directories.
+# This runs AFTER profile_user.ps1 so explicit PS-level overrides still win over JSON commandOverrides.
+$userSettingsPath = Join-Path $cacheDir 'user-settings.json'
+$script:UserSettings = $null
+if (Test-Path $userSettingsPath) {
+    try {
+        $_rawSettings = Get-Content $userSettingsPath -Raw -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($_rawSettings)) {
+            $script:UserSettings = $_rawSettings | ConvertFrom-Json -ErrorAction Stop
+        }
+    }
+    catch { Write-Warning "user-settings.json unreadable: $($_.Exception.Message)" }
+}
+if ($script:UserSettings) {
+    if ($script:UserSettings.PSObject.Properties['features']) {
+        foreach ($prop in $script:UserSettings.features.PSObject.Properties) {
+            if ($script:PSP.Features.ContainsKey($prop.Name)) {
+                # Handle string "false"/"0" -> $false explicitly. Bare [bool] coerces any non-empty string to $true.
+                $val = $prop.Value
+                if ($val -is [string]) {
+                    $script:PSP.Features[$prop.Name] = ($val -notmatch '^(?i:false|0|no|off|)$')
+                }
+                else {
+                    $script:PSP.Features[$prop.Name] = [bool]$val
+                }
+            }
+        }
+    }
+    if ($script:UserSettings.PSObject.Properties['trustedDirs']) {
+        foreach ($d in @($script:UserSettings.trustedDirs | Where-Object { $_ })) {
+            [void]$script:PSP.TrustedDirs.Add([string]$d)
+        }
+    }
+    if ($script:UserSettings.PSObject.Properties['commandOverrides']) {
+        $_overrideCount = @($script:UserSettings.commandOverrides.PSObject.Properties).Count
+        if (-not $script:PSP.Features.commandOverrides) {
+            # Security-significant feature: commandOverrides compiles JSON strings to scriptblocks.
+            # Default-off; warn loudly if the user has entries but hasn't enabled the feature.
+            if ($_overrideCount -gt 0 -and $isInteractive -and $script:PSP.Features.startupMessage) {
+                Write-Host ("commandOverrides ignored ({0} entries): set features.commandOverrides = true in user-settings.json to apply." -f $_overrideCount) -ForegroundColor DarkYellow
+            }
+        }
+        else {
+            $_appliedOverrides = @()
+            foreach ($prop in $script:UserSettings.commandOverrides.PSObject.Properties) {
+                $_ovName = $prop.Name
+                # Skip underscore-prefixed keys so documentation markers like `_note` in
+                # user-settings.json examples never get compiled as real commands.
+                if ($_ovName -like '_*') { continue }
+                $_ovBody = [string]$prop.Value
+                if ([string]::IsNullOrWhiteSpace($_ovBody)) { continue }
+                try {
+                    Remove-Item "function:$_ovName" -ErrorAction SilentlyContinue
+                    Remove-Item "alias:$_ovName" -ErrorAction SilentlyContinue
+                    Set-Item "function:$_ovName" -Value ([scriptblock]::Create($_ovBody))
+                    $_appliedOverrides += $_ovName
+                }
+                catch { Write-Warning "commandOverride '$_ovName' failed: $($_.Exception.Message)" }
+            }
+            # Visible notice every interactive load so JSON-sourced code execution is not invisible.
+            if ($_appliedOverrides.Count -gt 0 -and $isInteractive -and $script:PSP.Features.startupMessage) {
+                Write-Host ("commandOverrides active ({0}): {1}" -f $_appliedOverrides.Count, ($_appliedOverrides -join ', ')) -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+# Auto-load plugins from $cacheDir\plugins\*.ps1. Dot-sourced so they inherit script scope
+# and can call Register-* APIs freely. Errors are isolated per plugin.
+$pluginDir = Join-Path $cacheDir 'plugins'
+if (-not (Test-Path $pluginDir)) {
+    try { New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null } catch { $null = $_ }
+}
+if (Test-Path $pluginDir) {
+    foreach ($plugin in (Get-ChildItem -Path $pluginDir -Filter *.ps1 -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        try { . $plugin.FullName }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Write-Warning "Plugin '$($plugin.Name)' failed to load: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Update-check (opt-in). Fires at most once every 7 days when features.updateCheck = true
+# and $isInteractive. Hits GitHub's commits API (~1 KB response) with a 3-second timeout so
+# a slow network does not stall profile load. The first check writes the current main SHA
+# as a baseline and only informs; subsequent checks notify when main has moved past that
+# baseline. Update-Profile refreshes the baseline on successful apply.
+if ($isInteractive -and $script:PSP.Features.updateCheck) {
+    try {
+        $_ucStampFile = Join-Path $cacheDir 'last-update-check.txt'
+        $_ucDoCheck = $true
+        if (Test-Path $_ucStampFile) {
+            $_ucRaw = (Get-Content $_ucStampFile -Raw -ErrorAction SilentlyContinue).Trim()
+            $_ucLast = [datetime]::MinValue
+            if ([datetime]::TryParse($_ucRaw, [ref]$_ucLast)) {
+                if (((Get-Date) - $_ucLast).TotalDays -lt 7) { $_ucDoCheck = $false }
+            }
+        }
+        if ($_ucDoCheck) {
+            # $repo_root is "https://raw.githubusercontent.com/<owner>"; derive owner for the API URL.
+            $_ucOwner = ($repo_root -replace '^https?://(raw\.)?githubusercontent\.com/', '').Trim('/')
+            $_ucApi = "https://api.github.com/repos/$_ucOwner/$repo_name/commits/main"
+            $_ucLatest = $null
+            try {
+                $_ucResp = Invoke-RestMethod -Uri $_ucApi -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+                $_ucLatest = $_ucResp.sha
+            }
+            catch { $null = $_ }
+            if ($_ucLatest) {
+                $_ucBaselineFile = Join-Path $cacheDir 'applied-commit.sha'
+                $_ucStored = if (Test-Path $_ucBaselineFile) { (Get-Content $_ucBaselineFile -Raw -ErrorAction SilentlyContinue).Trim() } else { $null }
+                if (-not $_ucStored) {
+                    # First check: record baseline so future checks can compare without false negatives.
+                    [System.IO.File]::WriteAllText($_ucBaselineFile, $_ucLatest, [System.Text.UTF8Encoding]::new($false))
+                    Write-Host ("Update-check enabled. Baseline: {0}. You'll see a notification here when main moves past this commit." -f $_ucLatest.Substring(0, 7)) -ForegroundColor DarkGray
+                }
+                elseif ($_ucStored -ne $_ucLatest) {
+                    Write-Host ("Update available: main is at {0}... (applied {1}...). Run: Update-Profile" -f $_ucLatest.Substring(0, 7), $_ucStored.Substring(0, 7)) -ForegroundColor Yellow
+                }
+                # Only stamp on successful API response; a silent API failure should not
+                # lock the user out of update notifications for 7 days.
+                [System.IO.File]::WriteAllText($_ucStampFile, (Get-Date).ToString('o'), [System.Text.UTF8Encoding]::new($false))
+            }
+        }
+    }
+    catch { $null = $_ }
+}
+
+# Fire OnProfileLoad hooks (user/plugin extensions).
+Invoke-ProfileHook -EventName 'OnProfileLoad'
+
 # Startup complete - show load time
 $profileStopwatch.Stop()
-if ($isInteractive) {
+if ($isInteractive -and $script:PSP.Features.startupMessage) {
     Write-Host "Profile loaded in $($profileStopwatch.ElapsedMilliseconds)ms." -ForegroundColor DarkGray
-    Write-Host "Use 'Show-Help' to display help" -ForegroundColor Yellow
+    Write-Host "Use 'Show-Help' or 'Start-ProfileTour' to explore." -ForegroundColor Yellow
 }

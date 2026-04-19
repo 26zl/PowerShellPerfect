@@ -4,30 +4,51 @@
     "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/pure.omp.json"
   },
   "windowsTerminal": {
-    "colorScheme": "Tokyo Night",
-    "cursorColor": "#a9b1d6",
+    "colorScheme": "Breaking Bad",
+    "cursorColor": "#ff4d94",
+    "theme": "PSP.Default",
+    "themeDefinition": {
+      "name": "PSP.Default",
+      "tab": { "background": "#3a5062", "unfocusedBackground": "#3a5062" },
+      "tabRow": { "background": "#3a5062", "unfocusedBackground": "#3a5062" },
+      "window": { "applicationTheme": "dark" }
+    },
     "scheme": {
-      "name": "Tokyo Night",
-      "background": "#1a1b26",
-      "foreground": "#a9b1d6",
-      "cursorColor": "#a9b1d6",
-      "selectionBackground": "#33467c",
-      "black": "#32344a",
-      "red": "#f7768e",
-      "green": "#9ece6a",
-      "yellow": "#e0af68",
-      "blue": "#7aa2f7",
-      "purple": "#ad8ee6",
-      "cyan": "#449dab",
-      "white": "#787c99",
-      "brightBlack": "#444b6a",
-      "brightRed": "#ff7a93",
-      "brightGreen": "#b9f27c",
-      "brightYellow": "#ff9e64",
-      "brightBlue": "#7da6ff",
-      "brightPurple": "#bb9af7",
-      "brightCyan": "#0db9d7",
-      "brightWhite": "#acb0d0"
+      "name": "Breaking Bad",
+      "background": "#1a1410",
+      "foreground": "#e8d9ba",
+      "cursorColor": "#ff4d94",
+      "selectionBackground": "#4a3c2e",
+      "black": "#2a221d",
+      "red": "#d2322d",
+      "green": "#8ba446",
+      "yellow": "#f2b548",
+      "blue": "#5bb8e6",
+      "purple": "#ff4d94",
+      "cyan": "#7fb1a8",
+      "white": "#d4c4a5",
+      "brightBlack": "#5e5347",
+      "brightRed": "#e74c3c",
+      "brightGreen": "#a8c266",
+      "brightYellow": "#f9cc6a",
+      "brightBlue": "#7fc9ef",
+      "brightPurple": "#ff6ba8",
+      "brightCyan": "#9bcbc2",
+      "brightWhite": "#f2e8d2"
+    }
+  },
+  "psreadline": {
+    "colors": {
+      "Command":   "#f2b548",
+      "Parameter": "#8ba446",
+      "Operator":  "#5bb8e6",
+      "Variable":  "#f9cc6a",
+      "String":    "#a8c266",
+      "Number":    "#ff4d94",
+      "Type":      "#e67e22",
+      "Comment":   "#7a6955",
+      "Keyword":   "#ff6ba8",
+      "Error":     "#d2322d"
     }
   }
 }
