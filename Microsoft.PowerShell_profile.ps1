@@ -274,7 +274,8 @@ function Merge-JsonObject {
         $override
     )
 
-    if (-not $base -or -not $override) { return }
+    if ($null -eq $override) { return }
+    if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
     foreach ($prop in $override.PSObject.Properties) {
         $baseVal = $base.PSObject.Properties[$prop.Name]
         if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -3470,10 +3471,10 @@ function hosts {
     $cmdInfo = Get-Command $editor -ErrorAction SilentlyContinue
     $editorPath = if ($cmdInfo -and $cmdInfo.Source) { $cmdInfo.Source } else { $editor }
     if ($cmdInfo -and $cmdInfo.CommandType -eq 'Application' -and $editorPath -match '\.(cmd|bat)$') {
-        Start-Process cmd -Verb RunAs -WindowStyle Hidden -ArgumentList "/c `"$editorPath`" `"$hostsPath`""
+        Start-Process -FilePath cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList @('/c', $editorPath, $hostsPath)
     }
     else {
-        Start-Process $editorPath $hostsPath -Verb RunAs
+        Start-Process -FilePath $editorPath -ArgumentList @($hostsPath) -Verb RunAs
     }
 }
 

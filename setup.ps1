@@ -49,15 +49,11 @@ if ([string]::IsNullOrWhiteSpace($LocalRepo) -and $PSScriptRoot -and
 # Each entry is a full Windows Terminal scheme definition. Users who want more
 # can paste their own into user-settings.json.windowsTerminal.scheme.
 $script:CuratedSchemes = @(
-    @{ Name = 'Breaking Bad'; Desc = 'Desert cream on warm brown + meth pink (matches van.jpg)'
-        Scheme = @{ name = 'Breaking Bad'; background = '#1a1410'; foreground = '#e8d9ba'; cursorColor = '#ff4d94'; selectionBackground = '#4a3c2e'
-            black = '#2a221d'; red = '#d2322d'; green = '#8ba446'; yellow = '#f2b548'; blue = '#5bb8e6'; purple = '#ff4d94'; cyan = '#7fb1a8'; white = '#d4c4a5'
-            brightBlack = '#5e5347'; brightRed = '#e74c3c'; brightGreen = '#a8c266'; brightYellow = '#f9cc6a'; brightBlue = '#7fc9ef'; brightPurple = '#ff6ba8'; brightCyan = '#9bcbc2'; brightWhite = '#f2e8d2' } }
-    @{ Name = 'Tokyo Night'; Desc = 'Cool blue-purple, balanced for long coding sessions'
+    @{ Name = 'Tokyo Night'; Desc = 'Cool blue-purple, balanced for long coding sessions (default)'
         Scheme = @{ name = 'Tokyo Night'; background = '#1a1b26'; foreground = '#a9b1d6'; cursorColor = '#a9b1d6'; selectionBackground = '#33467c'
             black = '#32344a'; red = '#f7768e'; green = '#9ece6a'; yellow = '#e0af68'; blue = '#7aa2f7'; purple = '#ad8ee6'; cyan = '#449dab'; white = '#787c99'
             brightBlack = '#444b6a'; brightRed = '#ff7a93'; brightGreen = '#b9f27c'; brightYellow = '#ff9e64'; brightBlue = '#7da6ff'; brightPurple = '#bb9af7'; brightCyan = '#0db9d7'; brightWhite = '#acb0d0' } }
-    @{ Name = 'Gruvbox Dark'; Desc = 'Retro warm yellow/orange/red, matches desert aesthetic'
+    @{ Name = 'Gruvbox Dark'; Desc = 'Retro warm yellow/orange/red, low-contrast and easy on the eyes'
         Scheme = @{ name = 'Gruvbox Dark'; background = '#282828'; foreground = '#ebdbb2'; cursorColor = '#ebdbb2'; selectionBackground = '#665c54'
             black = '#282828'; red = '#cc241d'; green = '#98971a'; yellow = '#d79921'; blue = '#458588'; purple = '#b16286'; cyan = '#689d6a'; white = '#a89984'
             brightBlack = '#928374'; brightRed = '#fb4934'; brightGreen = '#b8bb26'; brightYellow = '#fabd2f'; brightBlue = '#83a598'; brightPurple = '#d3869b'; brightCyan = '#8ec07c'; brightWhite = '#ebdbb2' } }
@@ -384,7 +380,7 @@ function Start-InstallWizard {
 
     # STEP 2: color scheme
     if ('Scheme' -notin $choices.CompletedSteps) {
-        $pick = Select-WizardItem -Title 'Windows Terminal color scheme' -Items $script:CuratedSchemes -DefaultName 'Breaking Bad'
+        $pick = Select-WizardItem -Title 'Windows Terminal color scheme' -Items $script:CuratedSchemes -DefaultName 'Tokyo Night'
         if ($pick) { $choices.Scheme = $pick.Scheme }
         $choices.CompletedSteps += 'Scheme'
         Save-State
@@ -403,7 +399,7 @@ function Start-InstallWizard {
         Write-Host ''
         Write-Host '-- Tab bar color --' -ForegroundColor Cyan
         Write-Host '  The strip at the top where tabs live. Default matches chosen color scheme background.'
-        $schemeBg = if ($choices.Scheme) { $choices.Scheme.background } else { '#1a1410' }
+        $schemeBg = if ($choices.Scheme) { $choices.Scheme.background } else { '#1a1b26' }
         $tabPresets = @(
             @{ Name = "Scheme match ($schemeBg)"; Desc = 'Seamless - tab bar same as terminal background'; Value = $schemeBg }
             @{ Name = 'Pure black (#000000)'; Desc = 'Maximum contrast'; Value = '#000000' }
@@ -995,7 +991,8 @@ catch {
 
 # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
 function Merge-JsonObject($base, $override) {
-    if (-not $base -or -not $override) { return }
+    if ($null -eq $override) { return }
+    if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
     foreach ($prop in $override.PSObject.Properties) {
         $baseVal = $base.PSObject.Properties[$prop.Name]
         if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {

@@ -3,22 +3,62 @@
 [![CI](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml)
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Status](https://img.shields.io/badge/status-active%20development-orange)](#)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
-> A modern PowerShell profile for Windows. `irm | iex` gives you 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a `p10k configure`-style install wizard - in one window, with a full uninstall, self-update, and CI behind it.
+> ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome.
+> A modern PowerShell profile for Windows. `irm | iex` drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
 ```powershell
 irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
 ```
 
-Run that in an **elevated** PowerShell window. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
+Run that in an **elevated** PowerShell window. The **install wizard runs by default** — pick theme / scheme / font / features interactively, or pass `-SkipWizard` for repo defaults. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
+
+## Install Wizard
+
+Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. **Runs automatically on every interactive install** — it's the default experience, not an opt-in. CI and AI-agent environments are auto-detected and skip it.
+
+```powershell
+# Default flow — wizard runs as part of installation
+irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
+
+# Bypass the wizard and apply repo defaults (Tokyo Night + CascadiaCode):
+.\setup.ps1 -SkipWizard
+
+# Resume a half-finished wizard (state persisted in %TEMP%\psp-wizard-state.json):
+.\setup.ps1 -Resume
+
+# Re-run the wizard any time after install (downloads latest setup.ps1 + elevates):
+Reconfigure-Profile
+```
+
+**Steps** (all accept Enter to keep the default / skip):
+
+1. **Quick start** — one-key preset: Tokyo Night scheme, CascadiaCode Nerd Font, VS Code editor, dark chrome, default features. Answer yes to jump straight to the summary.
+2. **Oh My Posh theme** — live fetch from [JanDeDobbeleer/oh-my-posh/themes](https://github.com/JanDeDobbeleer/oh-my-posh) via GitHub API. Pick by number or partial name. Network failure falls back to `pure`.
+3. **Color scheme** — curated 7-pack: Tokyo Night (default), Gruvbox Dark, Dracula, Catppuccin Mocha, Nord, One Half Dark, Solarized Dark. Full scheme definitions embedded; no extra network.
+4. **Nerd Font** — Caskaydia, JetBrainsMono, FiraCode, Meslo, Hack, or Iosevka. Fetches latest release tag from [ryanoasis/nerd-fonts](https://github.com/ryanoasis/nerd-fonts/releases) automatically.
+5. **Tab bar color + window chrome** — presets (scheme-match, pure black, custom hex) + `applicationTheme` dark/light.
+6. **Terminal appearance** — opacity, `useAcrylic`, font size, cursor shape, padding, scrollbar state, history size. Each prompt keeps the current default on Enter.
+7. **PSReadLine colors** — default / derive from chosen scheme / skip.
+8. **Background image** — optional path + opacity (0.05–0.50). Skipped by default.
+9. **Editor preference** — VS Code, Notepad++, Neovim, Vim, Notepad, or a custom exe. Used by `edit`, `ep`, `hosts`, etc.
+10. **Telemetry opt-out + feature toggles** — `psfzf`, `predictions`, `startupMessage`, `perDirProfiles`, `commandOverrides` — y/n per item with sensible defaults.
+
+**Design**:
+
+- All choices persist to `user-settings.json` so `Update-Profile` re-applies them; nothing hardcoded into the profile.
+- Summary screen at the end with "apply all?" confirmation.
+- State file enables `-Resume` if the wizard is interrupted or cancelled.
+- All 130+ commands and the extensibility system ship regardless of wizard choices; the wizard only selects cosmetics and opt-ins.
 
 ## At a glance
 
 | | |
 | --- | --- |
 | **130+ commands** | git, files, unix tools, network, security, developer, sysadmin, WSL, docker, ssh, clipboard |
-| **Install wizard** | Pick OMP theme, WT color scheme (8 curated), Nerd Font (6 curated), tab-bar + window chrome, terminal appearance (opacity, font size, cursor shape, scrollbar, padding, history size, acrylic), PSReadLine colors (default/scheme-derived/skip), background, editor, telemetry opt-out, feature toggles. `-Resume` on interrupt. |
+| **Install wizard (default)** | Runs automatically on `irm \| iex`. Picks OMP theme, WT color scheme (7 curated), Nerd Font (6 curated), tab-bar + window chrome, terminal appearance, PSReadLine colors, background, editor, telemetry opt-out, feature toggles. `-Resume` on interrupt. See [Install Wizard](#install-wizard) for details. |
 | **Transient prompt** | Scrollback shows collapsed `$`; new input gets the full OMP prompt (opt-in feature flag) |
 | **Self-updating** | `Update-Profile` syncs profile + theme + WT config with SHA-256 verification. Survives custom `profile_user.ps1` + `user-settings.json`. |
 | **Full uninstall** | `Uninstall-Profile` restores WT, removes caches, `-RemoveTools` drops winget packages, `-All` wipes everything |
@@ -29,16 +69,19 @@ Run that in an **elevated** PowerShell window. The terminal restarts when setup 
 
 Inspired by [ChrisTitusTech/powershell-profile](https://github.com/ChrisTitusTech/powershell-profile); design cues from [powerlevel10k](https://github.com/romkatv/powerlevel10k) and [starship](https://github.com/starship/starship).
 
-## Install
+## Install (alternatives)
 
-> **Recommended for Oh My Posh:** Install the x64 MSI from the [releases](https://github.com/JanDeDobbeleer/oh-my-posh/releases) page (see [Oh My Posh](https://github.com/JanDeDobbeleer/oh-my-posh)) instead of `winget`/Store—this profile preserves a direct install and avoids the WindowsApps path. If you already have the MSI install, setup leaves it as is.
+The one-liner at the top is the recommended path. These are alternatives when you need a local clone or want to tweak defaults without going through the wizard.
 
-### Manual Setup
+> **Recommended for Oh My Posh:** Install the x64 MSI from the [releases](https://github.com/JanDeDobbeleer/oh-my-posh/releases) page (see [Oh My Posh](https://github.com/JanDeDobbeleer/oh-my-posh)) instead of `winget`/Store — this profile preserves a direct install and avoids the WindowsApps path. If you already have the MSI install, setup leaves it as is.
+
+### Manual Setup (local clone)
 
 ```powershell
 git clone https://github.com/26zl/PowerShellPerfect.git
 cd PowerShellPerfect
-.\setup.ps1
+.\setup.ps1            # wizard runs by default
+.\setup.ps1 -SkipWizard # apply repo defaults instead
 ```
 
 `setup.ps1` auto-detects the local clone when run from the repo directory, so the profile, `theme.json`, and `terminal-config.json` are copied from your working tree instead of downloaded from GitHub. It installs the profile to both PS5 and PS7 directories as part of step [1/10]; a separate `.\setprofile.ps1` run is only needed if you later want a quick profile-only refresh without re-running the full installer.
@@ -46,7 +89,7 @@ cd PowerShellPerfect
 When running locally you can override terminal defaults (not available via `irm | iex`):
 
 ```powershell
-.\setup.ps1 -Opacity 85 -ColorScheme "One Half Dark" -FontSize 12
+.\setup.ps1 -SkipWizard -Opacity 85 -ColorScheme "One Half Dark" -FontSize 12
 ```
 
 > **Controlled Folder Access:** If Windows Defender blocks the setup, allow PowerShell through:
@@ -341,40 +384,6 @@ Tab-complete works on `-Distro` for all of these via live `Get-WslDistro` lookup
 | `cpy <text>` | Copy to clipboard |
 | `pst` | Paste from clipboard |
 | `icb` | Insert clipboard into prompt (never executes) |
-
-## Install Wizard
-
-Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. Auto-runs on interactive installs; `setup.ps1 -SkipWizard` bypasses it (and CI/AI-agent environments always skip).
-
-```powershell
-# Force-run the wizard during install:
-.\setup.ps1 -Wizard
-
-# Skip and use repo defaults:
-.\setup.ps1 -SkipWizard
-
-# Resume a half-finished wizard (state in %TEMP%\psp-wizard-state.json):
-.\setup.ps1 -Resume
-
-# Re-run the wizard any time after install (downloads latest setup.ps1 + elevates):
-Reconfigure-Profile
-```
-
-**Steps**:
-
-1. **Oh My Posh theme** — live fetch from [JanDeDobbeleer/oh-my-posh/themes](https://github.com/JanDeDobbeleer/oh-my-posh) via GitHub API. Pick by number or partial name. Network failure falls back to `pure`.
-2. **Color scheme** — curated 8-pack: Breaking Bad, Tokyo Night, Gruvbox Dark, Dracula, Catppuccin Mocha, Nord, One Half Dark, Solarized Dark. Full scheme definitions embedded; no extra network.
-3. **Nerd Font** — Caskaydia, JetBrainsMono, FiraCode, Meslo, Hack, or Iosevka. Fetches latest release tag from [ryanoasis/nerd-fonts](https://github.com/ryanoasis/nerd-fonts/releases) automatically.
-4. **Tab bar color** — presets: scheme-match (seamless), pure black, warm brown, custom hex, or skip. Applied via a custom WT theme definition.
-5. **Background image** — optional path + opacity (0.05-0.50). Skipped by default.
-6. **Feature toggles** — `psfzf`, `predictions`, `startupMessage`, `perDirProfiles`, `commandOverrides` — y/n per item with sensible defaults.
-
-**Design**:
-
-- All choices persist to `user-settings.json` so `Update-Profile` re-applies them; nothing hardcoded into the profile.
-- Summary screen at the end with "apply all?" confirmation.
-- State file enables `-Resume` if the wizard is interrupted or cancelled.
-- All 130+ commands and the extensibility system ship regardless of wizard choices; the wizard only selects cosmetics and opt-ins.
 
 ## Tests
 

@@ -283,10 +283,10 @@ jobs:
           }
 
           $errors = 0
-          # Schemes: expect 8 entries, each with Name, Desc, and a nested Scheme with name + background
+          # Schemes: expect 7 entries, each with Name, Desc, and a nested Scheme with name + background
           $schemes = $found['CuratedSchemes']
           if (-not $schemes) { Write-Host "FAIL: CuratedSchemes not found" -ForegroundColor Red; exit 1 }
-          if ($schemes.Count -ne 8) { Write-Host "FAIL: expected 8 curated schemes, got $($schemes.Count)" -ForegroundColor Red; $errors++ }
+          if ($schemes.Count -ne 7) { Write-Host "FAIL: expected 7 curated schemes, got $($schemes.Count)" -ForegroundColor Red; $errors++ }
           $schemeReq = @('Name','Desc','Scheme')
           $schemeInnerReq = @('name','background','foreground','black','red','green','yellow','blue','purple','cyan','white')
           foreach ($s in $schemes) {
@@ -345,7 +345,8 @@ jobs:
         run: |
           # Extract Merge-JsonObject from setup.ps1 and test it (with null guard like production)
           function Merge-JsonObject($base, $override) {
-            if (-not $base -or -not $override) { return }
+            if ($null -eq $override) { return }
+            if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
             foreach ($prop in $override.PSObject.Properties) {
               $baseVal = $base.PSObject.Properties[$prop.Name]
               if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -386,11 +387,13 @@ jobs:
           }
           Write-Host "OK: object replacement" -ForegroundColor Green
 
-          # Test 4: null base or override returns without throwing (matches production guard)
+          # Test 4: null override is a no-op; null base throws (caller-bug surfacing)
           $base = [PSCustomObject]@{ a = 1 }
-          Merge-JsonObject $null $base
           Merge-JsonObject $base $null
-          if ($base.a -ne 1) { Write-Error "Null guard should not modify base"; exit 1 }
+          if ($base.a -ne 1) { Write-Error "Null override should not modify base"; exit 1 }
+          $threw = $false
+          try { Merge-JsonObject $null ([PSCustomObject]@{ a = 1 }) } catch { $threw = $true }
+          if (-not $threw) { Write-Error "Null base should throw"; exit 1 }
           Write-Host "OK: null guard" -ForegroundColor Green
 
       - name: Test WT settings merge (mock)
