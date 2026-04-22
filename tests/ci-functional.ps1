@@ -235,46 +235,56 @@ if (-not (Test-Path $profilePath)) {
 }
 
 try {
-Invoke-TestCase -Name 'Full install flow on host (setup.ps1)' -Code {
-    # Run the real setup.ps1 against the current host to validate the full install flow
-    # (winget tools, fonts, Windows Terminal settings).
-    #
-    # Behavior:
-    # - In CI/non-admin environments: call setup.ps1 -CiMode so admin-only steps are skipped
-    #   but the rest of the flow still executes.
-    # - Locally (non-CI): require elevation so users see the real install behavior.
-
-    $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $isCiHost = [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
-
-    if (-not $isElevated -and -not $isCiHost) {
-        throw 'setup.ps1 requires an elevated (Administrator) shell when run locally. Run tests/ci-functional.ps1 from an elevated pwsh so the full install flow can be validated.'
-    }
-
+Invoke-TestCase -Name 'Full install flow in sandbox (setup.ps1)' -Code {
+    # Run the real setup.ps1 against a disposable sandbox so the install flow is validated
+    # without mutating the developer's actual profile, LOCALAPPDATA, or WT settings.
     $setupPath = Join-Path $repoRoot 'setup.ps1'
     if (-not (Test-Path $setupPath)) {
         throw "setup.ps1 not found at $setupPath"
     }
 
-    Write-Host '  Running setup.ps1 against host environment (full install flow).' -ForegroundColor Yellow
-    # Hashtable splatting is required for named parameters.
-    # Array splatting passes elements positionally, which would bind '-LocalRepo'
-    # to the first positional param ($Opacity) and fail the int conversion.
-    $setupArgs = @{ LocalRepo = $repoRoot }
-    if ($isCiHost -and -not $isElevated) {
-        $setupArgs['CiMode'] = $true
-    }
-    & $setupPath @setupArgs
+    $sandboxRoot = Join-Path $env:TEMP "psp-ci-setup-$([System.IO.Path]::GetRandomFileName())"
+    $sandboxLocal = Join-Path $sandboxRoot 'Local'
+    $sandboxDocs = Join-Path $sandboxRoot 'Documents'
+    $sandboxPs7Dir = Join-Path $sandboxDocs 'PowerShell'
+    $sandboxPs5Dir = Join-Path $sandboxDocs 'WindowsPowerShell'
+    $sandboxPs7Profile = Join-Path $sandboxPs7Dir 'Microsoft.PowerShell_profile.ps1'
+    $sandboxPs5Profile = Join-Path $sandboxPs5Dir 'Microsoft.PowerShell_profile.ps1'
+    $sandboxCacheDir = Join-Path $sandboxLocal 'PowerShellProfile'
+    $sandboxWtLocalState = Join-Path $sandboxLocal 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState'
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
-    # Verify setup actually installed files (setup.ps1 uses return, not exit 1, so
-    # $LASTEXITCODE is always 0 - we must check artifacts directly)
-    $docsRoot = Split-Path (Split-Path $PROFILE)
-    $ps7Profile = Join-Path $docsRoot 'PowerShell' 'Microsoft.PowerShell_profile.ps1'
-    $ps5Profile = Join-Path $docsRoot 'WindowsPowerShell' 'Microsoft.PowerShell_profile.ps1'
-    if (-not (Test-Path $ps7Profile)) { throw "setup.ps1 did not install PS7 profile at $ps7Profile" }
-    if (-not (Test-Path $ps5Profile)) { throw "setup.ps1 did not install PS5 profile at $ps5Profile" }
-    $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
-    if (-not (Test-Path $cacheDir)) { throw "setup.ps1 did not create cache dir at $cacheDir" }
+    New-Item -ItemType Directory -Path $sandboxPs7Dir, $sandboxPs5Dir, $sandboxWtLocalState -Force | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $sandboxWtLocalState 'settings.json'),
+        '{"profiles":{"defaults":{"font":{"face":"Consolas"}},"list":[]},"schemes":[],"actions":[]}',
+        $utf8NoBom
+    )
+
+    $prevLocal = $env:LOCALAPPDATA
+    $prevProfile = $PROFILE
+    try {
+        $env:LOCALAPPDATA = $sandboxLocal
+        Set-Variable -Name PROFILE -Scope Global -Value $sandboxPs7Profile
+
+        Write-Host '  Running setup.ps1 against disposable sandbox.' -ForegroundColor Yellow
+        & $setupPath -LocalRepo $repoRoot -CiMode -SkipWizard
+
+        if (-not (Test-Path $sandboxPs7Profile)) { throw "setup.ps1 did not install PS7 profile at $sandboxPs7Profile" }
+        if (-not (Test-Path $sandboxPs5Profile)) { throw "setup.ps1 did not install PS5 profile at $sandboxPs5Profile" }
+        if (-not (Test-Path $sandboxCacheDir)) { throw "setup.ps1 did not create cache dir at $sandboxCacheDir" }
+
+        $wtSettingsPath = Join-Path $sandboxWtLocalState 'settings.json'
+        $wtSettings = Get-Content $wtSettingsPath -Raw | ConvertFrom-Json
+        if (-not $wtSettings.profiles.defaults) {
+            throw "setup.ps1 did not merge Windows Terminal defaults in sandbox settings"
+        }
+    }
+    finally {
+        $env:LOCALAPPDATA = $prevLocal
+        Set-Variable -Name PROFILE -Scope Global -Value $prevProfile
+        Remove-Item -Path $sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Invoke-TestCase -Name 'Install profile in sandbox' -Code {

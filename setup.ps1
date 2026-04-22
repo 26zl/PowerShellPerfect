@@ -23,7 +23,10 @@ param(
     # -Resume continues from a prior incomplete wizard run (state in $env:TEMP\psp-wizard-state.json).
     [switch]$Wizard,
     [switch]$SkipWizard,
-    [switch]$Resume
+    [switch]$Resume,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedSha256,
+    [switch]$SkipHashCheck
 )
 
 # Normalize agent detection (same as profile): if host set a known agent var, set AI_AGENT so we only check one name
@@ -32,6 +35,10 @@ if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_COD
 }
 
 $RepoBase = "https://raw.githubusercontent.com/26zl/PowerShellPerfect/main"
+$script:DownloadedProfilePath = $null
+$script:DownloadedThemeConfigPath = $null
+$script:DownloadedTerminalConfigPath = $null
+$script:VerifiedInstallBundle = $false
 
 # Auto-detect local repo: when the script sits next to Microsoft.PowerShell_profile.ps1 and
 # -LocalRepo was not supplied, prefer the local checkout over a GitHub round-trip. This makes
@@ -43,6 +50,90 @@ if ([string]::IsNullOrWhiteSpace($LocalRepo) -and $PSScriptRoot -and
     (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'terminal-config.json'))) {
     $LocalRepo = $PSScriptRoot
     Write-Host "Using local repo checkout: $LocalRepo" -ForegroundColor DarkGray
+}
+
+function Get-CombinedSha256 {
+    param([Parameter(Mandatory)][string[]]$Parts)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString(
+            $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($Parts -join ':')))
+        ).Replace('-', '')
+    }
+    finally { $sha.Dispose() }
+}
+
+function Initialize-RemoteInstallBundle {
+    if ($LocalRepo -or $script:VerifiedInstallBundle) { return }
+
+    $tempSuffix = [System.IO.Path]::GetRandomFileName()
+    $bundleProfile = Join-Path $env:TEMP "psp-setup-profile-$tempSuffix.ps1"
+    $bundleTheme = Join-Path $env:TEMP "psp-setup-theme-$tempSuffix.json"
+    $bundleTerminal = Join-Path $env:TEMP "psp-setup-terminal-$tempSuffix.json"
+
+    try {
+        Invoke-DownloadWithRetry -Uri "$RepoBase/Microsoft.PowerShell_profile.ps1" -OutFile $bundleProfile -TimeoutSec 30
+        Invoke-DownloadWithRetry -Uri "$RepoBase/theme.json" -OutFile $bundleTheme
+        Invoke-DownloadWithRetry -Uri "$RepoBase/terminal-config.json" -OutFile $bundleTerminal
+
+        $profileHash = (Get-FileHash -LiteralPath $bundleProfile -Algorithm SHA256).Hash
+        $themeHash = (Get-FileHash -LiteralPath $bundleTheme -Algorithm SHA256).Hash
+        $terminalHash = (Get-FileHash -LiteralPath $bundleTerminal -Algorithm SHA256).Hash
+        $combinedHash = Get-CombinedSha256 -Parts @(
+            "profile:$profileHash"
+            "theme:$themeHash"
+            "terminal:$terminalHash"
+        )
+
+        if (-not $SkipHashCheck) {
+            if (-not $ExpectedSha256) {
+                Write-Host "Downloaded install bundle hashes:" -ForegroundColor Yellow
+                Write-Host "  profile.ps1:       $profileHash" -ForegroundColor Yellow
+                Write-Host "  theme.json:        $themeHash" -ForegroundColor Yellow
+                Write-Host "  terminal-config:   $terminalHash" -ForegroundColor Yellow
+                Write-Host "  combined:          $combinedHash" -ForegroundColor Yellow
+                throw "Hash input required. Re-run with -ExpectedSha256 '$combinedHash' or -SkipHashCheck."
+            }
+
+            if ($combinedHash -ne $ExpectedSha256.ToUpperInvariant()) {
+                throw "Combined hash mismatch. Expected $($ExpectedSha256.ToUpperInvariant()), got $combinedHash."
+            }
+        }
+
+        $script:DownloadedProfilePath = $bundleProfile
+        $script:DownloadedThemeConfigPath = $bundleTheme
+        $script:DownloadedTerminalConfigPath = $bundleTerminal
+        $script:VerifiedInstallBundle = $true
+    }
+    catch {
+        Remove-Item $bundleProfile, $bundleTheme, $bundleTerminal -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Test-IsTrustedRawGitHubUrl {
+    param([Parameter(Mandatory)][string]$Url)
+    try { $uri = [Uri]$Url } catch { return $false }
+    if ($uri.Scheme -ne 'https') { return $false }
+    return $uri.Host -in @('raw.githubusercontent.com', 'githubusercontent.com')
+}
+
+function Resolve-SetupSourcePath {
+    param([Parameter(Mandatory)][ValidateSet('profile', 'theme', 'terminal')][string]$Kind)
+    if ($LocalRepo) {
+        switch ($Kind) {
+            'profile' { return (Join-Path $LocalRepo 'Microsoft.PowerShell_profile.ps1') }
+            'theme' { return (Join-Path $LocalRepo 'theme.json') }
+            'terminal' { return (Join-Path $LocalRepo 'terminal-config.json') }
+        }
+    }
+
+    Initialize-RemoteInstallBundle
+    switch ($Kind) {
+        'profile' { return $script:DownloadedProfilePath }
+        'theme' { return $script:DownloadedThemeConfigPath }
+        'terminal' { return $script:DownloadedTerminalConfigPath }
+    }
 }
 
 # Curated color scheme library (used by install wizard).
@@ -304,6 +395,25 @@ function Start-InstallWizard {
                 Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
             }
             else {
+                # Concurrency check: if the state file was written by a different, still-live
+                # setup.ps1 process, two wizards are racing for the same state file. Warn the
+                # user before we let this invocation stomp on the other one's progress.
+                $otherPid = if ($prev.PSObject.Properties['ownerPid']) { [int]$prev.ownerPid } else { 0 }
+                $otherAlive = $false
+                if ($otherPid -gt 0 -and $otherPid -ne $PID) {
+                    try {
+                        $otherProc = Get-Process -Id $otherPid -ErrorAction Stop
+                        if ($otherProc -and $otherProc.ProcessName -match '^(pwsh|powershell)$') { $otherAlive = $true }
+                    }
+                    catch { $otherAlive = $false }
+                }
+                if ($otherAlive) {
+                    Write-Host ''
+                    Write-Host ("Another setup.ps1 wizard (PID {0}) appears to be running with this state file." -f $otherPid) -ForegroundColor Yellow
+                    if (-not (Read-WizardYesNo -Prompt '  Take over anyway? (the other run will silently overwrite on its next save)' -Default $false)) {
+                        throw 'WizardCancelled: concurrent wizard detected.'
+                    }
+                }
                 Write-Host ''
                 Write-Host ("Found wizard state from {0}." -f $prev.Timestamp) -ForegroundColor Yellow
                 if (Read-WizardYesNo -Prompt 'Resume?' -Default $true) {
@@ -315,12 +425,15 @@ function Start-InstallWizard {
                 else { Remove-Item $StatePath -Force -ErrorAction SilentlyContinue }
             }
         }
-        catch { Remove-Item $StatePath -Force -ErrorAction SilentlyContinue }
+        catch {
+            if ($_.Exception.Message -like 'WizardCancelled*') { throw }
+            Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
+        }
     }
 
     function Save-State {
         if (-not $StatePath) { return }
-        $snap = @{ schemaVersion = $WIZARD_STATE_SCHEMA; Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Choices = $choices }
+        $snap = @{ schemaVersion = $WIZARD_STATE_SCHEMA; Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); ownerPid = $PID; Choices = $choices }
         $json = $snap | ConvertTo-Json -Depth 20
         [System.IO.File]::WriteAllText($StatePath, $json, [System.Text.UTF8Encoding]::new($false))
     }
@@ -609,10 +722,8 @@ elseif (-not $isElevated -and $isCiHost) {
     Write-Host "Running setup.ps1 in CI/non-admin mode. Admin-only steps (LocalMachine execution policy, system-wide font install) will be skipped." -ForegroundColor Yellow
 }
 
-# Set execution policy so the profile can load on future sessions.
-# AllSigned is STRICTER than RemoteSigned; changing it without consent is a real policy
-# downgrade, so prompt explicitly. Restricted/Undefined are less permissive defaults where
-# a silent upgrade to RemoteSigned is the intended outcome.
+# ExecutionPolicy is security-sensitive. setup.ps1 must never silently relax it.
+# We only surface guidance; users can opt in manually if their environment requires it.
 $currentUserPolicy = Get-ExecutionPolicy -Scope CurrentUser
 if ($currentUserPolicy -eq 'AllSigned') {
     $canPromptPolicy = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
@@ -633,29 +744,17 @@ if ($currentUserPolicy -eq 'AllSigned') {
     }
 }
 elseif ($currentUserPolicy -in @('Restricted', 'Undefined')) {
-    Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
-    Write-Host "Execution policy set to RemoteSigned for CurrentUser." -ForegroundColor Green
+    Write-Host "CurrentUser execution policy is '$currentUserPolicy'." -ForegroundColor Yellow
+    Write-Host "  If the installed profile is blocked, opt in manually with:" -ForegroundColor DarkYellow
+    Write-Host "  Set-ExecutionPolicy RemoteSigned -Scope CurrentUser" -ForegroundColor DarkYellow
 }
 # Offer LocalMachine scope (covers all users and both PS editions) but don't force it.
 # In CI/non-admin mode we skip this prompt entirely.
 if (-not $isCiHost) {
     $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
     if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
-        $canPrompt = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
-        if ($canPrompt) { try { $null = [Console]::KeyAvailable } catch { $canPrompt = $false } }
-        if ($canPrompt) {
-            $reply = Read-Host "  LocalMachine execution policy is '$machinePolicy'. Set to RemoteSigned for all users? [y/N]"
-            if ($reply -match '^[Yy]') {
-                Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
-                Write-Host "Execution policy set to RemoteSigned for LocalMachine." -ForegroundColor Green
-            }
-            else {
-                Write-Host "  Skipped LocalMachine policy. PS5 may not load the profile if CurrentUser is overridden." -ForegroundColor Yellow
-            }
-        }
-        else {
-            Write-Host "  Skipped LocalMachine policy prompt (non-interactive mode)." -ForegroundColor Yellow
-        }
+        Write-Host "LocalMachine execution policy is '$machinePolicy'." -ForegroundColor Yellow
+        Write-Host "  setup.ps1 leaves machine-wide policy unchanged. Change it manually only if you intend to affect all users." -ForegroundColor DarkYellow
     }
 }
 
@@ -957,12 +1056,7 @@ if ($wantWizard) {
 
 try {
     $configTmp = Join-Path $env:TEMP ("psp-theme-" + [System.IO.Path]::GetRandomFileName() + ".json")
-    if ($LocalRepo) {
-        Copy-Item (Join-Path $LocalRepo 'theme.json') $configTmp -Force -ErrorAction Stop
-    }
-    else {
-        Invoke-DownloadWithRetry -Uri "$RepoBase/theme.json" -OutFile $configTmp
-    }
+    Copy-Item (Resolve-SetupSourcePath -Kind 'theme') $configTmp -Force -ErrorAction Stop
     $profileConfig = Get-Content $configTmp -Raw | ConvertFrom-Json
     Copy-Item $configTmp (Join-Path $configCachePath "theme.json") -Force
     Remove-Item $configTmp -ErrorAction SilentlyContinue
@@ -975,12 +1069,7 @@ catch {
 $terminalConfig = $null
 try {
     $terminalConfigTmp = Join-Path $env:TEMP ("psp-terminal-" + [System.IO.Path]::GetRandomFileName() + ".json")
-    if ($LocalRepo) {
-        Copy-Item (Join-Path $LocalRepo 'terminal-config.json') $terminalConfigTmp -Force -ErrorAction Stop
-    }
-    else {
-        Invoke-DownloadWithRetry -Uri "$RepoBase/terminal-config.json" -OutFile $terminalConfigTmp
-    }
+    Copy-Item (Resolve-SetupSourcePath -Kind 'terminal') $terminalConfigTmp -Force -ErrorAction Stop
     $terminalConfig = Get-Content $terminalConfigTmp -Raw | ConvertFrom-Json
     Copy-Item $terminalConfigTmp (Join-Path $configCachePath "terminal-config.json") -Force
     Remove-Item $terminalConfigTmp -ErrorAction SilentlyContinue
@@ -1112,7 +1201,6 @@ Write-Host ""
 
 # Profile creation or update (install for both PS5 and PS7)
 Write-Host "[1/10] Profile" -ForegroundColor Cyan
-$profileUrl = "$RepoBase/Microsoft.PowerShell_profile.ps1"
 # Derive Documents root from $PROFILE (works correctly even when Documents is in OneDrive)
 $docsRoot = Split-Path (Split-Path $PROFILE)
 $profileDirs = @(
@@ -1128,16 +1216,20 @@ foreach ($dir in $profileDirs) {
         }
         # Copy/download to temp first so a partial/corrupt download never overwrites the existing profile
         $tempDownload = Join-Path $env:TEMP ("psp-profile_download_" + (Split-Path $dir -Leaf) + "_" + [System.IO.Path]::GetRandomFileName() + ".ps1")
-        if ($LocalRepo) {
-            Copy-Item (Join-Path $LocalRepo 'Microsoft.PowerShell_profile.ps1') $tempDownload -Force
-        }
-        else {
-            Invoke-DownloadWithRetry -Uri $profileUrl -OutFile $tempDownload -TimeoutSec 30
-        }
+        Copy-Item (Resolve-SetupSourcePath -Kind 'profile') $tempDownload -Force -ErrorAction Stop
         if (Test-Path -Path $targetProfile -PathType Leaf) {
-            $backupPath = Join-Path $dir "oldprofile.ps1"
+            # Timestamped + rolling so a second install never destroys the first backup.
+            # Matches the WT settings backup pattern (keep last 5). Older "oldprofile.ps1"
+            # (pre-timestamp format) is also swept by the rolling cleanup below.
+            $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $backupPath = Join-Path $dir ("oldprofile.$backupStamp.ps1")
             Copy-Item -Path $targetProfile -Destination $backupPath -Force
             Write-Host "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
+            $oldBackups = Get-ChildItem -Path $dir -Filter 'oldprofile*.ps1' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -Skip 5
+            foreach ($old in $oldBackups) {
+                Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
+            }
         }
         Move-Item -Path $tempDownload -Destination $targetProfile -Force
         Write-Host "  Profile installed at [$targetProfile]" -ForegroundColor Green
@@ -1222,88 +1314,82 @@ else {
     Write-Host "  User settings file already exists at [$userSettingsTemplate] (preserved)" -ForegroundColor DarkGray
 }
 
+function Set-PreferredEditorInProfiles {
+    param(
+        [Parameter(Mandatory)][string]$EditorName,
+        [Parameter(Mandatory)][string]$CommentLabel
+    )
+    $editorLine = '$script:EditorPriority = @(' + "'$EditorName', 'notepad'" + ')'
+    foreach ($dir in $profileDirs) {
+        $userProfilePath = Join-Path $dir "profile_user.ps1"
+        if (-not (Test-Path $userProfilePath)) { continue }
+        $content = [System.IO.File]::ReadAllText($userProfilePath)
+        if ($content -match '(?m)^\$script:EditorPriority\s*=') {
+            $content = $content -replace '(?m)^\$script:EditorPriority\s*=.*$', $editorLine
+        }
+        else {
+            $content = $content.TrimEnd() + "`r`n`r`n# --- Preferred editor ($CommentLabel) ---`r`n$editorLine`r`n"
+        }
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($userProfilePath, $content, $utf8NoBom)
+    }
+}
+
+if ($script:DownloadedProfilePath) { Remove-Item $script:DownloadedProfilePath -Force -ErrorAction SilentlyContinue }
+if ($script:DownloadedThemeConfigPath) { Remove-Item $script:DownloadedThemeConfigPath -Force -ErrorAction SilentlyContinue }
+if ($script:DownloadedTerminalConfigPath) { Remove-Item $script:DownloadedTerminalConfigPath -Force -ErrorAction SilentlyContinue }
+
+function Resolve-ConfiguredEditor {
+    param([Parameter(Mandatory)][string]$RequestedEditor)
+    $chosen = $EditorCandidates | Where-Object { $_.Cmd -eq $RequestedEditor } | Select-Object -First 1
+    $resolvedEditor = $RequestedEditor
+    if ($chosen -and $chosen.WingetId -and -not (Get-Command $RequestedEditor -ErrorAction SilentlyContinue)) {
+        if ($isCiHost) {
+            Write-Host "  CI mode: skipping editor install for $($chosen.Display)." -ForegroundColor DarkGray
+            $resolvedEditor = 'notepad'
+        }
+        elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
+            $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
+                # Filter null/empty before joining: a missing User PATH would otherwise produce
+                # a trailing ';' in $env:PATH, which Windows path parsing has historically
+                # interpreted as "include CWD" - a classic command-hijack surface during setup.
+                $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+                $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+                $env:PATH = (@($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+                Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Could not install $($chosen.Display) via winget. Using Notepad." -ForegroundColor Yellow
+                $resolvedEditor = 'notepad'
+            }
+        }
+        else {
+            Write-Host "  winget not found. Using Notepad." -ForegroundColor Yellow
+            $resolvedEditor = 'notepad'
+        }
+    }
+    return $resolvedEditor
+}
+
 # Editor preference (interactive prompt writes $script:EditorPriority into profile_user.ps1).
 # When the wizard already captured an editor choice we skip the prompt and use it directly.
 Write-Host "[2/10] Editor preference" -ForegroundColor Cyan
 $canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
 if ($script:WizardEditor) {
-    $chosenEditor = $script:WizardEditor
+    $chosenEditor = [string]$script:WizardEditor
     Write-Host "  Using wizard choice: $chosenEditor" -ForegroundColor DarkGray
-    $chosen = $EditorCandidates | Where-Object { $_.Cmd -eq $chosenEditor } | Select-Object -First 1
-    if ($chosen -and $chosen.WingetId -and -not (Get-Command $chosenEditor -ErrorAction SilentlyContinue)) {
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
-            Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
-            $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
-            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
-                $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-                Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
-            }
-            else {
-                Write-Host "  Could not install $($chosen.Display) via winget. Using Notepad." -ForegroundColor Yellow
-                $chosenEditor = 'notepad'
-            }
-        }
-        else {
-            Write-Host "  winget not found. Using Notepad." -ForegroundColor Yellow
-            $chosenEditor = 'notepad'
-        }
-    }
+    $chosenEditor = Resolve-ConfiguredEditor -RequestedEditor $chosenEditor
     Write-Host "  Editor set to: $chosenEditor" -ForegroundColor Green
-    $editorLine = '$script:EditorPriority = @(' + "'$chosenEditor', 'notepad'" + ')'
-    foreach ($dir in $profileDirs) {
-        $userProfilePath = Join-Path $dir "profile_user.ps1"
-        if (Test-Path $userProfilePath) {
-            $content = [System.IO.File]::ReadAllText($userProfilePath)
-            if ($content -match '(?m)^\$script:EditorPriority\s*=') {
-                $content = $content -replace '(?m)^\$script:EditorPriority\s*=.*$', $editorLine
-            }
-            else {
-                $content = $content.TrimEnd() + "`r`n`r`n# --- Preferred editor (set by setup.ps1 wizard) ---`r`n$editorLine`r`n"
-            }
-            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-            [System.IO.File]::WriteAllText($userProfilePath, $content, $utf8NoBom)
-        }
-    }
+    Set-PreferredEditorInProfiles -EditorName $chosenEditor -CommentLabel 'set by setup.ps1 wizard'
 }
 elseif ($canPromptEditor) {
     $chosenEditor = Select-PreferredEditor
-    # Install chosen editor via winget only if not already installed
-    $chosen = $EditorCandidates | Where-Object { $_.Cmd -eq $chosenEditor } | Select-Object -First 1
-    if ($chosen -and $chosen.WingetId -and -not (Get-Command $chosenEditor -ErrorAction SilentlyContinue)) {
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
-            Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
-            $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
-            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
-                $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-                Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
-            }
-            else {
-                Write-Host "  Could not install $($chosen.Display) via winget. Using Notepad." -ForegroundColor Yellow
-                $chosenEditor = 'notepad'
-            }
-        }
-        else {
-            Write-Host "  winget not found. Using Notepad." -ForegroundColor Yellow
-            $chosenEditor = 'notepad'
-        }
-    }
+    $chosenEditor = Resolve-ConfiguredEditor -RequestedEditor $chosenEditor
     Write-Host "  Editor set to: $chosenEditor" -ForegroundColor Green
-    $editorLine = '$script:EditorPriority = @(' + "'$chosenEditor', 'notepad'" + ')'
-    foreach ($dir in $profileDirs) {
-        $userProfilePath = Join-Path $dir "profile_user.ps1"
-        if (Test-Path $userProfilePath) {
-            $content = [System.IO.File]::ReadAllText($userProfilePath)
-            if ($content -match '(?m)^\$script:EditorPriority\s*=') {
-                $content = $content -replace '(?m)^\$script:EditorPriority\s*=.*$', $editorLine
-            }
-            else {
-                $content = $content.TrimEnd() + "`r`n`r`n# --- Preferred editor (set by setup.ps1) ---`r`n$editorLine`r`n"
-            }
-            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-            [System.IO.File]::WriteAllText($userProfilePath, $content, $utf8NoBom)
-        }
-    }
+    Set-PreferredEditorInProfiles -EditorName $chosenEditor -CommentLabel 'set by setup.ps1'
 }
 else {
     Write-Host "  Skipped (non-interactive). Default: code, notepad" -ForegroundColor Yellow
@@ -1319,6 +1405,9 @@ function Install-OhMyPoshTheme {
     )
     $themeFilePath = Join-Path $configCachePath "$ThemeName.omp.json"
     try {
+        if (-not (Test-IsTrustedRawGitHubUrl -Url $ThemeUrl)) {
+            throw "Refusing to download theme from untrusted host: $ThemeUrl"
+        }
         $alreadyValid = $false
         if (Test-Path -LiteralPath $themeFilePath -PathType Leaf) {
             try {
@@ -1379,6 +1468,10 @@ if ($ompPath -and $ompPath -notlike ((Join-Path $env:LOCALAPPDATA 'Microsoft\Win
     Write-Host "  Oh My Posh already present at $ompPath (preserved)." -ForegroundColor Green
     $ompInstalled = $true
 }
+elseif ($isCiHost) {
+    Write-Host "  CI mode: skipping Oh My Posh install." -ForegroundColor DarkGray
+    $ompInstalled = $true
+}
 else {
     $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
 }
@@ -1415,25 +1508,50 @@ if ($script:WizardFontInstalled) {
     Write-Host "  Font already installed by wizard; skipping default." -ForegroundColor DarkGray
     $fontInstalled = $true
 }
+elseif ($isCiHost) {
+    Write-Host "  CI mode: skipping Nerd Font install." -ForegroundColor DarkGray
+    $fontInstalled = $true
+}
 else {
     $fontInstalled = Install-NerdFonts -FontName $fontName -FontDisplayName $fontDisplayName -Version $fontVersion
 }
 
 # eza Install (modern ls replacement with icons and git status)
 Write-Host "[5/10] eza" -ForegroundColor Cyan
-$ezaInstalled = Install-WingetPackage -Name "eza" -Id "eza-community.eza"
+$ezaInstalled = $true
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping eza install." -ForegroundColor DarkGray
+}
+else {
+    $ezaInstalled = Install-WingetPackage -Name "eza" -Id "eza-community.eza"
+}
 # Clean up leftover Terminal-Icons if present
 Remove-Module Terminal-Icons -Force -ErrorAction SilentlyContinue
 Uninstall-Module Terminal-Icons -AllVersions -Force -ErrorAction SilentlyContinue
 
 # zoxide Install
 Write-Host "[6/10] zoxide" -ForegroundColor Cyan
-$zoxideInstalled = Install-WingetPackage -Name "zoxide" -Id "ajeetdsouza.zoxide"
+$zoxideInstalled = $true
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping zoxide install." -ForegroundColor DarkGray
+}
+else {
+    $zoxideInstalled = Install-WingetPackage -Name "zoxide" -Id "ajeetdsouza.zoxide"
+}
 
 # fzf + PSFzf Install (fuzzy finder for history and file search)
 Write-Host "[7/10] fzf" -ForegroundColor Cyan
-$fzfInstalled = Install-WingetPackage -Name "fzf" -Id "junegunn.fzf"
-if (-not (Get-Module -ListAvailable -Name PSFzf)) {
+$fzfInstalled = $true
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping fzf install." -ForegroundColor DarkGray
+}
+else {
+    $fzfInstalled = Install-WingetPackage -Name "fzf" -Id "junegunn.fzf"
+}
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping PSFzf module install." -ForegroundColor DarkGray
+}
+elseif (-not (Get-Module -ListAvailable -Name PSFzf)) {
     try {
         Install-Module -Name PSFzf -Scope CurrentUser -Force -AllowClobber
         Write-Host "  PSFzf module installed." -ForegroundColor Green
@@ -1449,11 +1567,23 @@ else {
 
 # bat Install (syntax-highlighted cat replacement)
 Write-Host "[8/10] bat" -ForegroundColor Cyan
-$batInstalled = Install-WingetPackage -Name "bat" -Id "sharkdp.bat"
+$batInstalled = $true
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping bat install." -ForegroundColor DarkGray
+}
+else {
+    $batInstalled = Install-WingetPackage -Name "bat" -Id "sharkdp.bat"
+}
 
 # ripgrep Install (fast recursive grep, used by the grep function)
 Write-Host "[9/10] ripgrep" -ForegroundColor Cyan
-$rgInstalled = Install-WingetPackage -Name "ripgrep" -Id "BurntSushi.ripgrep.MSVC"
+$rgInstalled = $true
+if ($isCiHost) {
+    Write-Host "  CI mode: skipping ripgrep install." -ForegroundColor DarkGray
+}
+else {
+    $rgInstalled = Install-WingetPackage -Name "ripgrep" -Id "BurntSushi.ripgrep.MSVC"
+}
 
 # Windows Terminal configuration (merges font, theme, and appearance into existing settings).
 # Iterates ALL installed WT variants so Stable + Preview + Canary all receive the merge.

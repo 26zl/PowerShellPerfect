@@ -1518,6 +1518,20 @@ function Clear-Cache {
     )
 
     if ($IncludeSystemCaches) {
+        # System paths affect every user on the box and require admin. SupportsShouldProcess
+        # defaults to ConfirmImpact=Medium and $ConfirmPreference is High by default, so
+        # -IncludeSystemCaches without -Confirm would otherwise delete silently. Require an
+        # explicit y/N prompt (unless -Confirm:$false or -WhatIf was passed).
+        if (-not $WhatIfPreference -and $ConfirmPreference -ne 'None') {
+            Write-Host ''
+            Write-Host 'You are about to clear SYSTEM caches (Windows\Temp, Windows\Prefetch).' -ForegroundColor Yellow
+            Write-Host 'These paths affect every user on this machine and require admin.' -ForegroundColor Yellow
+            $reply = Read-Host '  Continue? [y/N]'
+            if ($reply -notmatch '^(?i:y|yes)$') {
+                Write-Host 'Cancelled. User caches left untouched as well.' -ForegroundColor DarkGray
+                return
+            }
+        }
         $targets += @(
             @{ Name = "Windows Temp"; Path = "$env:SystemRoot\Temp\*"; Recurse = $true },
             @{ Name = "Windows Prefetch"; Path = "$env:SystemRoot\Prefetch\*"; Recurse = $false }
@@ -2384,7 +2398,10 @@ function genpass {
     $password = $result.ToString()
     Set-Clipboard $password
     Write-Host "Password copied to clipboard." -ForegroundColor Green
-    return $password
+    # Do not return the plaintext: at top-level, PowerShell would print it to the
+    # terminal scrollback (and to any capturing pipeline/redirect), defeating the
+    # clipboard-only contract. The clipboard is the sole delivery channel.
+    return
 }
 
 # Base64 encode/decode

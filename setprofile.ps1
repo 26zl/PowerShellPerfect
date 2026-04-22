@@ -16,11 +16,18 @@ foreach ($dir in $profileDirs) {
         New-Item -Path $dir -ItemType "directory" -Force | Out-Null
     }
     $targetProfile = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
-    # Mirror setup.ps1 backup behaviour so an existing profile is preserved before overwrite.
+    # Mirror setup.ps1 backup behaviour: timestamped + rolling 5 so repeated runs
+    # never clobber the original profile backup.
     if (Test-Path -Path $targetProfile -PathType Leaf) {
-        $backupPath = Join-Path $dir "oldprofile.ps1"
+        $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $backupPath = Join-Path $dir ("oldprofile.$backupStamp.ps1")
         Copy-Item -Path $targetProfile -Destination $backupPath -Force
         Write-Host "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
+        $oldBackups = Get-ChildItem -Path $dir -Filter 'oldprofile*.ps1' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 5
+        foreach ($old in $oldBackups) {
+            Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
     Copy-Item -Path (Join-Path $PSScriptRoot "Microsoft.PowerShell_profile.ps1") -Destination $targetProfile -Force
     Write-Host "Profile copied to $dir" -ForegroundColor Green
