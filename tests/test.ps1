@@ -480,11 +480,24 @@ try {
     $requiredFunctions = @(
         'Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme',
         'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor',
-        'Invoke-DownloadWithRetry'
+        'Invoke-DownloadWithRetry', 'Remove-SafeTempDirectory',
+        'Update-SessionPathFromRegistry'
     )
     $missingFns = @()
     foreach ($fn in $requiredFunctions) {
         if ($setupContent -notmatch "function\s+$fn\b") { $missingFns += $fn }
+    }
+    $remotePreflightStart = Select-String -Path $setupPath -Pattern 'For remote installs, verify/download' | Select-Object -First 1
+    $remotePreflight = Select-String -Path $setupPath -Pattern '^\s*Initialize-RemoteInstallBundle\s*$' |
+        Where-Object { $remotePreflightStart -and $_.LineNumber -gt $remotePreflightStart.LineNumber } |
+        Select-Object -First 1
+    $policyMutation = Select-String -Path $setupPath -Pattern 'Set-ExecutionPolicy RemoteSigned' | Select-Object -First 1
+    if (-not $remotePreflight) { $missingFns += 'remote bundle preflight call' }
+    elseif ($policyMutation -and $remotePreflight.LineNumber -gt $policyMutation.LineNumber) {
+        $missingFns += 'remote bundle preflight before mutations'
+    }
+    if ($setupContent -match [regex]::Escape('$env:PATH = [System.Environment]::GetEnvironmentVariable(''PATH'', ''Machine'') + '';'' + [System.Environment]::GetEnvironmentVariable(''PATH'', ''User'')')) {
+        $missingFns += 'safe PATH registry refresh'
     }
     if ($missingFns) {
         $missingFns | ForEach-Object { Write-Host "        Missing: $_" -ForegroundColor Red }
@@ -1178,7 +1191,7 @@ T 'Invoke-ProfileWizard' {
     $post = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
     if ($post.Count -gt $pre.Count) { throw "Invoke-ProfileWizard -WhatIf leaked temp files" }
     $cmd = Get-Command Invoke-ProfileWizard
-    foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
+    foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'BundleExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
         if (-not $cmd.Parameters.ContainsKey($p)) { throw "Invoke-ProfileWizard missing parameter: $p" }
     }
 }
@@ -1363,12 +1376,17 @@ T 'genpass'   { genpass 16 }
 T 'b64'       { b64 "hello world" }
 T 'b64d'      { b64d "aGVsbG8gd29ybGQ=" }
 T 'jwtd'      { jwtd "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c" }
+T 'Test-ProfileHistorySafeLine' {
+    if (Test-ProfileHistorySafeLine 'pwnd hunter2') { throw 'pwnd input allowed into history' }
+    if (Test-ProfileHistorySafeLine 'jwtd eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig') { throw 'jwt decode allowed into history' }
+    if (-not (Test-ProfileHistorySafeLine 'git status --short')) { throw 'safe command blocked from history' }
+}
 T 'uuid'      { uuid }
 T 'epoch'     { epoch }
 T 'epoch 0'   { epoch 0 }
 T 'urlencode' { urlencode "hello world" }
 T 'urldecode' { urldecode "hello%20world" }
-T 'vtscan'    $null 'needs API key + uploads file'
+T 'vtscan'    $null 'needs API key; -Upload submits file content'
 T 'vt'        {
     if (Get-Command vt.exe -ErrorAction SilentlyContinue) { vt --help }
     else { vt }
@@ -1892,6 +1910,7 @@ try {
     # Internal helper functions that are intentionally not direct user commands
     $internalOnly = @(
         'Get-ExternalCommandPath'
+        'Update-SessionPathFromRegistry'
         'Get-OhMyPoshInstallInfo'
         'Get-OhMyPoshMsiProductCode'
         'Get-OhMyPoshExecutablePath'
@@ -1909,9 +1928,11 @@ try {
         'Write-JournalLine'
         'Invoke-PromptStage'
         'Invoke-ProfileHook'
+        'Test-ProfileHistorySafeLine'
         'Save-TrustedDirectories'
         'Read-UserSettingsForWrite'
         'Get-WindowsTerminalSettingsPath'
+        'Get-WindowsTerminalSettingsPaths'
         'Push-TabTitle'
         'Pop-TabTitle'
         'Resolve-WslUncPath'

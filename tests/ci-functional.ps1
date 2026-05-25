@@ -533,7 +533,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 throw "Invoke-ProfileWizard -WhatIf created temp files it should not have: $($postFiles.Name -join ', ')"
             }
             $cmd = Get-Command Invoke-ProfileWizard
-            foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
+            foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'BundleExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
                 if (-not $cmd.Parameters.ContainsKey($p)) { throw "Invoke-ProfileWizard missing expected parameter: $p" }
             }
         }
@@ -792,6 +792,11 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $sampleJwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQiOjE1MTYyMzkwMjJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
             jwtd $sampleJwt | Out-Null
         }
+        Invoke-CommandProbe -Command 'Test-ProfileHistorySafeLine' -Code {
+            if (Test-ProfileHistorySafeLine 'pwnd hunter2') { throw 'pwnd input allowed into history' }
+            if (Test-ProfileHistorySafeLine 'jwtd eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig') { throw 'jwt decode allowed into history' }
+            if (-not (Test-ProfileHistorySafeLine 'git status --short')) { throw 'safe command blocked from history' }
+        }
         Invoke-CommandProbe -Command 'uuid' -Code { uuid | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'epoch' -Code {
             $now = [int64]((epoch | Out-String).Trim())
@@ -807,7 +812,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $dec = (urldecode 'hello%20world' | Out-String).Trim()
             if ($dec -ne 'hello world') { throw "urldecode returned unexpected value: $dec" }
         }
-        Invoke-CommandProbe -Command 'vtscan' -SkipReason 'Requires VirusTotal API key and uploads content'
+        Invoke-CommandProbe -Command 'vtscan' -SkipReason 'Requires VirusTotal API key; -Upload submits content'
         Invoke-CommandProbe -Command 'vt' -Code {
             if (Get-Command vt.exe -ErrorAction SilentlyContinue) { vt --help | Out-Null }
             else { vt | Out-Null }
@@ -1094,6 +1099,7 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     # Internal helper functions that are not direct end-user commands
     $internalOnly = @(
         'Get-ExternalCommandPath'
+        'Update-SessionPathFromRegistry'
         'Get-OhMyPoshInstallInfo'
         'Get-OhMyPoshMsiProductCode'
         'Get-OhMyPoshExecutablePath'
@@ -1111,9 +1117,11 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Write-JournalLine'
         'Invoke-PromptStage'
         'Invoke-ProfileHook'
+        'Test-ProfileHistorySafeLine'
         'Save-TrustedDirectories'
         'Read-UserSettingsForWrite'
         'Get-WindowsTerminalSettingsPath'
+        'Get-WindowsTerminalSettingsPaths'
         'Push-TabTitle'
         'Pop-TabTitle'
         'Resolve-WslUncPath'

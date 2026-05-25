@@ -328,7 +328,7 @@ jobs:
           $content = Get-Content 'setup.ps1' -Raw
 
           # Verify required functions are defined in setup.ps1
-          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry')
+          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry', 'Remove-SafeTempDirectory', 'Update-SessionPathFromRegistry')
           $errors = 0
           foreach ($fn in $requiredFunctions) {
             if ($content -notmatch "function\s+$fn\b") {

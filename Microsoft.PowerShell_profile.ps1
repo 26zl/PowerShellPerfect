@@ -219,6 +219,12 @@ function Get-ExternalCommandPath {
     return $null
 }
 
+function Update-SessionPathFromRegistry {
+    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $env:PATH = (@($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+}
+
 # Tab-title helpers used by long-running wrappers (ssh/dex/dlogs/serve/watch/journal -Follow)
 # to make it obvious what each tab is doing. Push returns the prior title so Pop can restore
 # it; both are silent on terminals that don't support title setting. LIFO-safe (nest freely).
@@ -312,7 +318,7 @@ function Get-OhMyPoshExecutablePath {
         $candidateDir = Split-Path -Path $candidatePath -Parent
         $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
         if ($pathEntries -notcontains $candidateDir) {
-            $env:PATH = $candidateDir + ';' + $env:PATH
+            $env:PATH = (@($candidateDir, $env:PATH) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
         }
 
         return $candidatePath
@@ -1269,7 +1275,7 @@ function Update-Profile {
                 }
                 # Refresh PATH so newly installed tools are found
                 if ($installedTools.Count -gt 0) {
-                    $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+                    Update-SessionPathFromRegistry
                 }
                 # PSFzf module (required for fzf integration)
                 if ((Get-Command fzf -ErrorAction SilentlyContinue) -and -not (Get-Module -ListAvailable -Name PSFzf)) {
@@ -1445,7 +1451,7 @@ function Update-Tools {
         winget upgrade --id $tool.Id --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -eq 0) {
             # Refresh PATH so the new binary is found for version check
-            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+            Update-SessionPathFromRegistry
             $newToolPath = Get-ProfileToolExecutablePath -Tool $tool
             $newVer = if ($newToolPath) { Get-ProfileToolVersionText -Tool $tool -ExecutablePath $newToolPath } else { $null }
             if ($newVer -and $oldVer -and $newVer -ne $oldVer) {
@@ -2419,7 +2425,11 @@ function b64d {
 
 # VirusTotal file scanner (PS5-compatible, no dependencies)
 function vtscan {
-    param([Parameter(Mandatory)][string]$FilePath)
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [switch]$Upload
+    )
     $apiKey = if ($env:VTCLI_APIKEY) { $env:VTCLI_APIKEY } elseif ($env:VT_API_KEY) { $env:VT_API_KEY } else { $null }
     if (-not $apiKey) {
         Write-Host 'Set $env:VTCLI_APIKEY first (free key at https://www.virustotal.com/gui/my-apikey)' -ForegroundColor Red
@@ -2487,6 +2497,14 @@ function vtscan {
     }
 
     # File not known - upload
+    if (-not $Upload) {
+        Write-Host 'Hash not found. Not uploading by default.' -ForegroundColor Yellow
+        Write-Host 'Re-run with: vtscan -Upload <file>  (submits the file to VirusTotal)' -ForegroundColor Yellow
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess($resolved.Path, 'Upload file to VirusTotal')) {
+        return
+    }
     Write-Host 'Hash not found, uploading...' -ForegroundColor Yellow
     $uploadUrl = 'https://www.virustotal.com/api/v3/files'
     if ($file.Length -gt 10MB) {
@@ -2994,9 +3012,10 @@ function Clear-ProfileCache {
 # features without reinstalling from scratch. Downloads a fresh setup.ps1 to %TEMP%
 # (to pick up the latest wizard logic) and relaunches elevated in a new pwsh window.
 #
-# Security: downloads remote code, so the user must either pin -ExpectedSha256 or explicitly
-# confirm -SkipHashCheck. Exit code of the child process is captured so we do not claim
-# "Wizard complete" on a failure.
+# Security: downloads remote code, so the user must either pin setup.ps1 with
+# -ExpectedSha256, then pin the install bundle with -BundleExpectedSha256, or
+# explicitly use -SkipHashCheck. Exit code of the child process is captured so
+# we do not claim "Wizard complete" on a failure.
 function Invoke-ProfileWizard {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
@@ -3004,8 +3023,15 @@ function Invoke-ProfileWizard {
         [switch]$NoElevate,
         [ValidatePattern('^[A-Fa-f0-9]{64}$')]
         [string]$ExpectedSha256,
+        [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+        [string]$BundleExpectedSha256,
         [switch]$SkipHashCheck
     )
+
+    if ($BundleExpectedSha256 -and $SkipHashCheck) {
+        Write-Error 'Use either -BundleExpectedSha256 or -SkipHashCheck, not both.'
+        return
+    }
 
     $setupUrl = "$repo_root/$repo_name/main/setup.ps1"
     $setupLocal = Join-Path ([System.IO.Path]::GetTempPath()) ("psp-reconfigure-{0}.ps1" -f ([System.IO.Path]::GetRandomFileName()))
@@ -3032,12 +3058,23 @@ function Invoke-ProfileWizard {
             Write-Host "  (Hash is computed over the download just made; it confirms integrity," -ForegroundColor DarkYellow
             Write-Host "   not upstream authenticity. Verify the commit out-of-band before pinning.)" -ForegroundColor DarkYellow
             Write-Host "  Pin it:  Invoke-ProfileWizard -ExpectedSha256 '$actualHash'" -ForegroundColor Yellow
+            Write-Host "  Then pin the setup bundle with -BundleExpectedSha256 when prompted." -ForegroundColor Yellow
             Write-Host "  Or skip: Invoke-ProfileWizard -SkipHashCheck" -ForegroundColor Yellow
             throw "Hash input required. Re-run with -ExpectedSha256 or -SkipHashCheck."
         }
 
         $shellArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $setupLocal, '-Wizard')
         if ($Resume) { $shellArgs += '-Resume' }
+        if ($SkipHashCheck) {
+            $shellArgs += '-SkipHashCheck'
+        }
+        elseif ($BundleExpectedSha256) {
+            $shellArgs += @('-ExpectedSha256', $BundleExpectedSha256)
+        }
+        else {
+            Write-Host "  setup.ps1 will stop before making changes and print the install-bundle hash." -ForegroundColor Yellow
+            Write-Host "  Re-run with -BundleExpectedSha256 '<hash>' or -SkipHashCheck to apply the wizard." -ForegroundColor Yellow
+        }
 
         $pwshExe = if ((Get-Command pwsh -ErrorAction SilentlyContinue)) { 'pwsh' } else { 'powershell' }
         $exitCode = 1
@@ -5254,6 +5291,28 @@ function psgrep {
     }
 }
 
+function Test-ProfileHistorySafeLine {
+    param([AllowNull()][string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $true }
+    $sensitivePatterns = @(
+        '(?i)password'
+        '(?i)secret'
+        '(?i)token'
+        '(?i)api[_-]?key'
+        '(?i)connectionstring'
+        '(?i)credential'
+        '(?i)bearer'
+        '(?i)\b(VTCLI_APIKEY|VT_API_KEY)\b'
+        '(?i)^\s*pwnd\s+'
+        '(?i)^\s*jwtd\s+'
+        '\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\b'
+    )
+    foreach ($pattern in $sensitivePatterns) {
+        if ($Line -match $pattern) { return $false }
+    }
+    return $true
+}
+
 # Enhanced PSReadLine Configuration. Colors read from theme.json (shipped palette) and
 # then overridden from user-settings.json (wizard / manual overrides). EditMode/BellStyle
 # remain here as behavior defaults (users override via profile_user.ps1 or Set-PSReadLineOption).
@@ -5379,9 +5438,7 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     # Filter sensitive commands from history
     Set-PSReadLineOption -AddToHistoryHandler {
         param($line)
-        $sensitive = @('password', 'secret', 'token', 'api[_-]?key', 'connectionstring', 'credential', 'bearer')
-        $hasSensitive = $sensitive | Where-Object { $line -match $_ }
-        return ($null -eq $hasSensitive)
+        return (Test-ProfileHistorySafeLine -Line $line)
     }
 
     # Native tool completers. Each tool emits its own PowerShell completion script; we cache
@@ -6069,7 +6126,7 @@ ${g}jwtd${r} <token> - Decode JWT header and payload.
 ${g}uuid${r} - Generate random UUID (copies to clipboard).
 ${g}epoch${r} [value] - Unix timestamp converter (no args = now).
 ${g}urlencode${r} / ${g}urldecode${r} <text> - URL encode / decode.
-${g}vtscan${r} <file> - Quick VirusTotal scan + open in browser. Uses ${g}`$env:VTCLI_APIKEY${r} or ${g}vt init${r}.
+${g}vtscan${r} <file> [-Upload] - VirusTotal hash lookup; ${g}-Upload${r} submits unknown files.
 ${g}vt${r} <subcommand> - Full VirusTotal CLI (vt-cli). Run ${g}vt --help${r} for details.
 
 ${c}Developer${r}
@@ -6274,7 +6331,7 @@ $script:_seedCommands = @(
     @{ Name = 'urlencode'; Category = 'Cybersec'; Synopsis = 'URL encode' }
     @{ Name = 'urldecode'; Category = 'Cybersec'; Synopsis = 'URL decode' }
     @{ Name = 'epoch'; Category = 'Cybersec'; Synopsis = 'Unix timestamp converter' }
-    @{ Name = 'vtscan'; Category = 'Cybersec'; Synopsis = 'VirusTotal quick scan' }
+    @{ Name = 'vtscan'; Category = 'Cybersec'; Synopsis = 'VirusTotal hash lookup (-Upload submits)' }
     @{ Name = 'nscan'; Category = 'Cybersec'; Synopsis = 'Nmap wrapper' }
     @{ Name = 'sigcheck'; Category = 'Cybersec'; Synopsis = 'Authenticode signature details' }
     @{ Name = 'ads'; Category = 'Cybersec'; Synopsis = 'Alternate data streams' }

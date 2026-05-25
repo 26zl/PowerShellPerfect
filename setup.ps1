@@ -63,6 +63,59 @@ function Get-CombinedSha256 {
     finally { $sha.Dispose() }
 }
 
+# Download helper with retry, size validation, and corrupt-file cleanup.
+# Defined before remote bundle verification so setup can fail before any local mutations.
+function Invoke-DownloadWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+        [int]$TimeoutSec = 10,
+        [int]$MaxAttempts = 2,
+        [int]$BackoffSec = 2
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+            if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+                throw 'Downloaded file is missing or empty'
+            }
+            return
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts) {
+                Write-Host "  Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $BackoffSec
+            }
+            else {
+                throw $_
+            }
+        }
+    }
+}
+
+function Remove-SafeTempDirectory {
+    param(
+        [AllowNull()][string]$Path,
+        [string]$NamePrefix = 'psp-'
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) { return }
+    $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $rootFull = [System.IO.Path]::GetFullPath($resolved.ProviderPath)
+    $rootName = Split-Path -Path $rootFull -Leaf
+    if ($rootName -like "$NamePrefix*" -and $rootFull.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $rootFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Write-Host "  Skipped temp cleanup outside expected temp root: $rootFull" -ForegroundColor Yellow
+    }
+}
+
 function Initialize-RemoteInstallBundle {
     if ($LocalRepo -or $script:VerifiedInstallBundle) { return }
 
@@ -722,6 +775,19 @@ elseif (-not $isElevated -and $isCiHost) {
     Write-Host "Running setup.ps1 in CI/non-admin mode. Admin-only steps (LocalMachine execution policy, system-wide font install) will be skipped." -ForegroundColor Yellow
 }
 
+# For remote installs, verify/download the profile bundle before any local mutation
+# (execution policy prompts, wizard writes, tool installs, profile copy, WT changes).
+if (-not $LocalRepo) {
+    try {
+        Initialize-RemoteInstallBundle
+    }
+    catch {
+        Write-Host "Remote install bundle was not applied: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "No local setup changes were made before this verification step." -ForegroundColor Yellow
+        if ($PSCommandPath) { exit 1 } else { return }
+    }
+}
+
 # ExecutionPolicy is security-sensitive. setup.ps1 must never silently relax it.
 # We only surface guidance; users can opt in manually if their environment requires it.
 $currentUserPolicy = Get-ExecutionPolicy -Scope CurrentUser
@@ -778,6 +844,7 @@ function Install-NerdFonts {
         [string]$Version = "3.2.1"
     )
 
+    $tempRoot = $null
     try {
         [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
         $fontCollection = New-Object System.Drawing.Text.InstalledFontCollection
@@ -786,16 +853,12 @@ function Install-NerdFonts {
         if ($fontFamilies -notcontains "${FontDisplayName}") {
             Write-Host "  Installing ${FontDisplayName}..." -ForegroundColor Yellow
             $fontZipUrl = "https://github.com/ryanoasis/nerd-fonts/releases/download/v${Version}/${FontName}.zip"
-            $zipFilePath = "$env:TEMP\${FontName}.zip"
-            $extractPath = "$env:TEMP\${FontName}"
+            $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("psp-font-" + [System.IO.Path]::GetRandomFileName())
+            $zipFilePath = Join-Path $tempRoot "${FontName}.zip"
+            $extractPath = Join-Path $tempRoot "extract"
 
-            $webClient = New-Object System.Net.WebClient
-            try {
-                $webClient.DownloadFile((New-Object System.Uri($fontZipUrl)), $zipFilePath)
-            }
-            finally {
-                $webClient.Dispose()
-            }
+            New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+            Invoke-DownloadWithRetry -Uri $fontZipUrl -OutFile $zipFilePath -TimeoutSec 60 -MaxAttempts 2
             if (-not (Test-Path $zipFilePath) -or (Get-Item $zipFilePath).Length -eq 0) {
                 throw "Font download is missing or empty"
             }
@@ -824,8 +887,8 @@ function Install-NerdFonts {
                 }
             }
 
-            Remove-Item -Path $extractPath -Recurse -Force
-            Remove-Item -Path $zipFilePath -Force
+            Remove-SafeTempDirectory -Path $tempRoot -NamePrefix 'psp-font-'
+            $tempRoot = $null
             if ($copied -gt 0 -and $pending) {
                 # Partial install: some files never appeared under %SystemRoot%\Fonts within the
                 # timeout. Report failure so callers can surface it instead of claiming success.
@@ -841,41 +904,9 @@ function Install-NerdFonts {
         }
     }
     catch {
+        Remove-SafeTempDirectory -Path $tempRoot -NamePrefix 'psp-font-'
         Write-Host "  Failed to install ${FontDisplayName}: $_" -ForegroundColor Red
         return $false
-    }
-}
-
-# Download helper with retry, size validation, and corrupt-file cleanup
-function Invoke-DownloadWithRetry {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-        [Parameter(Mandatory)]
-        [string]$OutFile,
-        [int]$TimeoutSec = 10,
-        [int]$MaxAttempts = 2,
-        [int]$BackoffSec = 2
-    )
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
-            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
-            if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
-                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
-                throw 'Downloaded file is missing or empty'
-            }
-            return
-        }
-        catch {
-            if ($attempt -lt $MaxAttempts) {
-                Write-Host "  Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..." -ForegroundColor Yellow
-                Start-Sleep -Seconds $BackoffSec
-            }
-            else {
-                throw $_
-            }
-        }
     }
 }
 
@@ -935,6 +966,12 @@ function Get-ExternalCommandPath {
     return $null
 }
 
+function Update-SessionPathFromRegistry {
+    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $env:PATH = (@($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+}
+
 # Resolve oh-my-posh executable path (Get-ExternalCommandPath or known install locations)
 function Get-OhMyPoshExecutablePath {
     $candidatePaths = @(
@@ -960,7 +997,7 @@ function Get-OhMyPoshExecutablePath {
         $candidateDir = Split-Path -Path $candidatePath -Parent
         $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
         if ($pathEntries -notcontains $candidateDir) {
-            $env:PATH = $candidateDir + ';' + $env:PATH
+            $env:PATH = (@($candidateDir, $env:PATH) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
         }
 
         return $candidatePath
@@ -969,8 +1006,8 @@ function Get-OhMyPoshExecutablePath {
     return $null
 }
 
-# Check for internet connectivity before proceeding (skip when using a local repo)
-if (-not $LocalRepo -and -not (Test-InternetConnection)) {
+# Check for internet connectivity before proceeding (skip when using a local repo or a verified remote bundle)
+if (-not $LocalRepo -and -not $script:VerifiedInstallBundle -and -not (Test-InternetConnection)) {
     if ($PSCommandPath) { exit 1 } else { return }
 }
 
@@ -1355,9 +1392,7 @@ function Resolve-ConfiguredEditor {
                 # Filter null/empty before joining: a missing User PATH would otherwise produce
                 # a trailing ';' in $env:PATH, which Windows path parsing has historically
                 # interpreted as "include CWD" - a classic command-hijack surface during setup.
-                $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-                $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-                $env:PATH = (@($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+                Update-SessionPathFromRegistry
                 Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
             }
             else {

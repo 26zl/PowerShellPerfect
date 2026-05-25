@@ -7,21 +7,23 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
 > ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome.
-> A modern PowerShell profile for Windows. `irm | iex` drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
+> A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
 ```powershell
-irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
+$setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
+& ([scriptblock]::Create($setup)) -SkipHashCheck
 ```
 
-Run that in an **elevated** PowerShell window. The **install wizard runs by default** — pick theme / scheme / font / features interactively, or pass `-SkipWizard` for repo defaults. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
+Run that in an **elevated** PowerShell window. `-SkipHashCheck` is the explicit trust-on-download path; omit it to print the install-bundle SHA256 and stop before making changes, then re-run with `-ExpectedSha256 '<hash>'` after verifying what you want to pin. The **install wizard runs by default** — pick theme / scheme / font / features interactively, or pass `-SkipWizard` for repo defaults. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
 
 ## Install Wizard
 
 Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. **Runs automatically on every interactive install** — it's the default experience, not an opt-in. CI and AI-agent environments are auto-detected and skip it.
 
 ```powershell
-# Default flow — wizard runs as part of installation
-irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
+# Default trusted-download flow — wizard runs as part of installation
+$setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
+& ([scriptblock]::Create($setup)) -SkipHashCheck
 
 # Bypass the wizard and apply repo defaults (Tokyo Night + CascadiaCode):
 .\setup.ps1 -SkipWizard
@@ -58,7 +60,7 @@ Reconfigure-Profile
 | | |
 | --- | --- |
 | **130+ commands** | git, files, unix tools, network, security, developer, sysadmin, WSL, docker, ssh, clipboard |
-| **Install wizard (default)** | Runs automatically on `irm \| iex`. Picks OMP theme, WT color scheme (7 curated), Nerd Font (6 curated), tab-bar + window chrome, terminal appearance, PSReadLine colors, background, editor, telemetry opt-out, feature toggles. `-Resume` on interrupt. See [Install Wizard](#install-wizard) for details. |
+| **Install wizard (default)** | Runs automatically when setup is invoked. Picks OMP theme, WT color scheme (7 curated), Nerd Font (6 curated), tab-bar + window chrome, terminal appearance, PSReadLine colors, background, editor, telemetry opt-out, feature toggles. `-Resume` on interrupt. See [Install Wizard](#install-wizard) for details. |
 | **Transient prompt** | Scrollback shows collapsed `$`; new input gets the full OMP prompt (opt-in feature flag) |
 | **Self-updating** | `Update-Profile` syncs profile + theme + WT config with SHA-256 verification. Survives custom `profile_user.ps1` + `user-settings.json`. |
 | **Full uninstall** | `Uninstall-Profile` restores WT, removes caches, `-RemoveTools` drops winget packages, `-All` wipes everything |
@@ -86,7 +88,7 @@ cd PowerShellPerfect
 
 `setup.ps1` auto-detects the local clone when run from the repo directory, so the profile, `theme.json`, and `terminal-config.json` are copied from your working tree instead of downloaded from GitHub. It installs the profile to both PS5 and PS7 directories as part of step [1/10]; a separate `.\setprofile.ps1` run is only needed if you later want a quick profile-only refresh without re-running the full installer.
 
-When running locally you can override terminal defaults (not available via `irm | iex`):
+When running locally you can override terminal defaults:
 
 ```powershell
 .\setup.ps1 -SkipWizard -Opacity 85 -ColorScheme "One Half Dark" -FontSize 12
@@ -283,7 +285,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `uuid` | Generate random UUID (copies to clipboard) |
 | `epoch [value]` | Unix timestamp converter (no args = now) |
 | `urlencode` / `urldecode <text>` | URL encode / decode |
-| `vtscan <file>` | VirusTotal scan + open in browser |
+| `vtscan <file> [-Upload]` | VirusTotal hash lookup; `-Upload` submits unknown files |
 | `vt <subcommand>` | Full VirusTotal CLI (vt-cli) |
 | `nscan <target> [-Mode ...]` | Nmap wrapper with curated scan profiles (Quick/Full/Services/Stealth/Vuln/Ports) |
 | `sigcheck <path>` | Authenticode signature details (file or directory) |
