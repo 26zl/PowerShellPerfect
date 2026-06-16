@@ -34,6 +34,13 @@ if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_COD
     $env:AI_AGENT = '1'
 }
 
+# Raise the TLS floor to 1.2 on Windows PowerShell 5.1 before the first HTTPS request. On older .NET 4.x the
+# process default can still be SSL3/TLS1.0, which github.com / raw.githubusercontent.com reject (downloads just
+# fail) and which leaves a protocol-downgrade window. PowerShell 7 (Core) negotiates via the OS and needs none.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { $null = $_ }
+}
+
 $RepoBase = "https://raw.githubusercontent.com/26zl/PowerShellPerfect/main"
 $script:DownloadedProfilePath = $null
 $script:DownloadedThemeConfigPath = $null
@@ -473,6 +480,18 @@ function Start-InstallWizard {
                     foreach ($prop in $prev.Choices.PSObject.Properties) {
                         $choices[$prop.Name] = $prop.Value
                     }
+                    # ConvertFrom-Json turns the [ordered]@{} Terminal/Features back into PSCustomObjects, which
+                    # have no .Keys and don't support [$key] indexing. Save-WizardChoices (line ~364/379) and the
+                    # summary (line ~736/747) iterate .Keys, so without this rehydration every terminal-appearance
+                    # and feature-toggle choice would be silently dropped on resume. Rebuild them as ordered
+                    # hashtables so the rest of the wizard sees the shape it originally wrote.
+                    foreach ($field in 'Terminal', 'Features') {
+                        if ($choices[$field] -is [System.Management.Automation.PSCustomObject]) {
+                            $ht = [ordered]@{}
+                            foreach ($p in $choices[$field].PSObject.Properties) { $ht[$p.Name] = $p.Value }
+                            $choices[$field] = $ht
+                        }
+                    }
                     Write-Host ("Resuming from step after: {0}" -f ($choices.CompletedSteps -join ', ')) -ForegroundColor DarkGray
                 }
                 else { Remove-Item $StatePath -Force -ErrorAction SilentlyContinue }
@@ -910,24 +929,9 @@ function Install-NerdFonts {
     }
 }
 
-# Resolve the active Windows Terminal settings.json across install variants.
-# DUPLICATED from Microsoft.PowerShell_profile.ps1's Get-WindowsTerminalSettingsPath.
-# Keep these two copies in sync per CLAUDE.md "Structural Duplication" guidance.
-function Get-WindowsTerminalSettingsPath {
-    $candidates = @(
-        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
-        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'
-        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalCanary_8wekyb3d8bbwe\LocalState\settings.json'
-        Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'
-    )
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) { return $candidate }
-    }
-    return $null
-}
-
 # Return ALL existing WT settings.json across variants so step [10/10] writes to every
 # installed variant (Stable + Preview + Canary + unpackaged). DUPLICATED from profile.
+# (setup needs its own copy: it runs before the profile it installs exists - chicken-and-egg.)
 function Get-WindowsTerminalSettingsPaths {
     $candidates = @(
         Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
@@ -1224,11 +1228,13 @@ if (Test-Path $userSettingsPath) {
     }
 }
 
-# Check for winget availability
+# winget is optional. The profile + config steps below do not need it, and every tool
+# installer (Install-WingetPackage, the editor install) already skips gracefully when it is
+# absent. Warn and continue instead of aborting, so LTSC/offline/locked-down hosts still get
+# the profile (matches README: optional tools "degrade gracefully if a tool is absent").
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Host "winget (App Installer) is required but not found." -ForegroundColor Red
-    Write-Host "Install it from the Microsoft Store or https://aka.ms/getwinget" -ForegroundColor Yellow
-    if ($PSCommandPath) { exit 1 } else { return }
+    Write-Host "winget (App Installer) not found - skipping optional tool installs (eza, bat, fzf, zoxide, ripgrep, Oh My Posh)." -ForegroundColor Yellow
+    Write-Host "  Install it later from the Microsoft Store or https://aka.ms/getwinget to add those tools." -ForegroundColor DarkYellow
 }
 
 Write-Host ""
@@ -1814,14 +1820,19 @@ elseif ($canPromptTelemetry -and $isElevatedSetup -and -not [System.Environment]
     }
 }
 
-# Final summary
+# Final summary. Exit code is driven ONLY by the core deliverable (the profile). The optional tools
+# (Oh My Posh, Nerd Font, eza, zoxide, fzf, bat, ripgrep) degrade gracefully per README, so a skipped
+# or failed optional install -- or a missing winget -- is a warning, never a non-zero exit.
 Write-Host ""
-$allGood = $profileInstalled -and $themeInstalled -and $fontInstalled -and $ompInstalled -and $ezaInstalled -and $zoxideInstalled -and $fzfInstalled -and $batInstalled -and $rgInstalled
-if ($allGood) {
-    Write-Host "Setup complete!" -ForegroundColor Green
+$optionalOk = $themeInstalled -and $fontInstalled -and $ompInstalled -and $ezaInstalled -and $zoxideInstalled -and $fzfInstalled -and $batInstalled -and $rgInstalled
+if (-not $profileInstalled) {
+    Write-Host "Setup FAILED: the profile could not be installed. Check the messages above." -ForegroundColor Red
+}
+elseif (-not $optionalOk) {
+    Write-Host "Setup complete - profile installed. Some optional tools were skipped or failed (see above); the profile works without them." -ForegroundColor Yellow
 }
 else {
-    Write-Host "Setup completed with some issues. Check the messages above." -ForegroundColor Yellow
+    Write-Host "Setup complete!" -ForegroundColor Green
 }
 Write-Host ""
 # AI_AGENT or CI = skip "Press Enter to restart" (agent/AI/automation context)
@@ -1845,8 +1856,8 @@ if ($canPromptExit) {
         $shellExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
         Start-Process -FilePath $shellExe -ArgumentList "-NoExit" -WorkingDirectory $dir
     }
-    exit ([int](-not $allGood))
+    exit ([int](-not $profileInstalled))
 }
 if ($MyInvocation.PSCommandPath) {
-    exit ([int](-not $allGood))
+    exit ([int](-not $profileInstalled))
 }

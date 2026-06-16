@@ -777,8 +777,12 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             checksum $textFile $script:sha256 | Out-Null
         }
         Invoke-CommandProbe -Command 'genpass' -Code {
-            $p = genpass 16
-            if (-not $p -or $p.Length -ne 16) { throw 'genpass did not return 16-character password' }
+            # genpass is clipboard-only by contract (never returns/prints the plaintext), so assert the
+            # clipboard receives a 16-char password rather than a return value.
+            Set-Clipboard ''
+            genpass 16
+            $clip = ((Get-Clipboard) -join '').Trim()
+            if (-not $clip -or $clip.Length -ne 16) { throw "genpass did not copy a 16-character password to clipboard (got length $($clip.Length))" }
         } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'b64' -Code {
             $enc = (b64 'hello world' | Out-String).Trim()
@@ -795,7 +799,15 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Test-ProfileHistorySafeLine' -Code {
             if (Test-ProfileHistorySafeLine 'pwnd hunter2') { throw 'pwnd input allowed into history' }
             if (Test-ProfileHistorySafeLine 'jwtd eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig') { throw 'jwt decode allowed into history' }
-            if (-not (Test-ProfileHistorySafeLine 'git status --short')) { throw 'safe command blocked from history' }
+            foreach ($leaky in @('$p = pwnd hunter2', 'cls; pwnd hunter2', 'history | pwnd hunter2')) {
+                if (Test-ProfileHistorySafeLine $leaky) { throw "pwnd not scrubbed in chained form: $leaky" }
+            }
+            foreach ($secret in @('git remote add o https://ghp_abcdefghij1234567890ABCDEFGH@github.com', 'export K=AKIAIOSFODNN7EXAMPLE', 'mysql -uroot -pHunter2024')) {
+                if (Test-ProfileHistorySafeLine $secret) { throw "value-shaped secret allowed into history: $secret" }
+            }
+            foreach ($safe in @('git status --short', 'mkdir -p src/lib', 'docker run -p 8080:80 nginx')) {
+                if (-not (Test-ProfileHistorySafeLine $safe)) { throw "safe command blocked from history: $safe" }
+            }
         }
         Invoke-CommandProbe -Command 'uuid' -Code { uuid | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'epoch' -Code {
@@ -1126,6 +1138,11 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Pop-TabTitle'
         'Resolve-WslUncPath'
         'Initialize-RestartManagerType'
+        'ConvertTo-NativeArgumentLine'
+        'Get-Utf8FileText'
+        'Write-Utf8FileAtomic'
+        'Set-PspFeatureOverride'
+        'Get-LatestMainCommitSha'
     )
     $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
 

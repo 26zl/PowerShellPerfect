@@ -271,14 +271,25 @@ catch { Write-Result 'PSScriptAnalyzer' 'FAIL' $_.Exception.Message }
 # 3. Smoke test (pwsh, non-interactive)
 # -------------------------------------------------------
 Write-Host '[3/26] Smoke test (pwsh)' -ForegroundColor Cyan
-try {
-    $env:CI = 'true'
-    pwsh -NonInteractive -NoProfile -Command ". '$profilePath'"
-    if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
-    Write-Result 'Smoke test (pwsh)' 'PASS'
+if ($env:OS -ne 'Windows_NT') {
+    # The profile is Windows-targeted (LOCALAPPDATA, WindowsPrincipal, etc.); it cannot load cleanly
+    # off-Windows, so loading it here only produces platform errors. CI runs this on windows-latest.
+    Write-Result 'Smoke test (pwsh)' 'SKIP' 'non-Windows host (profile is Windows-targeted)'
 }
-catch { Write-Result 'Smoke test (pwsh)' 'FAIL' $_.Exception.Message }
-finally { $env:CI = $null }
+else {
+    try {
+        $env:CI = 'true'
+        # Exit code alone misses non-terminating errors; also scan the error stream (warnings suppressed
+        # since user-file/plugin load failures are non-fatal). Mirrors the CI smoke step.
+        $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '$profilePath'" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
+        $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+        if ($smokeErrors.Count -gt 0) { throw "$($smokeErrors.Count) error(s) during load: $($smokeErrors[0])" }
+        Write-Result 'Smoke test (pwsh)' 'PASS'
+    }
+    catch { Write-Result 'Smoke test (pwsh)' 'FAIL' $_.Exception.Message }
+    finally { $env:CI = $null }
+}
 
 # -------------------------------------------------------
 # 4. Smoke test (PS5, non-interactive)
@@ -290,8 +301,10 @@ if ($SkipPS5 -or -not (Get-Command powershell.exe -ErrorAction SilentlyContinue)
 else {
     try {
         $escaped = $profilePath -replace "'", "''"
-        powershell.exe -NoProfile -Command "`$env:CI = 'true'; . '$escaped'"
+        $ps5Smoke = powershell.exe -NoProfile -Command "`$env:CI = 'true'; `$WarningPreference = 'SilentlyContinue'; . '$escaped'" 2>&1
         if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
+        $ps5Errors = @($ps5Smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+        if ($ps5Errors.Count -gt 0) { throw "$($ps5Errors.Count) error(s) during load: $($ps5Errors[0])" }
         Write-Result 'Smoke test (PS5)' 'PASS'
     }
     catch { Write-Result 'Smoke test (PS5)' 'FAIL' $_.Exception.Message }
@@ -735,6 +748,11 @@ foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-conf
     [System.IO.File]::WriteAllText((Join-Path $cacheDir $f), "# $f placeholder", [System.Text.UTF8Encoding]::new($false))
 }
 
+# User plugins dir: must survive a plain uninstall (user-authored, auto-loaded scripts); only -RemoveUserData removes it.
+$pluginsDir = Join-Path $cacheDir 'plugins'
+New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $pluginsDir 'myplugin.ps1'), '# user plugin', [System.Text.UTF8Encoding]::new($false))
+
 # Profile files in both dirs
 foreach ($d in @($ps7Dir, $ps5Dir)) {
     [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
@@ -768,6 +786,9 @@ try {
     # Cache: user-settings.json should be PRESERVED (no -RemoveUserData)
     if (-not (Test-Path (Join-Path $cacheDir 'user-settings.json'))) { $errors += 'Cache: user-settings.json was deleted (should be preserved)' }
 
+    # Cache: plugins/ (user-authored scripts) should be PRESERVED (no -RemoveUserData)
+    if (-not (Test-Path (Join-Path $pluginsDir 'myplugin.ps1'))) { $errors += 'Cache: plugins/myplugin.ps1 was deleted (should be preserved without -RemoveUserData)' }
+
     # Profile files should be gone from both dirs
     foreach ($d in @($ps7Dir, $ps5Dir)) {
         $pf = Join-Path $d 'Microsoft.PowerShell_profile.ps1'
@@ -789,6 +810,9 @@ try {
 
     # user-settings.json should now be gone
     if (Test-Path (Join-Path $cacheDir 'user-settings.json')) { $errors += 'RemoveUserData: user-settings.json still exists' }
+
+    # plugins/ should now be gone with -RemoveUserData
+    if (Test-Path $pluginsDir) { $errors += 'RemoveUserData: plugins/ still exists' }
 
     # profile_user.ps1 should now be gone from both dirs
     foreach ($d in @($ps7Dir, $ps5Dir)) {
@@ -1379,7 +1403,18 @@ T 'jwtd'      { jwtd "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3O
 T 'Test-ProfileHistorySafeLine' {
     if (Test-ProfileHistorySafeLine 'pwnd hunter2') { throw 'pwnd input allowed into history' }
     if (Test-ProfileHistorySafeLine 'jwtd eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig') { throw 'jwt decode allowed into history' }
-    if (-not (Test-ProfileHistorySafeLine 'git status --short')) { throw 'safe command blocked from history' }
+    # pwnd/jwtd must be scrubbed wherever the command can start, not just at line start
+    foreach ($leaky in @('$p = pwnd hunter2', 'cls; pwnd hunter2', 'history | pwnd hunter2', '1..3 | % { pwnd s }')) {
+        if (Test-ProfileHistorySafeLine $leaky) { throw "pwnd not scrubbed in chained form: $leaky" }
+    }
+    # value-shaped secrets caught even with no keyword present
+    foreach ($secret in @('git remote add o https://ghp_abcdefghij1234567890ABCDEFGH@github.com', 'export K=AKIAIOSFODNN7EXAMPLE', 'mysql -uroot -pHunter2024', 'curl https://user:s3cr3t@example.com')) {
+        if (Test-ProfileHistorySafeLine $secret) { throw "value-shaped secret allowed into history: $secret" }
+    }
+    # benign lines must NOT be blocked (no false positives on common flags/URLs)
+    foreach ($safe in @('git status --short', 'mkdir -p src/lib', 'docker run -p 8080:80 nginx', 'git clone https://github.com/foo/bar')) {
+        if (-not (Test-ProfileHistorySafeLine $safe)) { throw "safe command blocked from history: $safe" }
+    }
 }
 T 'uuid'      { uuid }
 T 'epoch'     { epoch }
@@ -1657,6 +1692,37 @@ T 'Merge-JsonObject (setup copy)' {
     $b = [PSCustomObject]@{ a = 1; n = [PSCustomObject]@{ x = 10; y = 20 } }
     Merge-JsonObject $b ([PSCustomObject]@{ a = 99; n = [PSCustomObject]@{ y = 30; z = 40 } })
     if ($b.a -ne 99 -or $b.n.x -ne 10 -or $b.n.y -ne 30 -or $b.n.z -ne 40) { throw 'merge mismatch' }
+}
+
+# --- Wizard -Resume round-trip (H2 regression): restored choices must still persist ---
+# A wizard interrupted and resumed reloads $choices from JSON, which turns the [ordered] Terminal/Features
+# hashtables into PSCustomObjects (no .Keys). Start-InstallWizard now rehydrates them; without that fix
+# Save-WizardChoices' .Keys loops ran zero times and silently dropped every appearance/feature choice.
+T 'Save-WizardChoices persists resumed terminal/feature choices' {
+    $choices = @{
+        Terminal = [ordered]@{ opacity = 90; fontSize = 12; cursorShape = 'bar' }
+        Features = [ordered]@{ psfzf = $false; predictions = $true }
+    }
+    # Simulate the state-file round-trip, then the resume rehydration Start-InstallWizard now performs.
+    $restored = @{}
+    foreach ($p in (($choices | ConvertTo-Json -Depth 20 | ConvertFrom-Json).PSObject.Properties)) { $restored[$p.Name] = $p.Value }
+    foreach ($field in 'Terminal', 'Features') {
+        if ($restored[$field] -is [System.Management.Automation.PSCustomObject]) {
+            $ht = [ordered]@{}
+            foreach ($pp in $restored[$field].PSObject.Properties) { $ht[$pp.Name] = $pp.Value }
+            $restored[$field] = $ht
+        }
+    }
+    $tmp = Join-Path $env:TEMP "psp-wiz-$([System.IO.Path]::GetRandomFileName()).json"
+    try {
+        Save-WizardChoices -Choices $restored -UserSettingsPath $tmp
+        $w = Get-Content $tmp -Raw | ConvertFrom-Json
+        if ($w.defaults.opacity -ne 90) { throw "opacity dropped on resume (got '$($w.defaults.opacity)')" }
+        if ($w.defaults.cursorShape -ne 'bar') { throw 'cursorShape dropped on resume' }
+        if ($w.defaults.font.size -ne 12) { throw 'fontSize dropped on resume' }
+        if ($w.features.predictions -ne $true) { throw 'feature toggle dropped on resume' }
+    }
+    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
 
 # --- Install-WingetPackage (already-installed path) ---
@@ -1937,6 +2003,11 @@ try {
         'Pop-TabTitle'
         'Resolve-WslUncPath'
         'Initialize-RestartManagerType'
+        'ConvertTo-NativeArgumentLine'
+        'Get-Utf8FileText'
+        'Write-Utf8FileAtomic'
+        'Set-PspFeatureOverride'
+        'Get-LatestMainCommitSha'
     )
     $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
 

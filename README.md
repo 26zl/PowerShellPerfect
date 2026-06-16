@@ -3,18 +3,54 @@
 [![CI](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml)
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Status](https://img.shields.io/badge/status-active%20development-orange)](#)
+[![Status](https://img.shields.io/badge/status-active%20development-orange)](https://github.com/26zl/PowerShellPerfect/commits/main)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
 > ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome.
 > A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
+<!--
+  STAR-DRIVER TODO (highest-leverage improvement): add visuals here. A terminal-theming repo with no
+  screenshots loses skeptical visitors on first scroll. Drop images under docs/img/ and reference them:
+    ![Prompt](docs/img/prompt.png)                  <- hero shot of the themed prompt
+    ![Install wizard](docs/img/wizard.gif)          <- record with `vhs` or asciinema
+    ![Scheme gallery](docs/img/schemes.png)         <- grid of the 7 curated color schemes
+-->
+
 ```powershell
+# Review-first (recommended): prints the install-bundle SHA256 and STOPS before changing anything.
 $setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
+& ([scriptblock]::Create($setup))
+
+# Then apply, pinned to the hash the step above printed (reproducible, integrity-checked):
+& ([scriptblock]::Create($setup)) -ExpectedSha256 '<hash-printed-above>'
+```
+
+Run in an **elevated** PowerShell window. The default flow above verifies download integrity before touching your machine. Prefer one step and willing to trust-on-download? Append `-SkipHashCheck`:
+
+```powershell
 & ([scriptblock]::Create($setup)) -SkipHashCheck
 ```
 
-Run that in an **elevated** PowerShell window. `-SkipHashCheck` is the explicit trust-on-download path; omit it to print the install-bundle SHA256 and stop before making changes, then re-run with `-ExpectedSha256 '<hash>'` after verifying what you want to pin. The **install wizard runs by default** — pick theme / scheme / font / features interactively, or pass `-SkipWizard` for repo defaults. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
+> **What the hash proves:** the printed SHA256 is computed over the bytes you just downloaded, so `-ExpectedSha256` guarantees a *reproducible, untampered-in-transit* apply — not that the bytes match what the maintainer published. For true upstream-authenticity pinning, verify the commit SHA out-of-band (browser / signed tag) before trusting a hash. See [SECURITY.md](SECURITY.md).
+
+The **install wizard runs by default** — pick theme / scheme / font / features interactively, or pass `-SkipWizard` for repo defaults. The terminal restarts when setup finishes (new tab in Windows Terminal, or a new window otherwise). For the best experience use [PowerShell 7+](https://github.com/PowerShell/PowerShell).
+
+## Contents
+
+- [Requirements](#requirements) · [Install Wizard](#install-wizard) · [At a glance](#at-a-glance) · [Install (alternatives)](#install-alternatives)
+- [Updates](#updates) · [Uninstall](#uninstall) · [Customization](#customization) · [Keyboard Shortcuts](#keyboard-shortcuts)
+- [Commands](#commands) · [Compared to alternatives](#compared-to-alternatives) · [Troubleshooting](#troubleshooting) · [Tests](#tests) · [Roadmap](#roadmap)
+
+## Requirements
+
+| | |
+| --- | --- |
+| **OS** | Windows 10 / 11 (Windows Terminal recommended) |
+| **Shell** | Windows PowerShell 5.1 (works) or [PowerShell 7+](https://github.com/PowerShell/PowerShell) (recommended; every PS5/PS7 API fork is guarded) |
+| **Privileges** | Elevated session for install/uninstall (font + machine-scope steps). Day-to-day commands need no admin. |
+| **Network** | First install fetches the profile bundle + (optionally) Oh My Posh, a Nerd Font, and CLI tools via winget. TLS 1.2+ is enforced on PS5.1. |
+| **Optional tools** | `eza`, `bat`, `ripgrep`, `fzf`, `zoxide`, `oh-my-posh` — installed by setup; every command degrades gracefully if a tool is absent. |
 
 ## Install Wizard
 
@@ -122,7 +158,7 @@ Uninstall-Profile -All         # Remove everything including tools, fonts, and u
 Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
 ```
 
-Optional switches: `-RemoveTools` (winget-managed tools plus direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes.
+Optional switches: `-RemoveTools` (winget-managed tools plus direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (`profile_user.ps1`, `user-settings.json`, and your `plugins/`), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes. A plain `Uninstall-Profile` preserves `user-settings.json`, `profile_user.ps1`, and your `plugins/` — only `-RemoveUserData`/`-All` delete them.
 
 ## Customization
 
@@ -134,7 +170,7 @@ Four extension points survive updates. From simplest to most powerful:
   - `features` - toggle heavy/optional behavior: `psfzf`, `predictions`, `startupMessage`, `perDirProfiles` (all `true` by default), `transientPrompt` (collapses previous prompt on Enter; default `false`, customize via `$script:PSP.TransientPrompt = { ... }` in `profile_user.ps1`), `updateCheck` (notifies once a week when main has advanced past the applied commit; default `false` so `irm | iex` in scripts does not trigger a surprise network call)
   - `commandOverrides` - redefine any command without editing source: `{ "gs": "git status --short" }`. Opt-in: set `features.commandOverrides = true` in the same file. Default off because it compiles JSON strings into executable scriptblocks.
   - `trustedDirs` - directories whose `.psprc.ps1` auto-loads (managed by `Add-TrustedDirectory`)
-- **`profile_user.ps1`** (`Split-Path $PROFILE`) - PowerShell overrides dot-sourced last: aliases, functions, editor, colors, modules
+- **`profile_user.ps1`** (`Split-Path $PROFILE`) - PowerShell overrides (aliases, functions, editor, colors, modules), dot-sourced after `user-settings.json` (so PS-level definitions win over JSON `commandOverrides` and feature toggles) and before `plugins/`
 - **`plugins/*.ps1`** (`%LOCALAPPDATA%\PowerShellProfile\plugins\`) - drop-in plugins. Each file is auto-loaded; errors are isolated per plugin
 - **`.psprc.ps1`** (per directory) - project-specific profile. Auto-loads on `cd` into a directory registered with `Add-TrustedDirectory`. Use `function global:foo` / `Set-Alias -Scope Global` for lasting definitions; `$env:VAR` always persists
 
@@ -401,13 +437,38 @@ Everything in `tests/` is tracked and runs locally in seconds.
 
 CI (`.github/workflows/ci.yml`) runs three jobs on every push/PR: **lint** (rule set + secret scan + PS5 parse), **install-flow** (JSON config + `Merge-JsonObject` unit tests + curated-scheme/font validation), **functional** (the full end-to-end). Both `lint` and `install-flow` are required status checks.
 
+## Compared to alternatives
+
+PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, and a **wizard-driven installer** in one. The prompt engines below are great at theming but aren't command suites; ChrisTitusTech's profile is the closest peer.
+
+| | **PowerShellPerfect** | [ChrisTitusTech](https://github.com/ChrisTitusTech/powershell-profile) | [Oh My Posh](https://ohmyposh.dev) | [Starship](https://starship.rs) |
+| --- | :---: | :---: | :---: | :---: |
+| p10k-style install wizard | ✅ | — | — | — |
+| 130+ Unix-style commands | ✅ | partial | — | — |
+| Prompt theming | ✅ (via Oh My Posh) | ✅ (via Oh My Posh) | ✅ (engine) | ✅ (engine) |
+| Hash-verified self-update + full uninstall | ✅ | ✅ | n/a | n/a |
+| PS 5.1 + PS 7 (guarded forks) | ✅ | ✅ | ✅ | ✅ (cross-shell) |
+| Secret-scrubbed history | ✅ | — | — | — |
+| Customization surfaces | `user-settings.json` + `profile_user.ps1` + `plugins/` + `.psprc.ps1` | profile edits | themes | `starship.toml` |
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| Setup blocked by Windows Defender (Controlled Folder Access) | Allow PowerShell through (see the command in [Install](#install-alternatives)), or run the clone from a non-protected folder. |
+| `running scripts is disabled on this system` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` — or use the `-ExecutionPolicy Bypass` the one-liner already applies. |
+| Prompt shows boxes / missing glyphs | The terminal font isn't a Nerd Font. Set your Windows Terminal profile font to the one setup installed (e.g. *CaskaydiaCove Nerd Font*) and restart WT. |
+| `oh-my-posh` not found right after install | Reopen the terminal (PATH refresh) or run `Update-SessionPathFromRegistry`; confirm with `psp-doctor`. |
+| Turned a feature off in the wizard but it still loads | Update to the latest commit — feature toggles now apply before PSReadLine init. Check the `features` block in `user-settings.json`. |
+| Something feels off | Run `psp-doctor` (alias for `Test-ProfileHealth`): OK/WARN/FAIL per check across tools, caches, fonts, PATH, and modules. |
+
 ## Roadmap
 
 Further ideas:
 
 - Per-distro WSL auto-configuration (install common tools when a new distro is detected).
 - `profile_user.ps1` scaffolder (`New-ProfileOverride` generates a commented starter file).
-- `psp doctor` command - runs `Test-Profile` + environment checks + auto-fixes common issues.
+- Auto-fix mode for `psp-doctor` / `Test-ProfileHealth` — today it *diagnoses* (tools, caches, fonts, PATH, modules); add an opt-in `-Fix` that repairs the common issues it surfaces.
 - Live theme preview (render OMP themes inline during picker rather than just listing names).
 
 ## License

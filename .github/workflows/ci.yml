@@ -48,12 +48,23 @@ jobs:
         shell: pwsh
         run: |
           $env:CI = 'true'
-          pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Profile failed to load non-interactive (exit code: $LASTEXITCODE)"
+          # $LASTEXITCODE alone misses non-terminating errors (a profile can emit errors and still
+          # exit 0). Capture the child's streams and fail on any ErrorRecord. Warnings are suppressed
+          # in the child because user-file/plugin load failures are non-fatal by design.
+          $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'" 2>&1
+          $code = $LASTEXITCODE
+          $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+          if ($code -ne 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile failed to load non-interactive (exit code: $code)"
             exit 1
           }
-          Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
+          if ($smokeErrors.Count -gt 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile loaded but emitted $($smokeErrors.Count) error(s) during load (non-terminating errors are still failures)"
+            exit 1
+          }
+          Write-Host "Profile loaded successfully in non-interactive mode (no errors)." -ForegroundColor Green
 
       - name: PS5 parse-check (all .ps1 files)
         shell: powershell
