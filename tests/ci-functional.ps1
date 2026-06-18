@@ -673,7 +673,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 Invoke-PromptStage
                 Set-Location -LiteralPath $workspace
                 Invoke-PromptStage
-                $out = cdh | Out-String
+                $out = cdh 6>&1 | Out-String
                 if ($out -notmatch 'cdh-probe') { throw "cdh output missing seeded entry: $out" }
             }
             finally { Set-Location $before }
@@ -688,14 +688,17 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 Set-Location -LiteralPath $workspace
                 Invoke-PromptStage
                 cdb 1
-                if ((Get-Location).Path -ne $sub) { throw "cdb 1 did not navigate back; got $((Get-Location).Path)" }
+                # Normalize both sides: $env:TEMP is the 8.3 short form (RUNNER~1) but cdb
+                # navigates via $PWD.ProviderPath (long form), so a raw string compare fails.
+                $here = Convert-Path -LiteralPath (Get-Location).Path
+                if ($here -ne (Convert-Path -LiteralPath $sub)) { throw "cdb 1 did not navigate back; got $here" }
             }
             finally { Set-Location $before }
         }
         Invoke-CommandProbe -Command 'duration' -Code {
             # Ensure a command is present in Get-History before calling duration
             Get-Date | Out-Null
-            $out = duration | Out-String
+            $out = duration 6>&1 | Out-String
             if ([string]::IsNullOrWhiteSpace($out)) { throw 'duration produced no output' }
         }
         Invoke-CommandProbe -Command 'Test-ProfileHealth' -Code {
