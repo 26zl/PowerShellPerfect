@@ -43,6 +43,23 @@ All code must work under both PowerShell 5.1 and 7+. Key differences:
    Also set `UpgradeStrategy` (`winget` for normal tools, `preserve-direct` only when a direct/MSI install must not be pushed back through winget).
 2. Add a numbered install step in `setup.ps1` (it cannot read `ProfileTools`)
 
+### Adding a New User-Facing Command
+
+1. Write the function in `Microsoft.PowerShell_profile.ps1`. Prefer approved PowerShell verbs for `Verb-Noun` names; short non-verb names are acceptable for Unix-style utilities (`grep`, `journal`, `nscan`).
+2. Seed the command registry so it shows up in `Get-ProfileCommand` and `Start-ProfileTour`. Add an entry to the `$script:_seedCommands` array near the end of the profile:
+
+   ```powershell
+   @{ Name = 'mycmd'; Category = 'Developer'; Synopsis = 'One-line description' }
+   ```
+
+3. Add an `Invoke-CommandProbe` entry in `tests/ci-functional.ps1` - either executing real code or `-SkipReason '...'` for destructive/interactive/tool-dependent commands. CI enforces 100% coverage, so missing a probe fails the `functional` job.
+4. If the command has nested internal helpers (e.g. `Write-JournalLine` inside `journal`), add them to `$internalOnly` in the coverage audit so they are not flagged as missing public commands.
+5. Update the appropriate section in `Show-Help` and `README.md`.
+
+### Adding an Argument Completer
+
+For new commands with parameters that benefit from Tab-complete (ports, log names, modes with descriptions, etc.), add a `Register-ArgumentCompleter` block near the top of the Sysadmin section. Use `$null = $commandName, $parameterName, $commandAst, $fakeBoundParameters` to mark unused `param()` entries as intentional and satisfy `PSReviewUnusedParameter`.
+
 ## Running the Linter
 
 CI uses PSScriptAnalyzer and fails on both warnings and errors. Run it locally before pushing:
@@ -84,6 +101,6 @@ CI runs on push/PR to `main` with three jobs:
 
 - **lint**: PSScriptAnalyzer, smoke test, PS5 parse, hardcoded-path check, non-ASCII/BOM/secrets checks
 - **install-flow**: JSON config validation, schema checks, Merge-JsonObject tests, WT merge mock, required function checks (`Test-InternetConnection`, `Install-NerdFonts`, `Install-OhMyPoshTheme`, `Install-WingetPackage`, `Merge-JsonObject`, `Select-PreferredEditor`, `Invoke-DownloadWithRetry`)
-- **functional**: Runs `ci-functional.ps1` (elevated): full install flow, sandbox install/execute/uninstall, and 100% command-probe coverage
+- **functional**: Runs `tests/ci-functional.ps1` (elevated): full install flow, sandbox install/execute/uninstall, and 100% command-probe coverage
 
 All three jobs must pass. CI also fails on hardcoded user paths and embedded secrets.

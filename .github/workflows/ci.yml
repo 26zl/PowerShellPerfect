@@ -34,9 +34,10 @@ jobs:
             'PSUseBOMForUnicodeEncodedFile'       # Not needed
             'PSReviewUnusedParameter'             # Scriptblock params required by completer API
             'PSUseSingularNouns'                  # Style preference
-          ) | Where-Object { $_.ScriptName -ne 'ci-functional.ps1' }
-          # ci-functional.ps1 is excluded: it intentionally calls profile aliases (gc, ls, cat, uptime,
-          # eventlog) by their short names to exercise the profile's own function definitions.
+          ) | Where-Object { $_.ScriptName -notin @('ci-functional.ps1', 'test.ps1', 'rawhunt.ps1', 'locallab.ps1', 'lint.ps1') }
+          # tests/ is excluded: those files intentionally call profile aliases (gc, ls, cat, uptime,
+          # eventlog) by their short names to exercise the profile's own function definitions, and
+          # contain patterns that trip secrets/path scanners on their own test data.
           $results | Format-Table -AutoSize
           if ($results | Where-Object Severity -in 'Error','Warning') {
             Write-Error "PSScriptAnalyzer found warnings or errors"
@@ -47,12 +48,23 @@ jobs:
         shell: pwsh
         run: |
           $env:CI = 'true'
-          pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Profile failed to load non-interactive (exit code: $LASTEXITCODE)"
+          # $LASTEXITCODE alone misses non-terminating errors (a profile can emit errors and still
+          # exit 0). Capture the child's streams and fail on any ErrorRecord. Warnings are suppressed
+          # in the child because user-file/plugin load failures are non-fatal by design.
+          $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'" 2>&1
+          $code = $LASTEXITCODE
+          $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+          if ($code -ne 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile failed to load non-interactive (exit code: $code)"
             exit 1
           }
-          Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
+          if ($smokeErrors.Count -gt 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile loaded but emitted $($smokeErrors.Count) error(s) during load (non-terminating errors are still failures)"
+            exit 1
+          }
+          Write-Host "Profile loaded successfully in non-interactive mode (no errors)." -ForegroundColor Green
 
       - name: PS5 parse-check (all .ps1 files)
         shell: powershell
@@ -86,7 +98,9 @@ jobs:
             '/home/'
             '\\\\Users\\\\'
           )
-          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' }
+          # tests/test.ps1 replicates this same check locally, so it contains the regex patterns
+          # we are searching for; excluded by name to avoid self-matching.
+          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.Name -ne 'test.ps1' }
           $found = @()
           foreach ($file in $files) {
             $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
@@ -154,7 +168,8 @@ jobs:
       - name: Check for Set-Content -Encoding UTF8
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' }
+          # tests/test.ps1 replicates this scan and contains the regex itself; excluded by name.
+          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.Name -ne 'test.ps1' }
           $found = @()
           foreach ($file in $files) {
             $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
@@ -187,7 +202,8 @@ jobs:
             'sk-[A-Za-z0-9]{32,}'
             '(?i)connectionstring\s*[:=]\s*[''"]Server='
           )
-          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' }
+          # tests/test.ps1 contains secret-detection regex patterns locally; excluded by name.
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' -and $_.Name -ne 'test.ps1' }
           $found = @()
           foreach ($file in $files) {
             $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
@@ -254,6 +270,67 @@ jobs:
           }
           Write-Host "Config schema valid." -ForegroundColor Green
 
+      - name: Validate wizard curated data (CuratedSchemes + CuratedFonts)
+        shell: pwsh
+        run: |
+          # Extract $script:CuratedSchemes and $script:CuratedFonts from setup.ps1 via AST
+          # and assert each entry has all required fields. Avoids running setup.ps1 itself.
+          $setup = Join-Path $PWD 'setup.ps1'
+          $tokens = $null; $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile($setup, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) { Write-Error "setup.ps1 has parse errors"; exit 1 }
+
+          $assignments = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            ($n.Left.Extent.Text -in @('$script:CuratedSchemes', '$script:CuratedFonts'))
+          }, $true)
+
+          $found = @{}
+          foreach ($a in $assignments) {
+            $name = $a.Left.Extent.Text.TrimStart('$').Replace('script:','')
+            Invoke-Expression $a.Extent.Text
+            $found[$name] = Get-Variable -Name $name -Scope Local -ValueOnly
+          }
+
+          $errors = 0
+          # Schemes: expect 7 entries, each with Name, Desc, and a nested Scheme with name + background
+          $schemes = $found['CuratedSchemes']
+          if (-not $schemes) { Write-Host "FAIL: CuratedSchemes not found" -ForegroundColor Red; exit 1 }
+          if ($schemes.Count -ne 7) { Write-Host "FAIL: expected 7 curated schemes, got $($schemes.Count)" -ForegroundColor Red; $errors++ }
+          $schemeReq = @('Name','Desc','Scheme')
+          $schemeInnerReq = @('name','background','foreground','black','red','green','yellow','blue','purple','cyan','white')
+          foreach ($s in $schemes) {
+            foreach ($k in $schemeReq) {
+              if (-not $s.ContainsKey($k)) { Write-Host "FAIL: scheme '$($s.Name)' missing '$k'" -ForegroundColor Red; $errors++ }
+            }
+            if ($s.Scheme) {
+              foreach ($k in $schemeInnerReq) {
+                if (-not $s.Scheme.ContainsKey($k)) { Write-Host "FAIL: scheme '$($s.Name)' missing Scheme.$k" -ForegroundColor Red; $errors++ }
+              }
+              if ($s.Scheme.background -and $s.Scheme.background -notmatch '^#[0-9a-fA-F]{6}$') {
+                Write-Host "FAIL: scheme '$($s.Name)' background not a #RRGGBB hex: $($s.Scheme.background)" -ForegroundColor Red; $errors++
+              }
+            }
+          }
+          Write-Host "OK: $($schemes.Count) curated schemes validated" -ForegroundColor Green
+
+          # Fonts: expect 6 entries, each with Asset, DisplayName, Desc
+          $fonts = $found['CuratedFonts']
+          if (-not $fonts) { Write-Host "FAIL: CuratedFonts not found" -ForegroundColor Red; exit 1 }
+          if ($fonts.Count -ne 6) { Write-Host "FAIL: expected 6 curated fonts, got $($fonts.Count)" -ForegroundColor Red; $errors++ }
+          $fontReq = @('Asset','DisplayName','Desc')
+          foreach ($f in $fonts) {
+            foreach ($k in $fontReq) {
+              if (-not $f.ContainsKey($k) -or [string]::IsNullOrWhiteSpace([string]$f[$k])) {
+                Write-Host "FAIL: font '$($f.Asset)' missing '$k'" -ForegroundColor Red; $errors++
+              }
+            }
+          }
+          Write-Host "OK: $($fonts.Count) curated fonts validated" -ForegroundColor Green
+
+          if ($errors -gt 0) { exit 1 }
+
       - name: Dry-run setup.ps1 (parse + function definitions)
         shell: pwsh
         run: |
@@ -262,7 +339,7 @@ jobs:
           $content = Get-Content 'setup.ps1' -Raw
 
           # Verify required functions are defined in setup.ps1
-          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry')
+          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry', 'Remove-SafeTempDirectory', 'Update-SessionPathFromRegistry')
           $errors = 0
           foreach ($fn in $requiredFunctions) {
             if ($content -notmatch "function\s+$fn\b") {
@@ -279,7 +356,8 @@ jobs:
         run: |
           # Extract Merge-JsonObject from setup.ps1 and test it (with null guard like production)
           function Merge-JsonObject($base, $override) {
-            if (-not $base -or -not $override) { return }
+            if ($null -eq $override) { return }
+            if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
             foreach ($prop in $override.PSObject.Properties) {
               $baseVal = $base.PSObject.Properties[$prop.Name]
               if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -320,11 +398,13 @@ jobs:
           }
           Write-Host "OK: object replacement" -ForegroundColor Green
 
-          # Test 4: null base or override returns without throwing (matches production guard)
+          # Test 4: null override is a no-op; null base throws (caller-bug surfacing)
           $base = [PSCustomObject]@{ a = 1 }
-          Merge-JsonObject $null $base
           Merge-JsonObject $base $null
-          if ($base.a -ne 1) { Write-Error "Null guard should not modify base"; exit 1 }
+          if ($base.a -ne 1) { Write-Error "Null override should not modify base"; exit 1 }
+          $threw = $false
+          try { Merge-JsonObject $null ([PSCustomObject]@{ a = 1 }) } catch { $threw = $true }
+          if (-not $threw) { Write-Error "Null base should throw"; exit 1 }
           Write-Host "OK: null guard" -ForegroundColor Green
 
       - name: Test WT settings merge (mock)
@@ -379,8 +459,8 @@ jobs:
 
           if ($errors -gt 0) { exit 1 }
 
-          # Verify JSON roundtrip
-          $json = $mockWt | ConvertTo-Json -Depth 10
+          # Verify JSON roundtrip (depth matches production: profile/setup write WT settings with -Depth 100)
+          $json = $mockWt | ConvertTo-Json -Depth 100
           $null = $json | ConvertFrom-Json -ErrorAction Stop
           Write-Host "OK: WT settings merge + JSON roundtrip" -ForegroundColor Green
 
@@ -398,4 +478,4 @@ jobs:
       - name: Run functional profile tests
         shell: pwsh
         run: |
-          pwsh -NoProfile -File '${{ github.workspace }}/ci-functional.ps1'
+          pwsh -NoProfile -File '${{ github.workspace }}/tests/ci-functional.ps1'

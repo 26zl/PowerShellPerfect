@@ -1,0 +1,35 @@
+# Default: let Git normalize line endings based on file content detection.
+* text=auto
+
+# PowerShell scripts: CRLF on checkout matches Windows tooling and avoids PS5 parser
+# quirks that can surface when source files land in $env:USERPROFILE\Documents\.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+
+# JSON / Markdown / YAML / config: LF is standard and works everywhere.
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.gitignore   text eol=lf
+*.gitattributes text eol=lf
+
+# Binary assets: tell Git not to attempt diff or EOL conversion.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.7z    binary
+*.tar   binary
+*.gz    binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+
+# GitHub Linguist: test harnesses shouldn't inflate language stats or drown out
+# the profile in the language bar.
+tests/**  linguist-detectable=false

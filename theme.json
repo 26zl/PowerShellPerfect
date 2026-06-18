@@ -6,6 +6,13 @@
   "windowsTerminal": {
     "colorScheme": "Tokyo Night",
     "cursorColor": "#a9b1d6",
+    "theme": "PSP.Default",
+    "themeDefinition": {
+      "name": "PSP.Default",
+      "tab": { "background": "#1a1b26", "unfocusedBackground": "#1a1b26" },
+      "tabRow": { "background": "#1a1b26", "unfocusedBackground": "#1a1b26" },
+      "window": { "applicationTheme": "dark" }
+    },
     "scheme": {
       "name": "Tokyo Night",
       "background": "#1a1b26",
@@ -28,6 +35,20 @@
       "brightPurple": "#bb9af7",
       "brightCyan": "#0db9d7",
       "brightWhite": "#acb0d0"
+    }
+  },
+  "psreadline": {
+    "colors": {
+      "Command":   "#7aa2f7",
+      "Parameter": "#9ece6a",
+      "Operator":  "#89ddff",
+      "Variable":  "#e0af68",
+      "String":    "#b9f27c",
+      "Number":    "#ff9e64",
+      "Type":      "#0db9d7",
+      "Comment":   "#565f89",
+      "Keyword":   "#bb9af7",
+      "Error":     "#f7768e"
     }
   }
 }
