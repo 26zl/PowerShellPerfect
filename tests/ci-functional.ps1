@@ -684,14 +684,16 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 $sub = Join-Path $workspace 'cdb-probe'
                 New-Item -ItemType Directory -Path $sub -Force | Out-Null
                 Set-Location -LiteralPath $sub
+                # Capture the canonical path the same way cdb does. $env:TEMP is the 8.3 short
+                # form (RUNNER~1) but $PWD.ProviderPath resolves to the long form, and that exact
+                # string is what Invoke-PromptStage pushes onto the stack and cdb restores. Comparing
+                # ProviderPath-to-ProviderPath sidesteps short/long and casing mismatches entirely.
+                $subResolved = $PWD.ProviderPath
                 Invoke-PromptStage
                 Set-Location -LiteralPath $workspace
                 Invoke-PromptStage
                 cdb 1
-                # Normalize both sides: $env:TEMP is the 8.3 short form (RUNNER~1) but cdb
-                # navigates via $PWD.ProviderPath (long form), so a raw string compare fails.
-                $here = Convert-Path -LiteralPath (Get-Location).Path
-                if ($here -ne (Convert-Path -LiteralPath $sub)) { throw "cdb 1 did not navigate back; got $here" }
+                if ($PWD.ProviderPath -ne $subResolved) { throw "cdb 1 did not navigate back; got $($PWD.ProviderPath)" }
             }
             finally { Set-Location $before }
         }
