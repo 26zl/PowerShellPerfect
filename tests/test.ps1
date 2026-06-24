@@ -7,6 +7,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# $env:TEMP is unset on non-Windows; the sandbox harness builds paths under it. Default to the
+# platform temp dir so the suite runs cross-platform instead of aborting on a null Join-Path.
+if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
 # This script lives in tests/. repoRoot points at the parent directory (where the profile lives).
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $passed = 0
@@ -1262,7 +1265,7 @@ T 'cdh'     {
         New-Item -ItemType Directory -Path $sub -Force | Out-Null
         Set-Location $sub; Invoke-PromptStage
         Set-Location $ws; Invoke-PromptStage
-        $out = cdh | Out-String
+        $out = cdh 6>&1 | Out-String
         if ($out -notmatch 'cdh-t') { throw 'cdh missing seeded entry' }
     }
     finally { Set-Location $before }
@@ -1281,7 +1284,7 @@ T 'cdb'     {
 }
 T 'duration' {
     Get-Date | Out-Null
-    $out = duration | Out-String
+    $out = duration 6>&1 | Out-String
     if ([string]::IsNullOrWhiteSpace($out)) { throw 'duration produced no output' }
 }
 T 'Test-ProfileHealth' {

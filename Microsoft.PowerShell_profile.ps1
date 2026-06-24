@@ -27,8 +27,11 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 $repo_root = "https://raw.githubusercontent.com/26zl"
 $repo_name = "PowerShellPerfect"
 
-# Cache directory outside Documents (avoids Controlled Folder Access / ransomware protection blocks)
-$cacheDir = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
+# Cache directory outside Documents (avoids Controlled Folder Access / ransomware protection blocks).
+# LOCALAPPDATA is unset on non-Windows (PS7 cross-platform); fall back to the temp dir so the
+# Join-Path below doesn't throw on a null base and downstream cache paths stay valid.
+$localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [System.IO.Path]::GetTempPath() }
+$cacheDir = Join-Path $localAppData "PowerShellProfile"
 if (-not (Test-Path $cacheDir)) {
     # A failure here (locked/redirected LOCALAPPDATA, ACLs) must not abort the whole profile load and leave
     # the user without a shell - the cache is best-effort; downstream callers already Test-Path before use.
@@ -43,7 +46,14 @@ $jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 # Admin check (used by prompt suffix, firewall helpers, Get-SystemInfo, Invoke-ProfileWizard).
 # A profile must not silently mutate machine-scope env vars; telemetry opt-out is handled by
 # setup.ps1 with explicit user consent. Uninstall-Profile Phase 6 still cleans up legacy values.
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# WindowsPrincipal/WindowsIdentity throw on non-Windows (PS7). $IsWindows is absent on PS5 (always
+# Windows), so a missing variable means Windows; off-Windows we default to non-admin.
+$isWindowsOS = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows
+if ($isWindowsOS) {
+    try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+    catch { $isAdmin = $false }
+}
+else { $isAdmin = $false }
 
 # Core Windows processes whose termination logs the user out or bluescreens. The process-killing commands
 # (pkill, Stop-StuckProcess) skip these by name and skip PID <= 4, so a careless kill can never take the
@@ -1439,6 +1449,8 @@ function Update-Profile {
 
 # Check for new PowerShell (Core) releases and update via winget
 function Update-PowerShell {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
     if ($PSVersionTable.PSEdition -ne "Core") {
         Write-Host "Windows PowerShell 5.1 is updated via Windows Update, not winget." -ForegroundColor Yellow
         Write-Host "This command checks for PowerShell 7+ (Core) updates only." -ForegroundColor Yellow
@@ -1455,9 +1467,11 @@ function Update-PowerShell {
         $latestVersionStr = $latestReleaseInfo.tag_name.Trim('v') -replace '-.*$', ''
         $latestVersion = [version]$latestVersionStr
         if ($currentVersion -lt $latestVersion) {
-            Write-Host "Updating PowerShell ($currentVersion -> $latestVersion)..." -ForegroundColor Yellow
-            Start-Process pwsh.exe -ArgumentList "-NoProfile -Command winget upgrade Microsoft.PowerShell --accept-source-agreements --accept-package-agreements" -NoNewWindow
-            Write-Host "PowerShell update started. Please restart your shell when complete." -ForegroundColor Magenta
+            if ($PSCmdlet.ShouldProcess("PowerShell (Core) $currentVersion -> $latestVersion", 'winget upgrade')) {
+                Write-Host "Updating PowerShell ($currentVersion -> $latestVersion)..." -ForegroundColor Yellow
+                Start-Process pwsh.exe -ArgumentList "-NoProfile -Command winget upgrade Microsoft.PowerShell --accept-source-agreements --accept-package-agreements" -NoNewWindow
+                Write-Host "PowerShell update started. Please restart your shell when complete." -ForegroundColor Magenta
+            }
         }
         else {
             Write-Host "Your PowerShell is up to date." -ForegroundColor Green
@@ -1478,6 +1492,8 @@ function Update-PowerShell {
 }
 # Update installed profile tools via winget, while preserving direct/MSI Oh My Posh installs.
 function Update-Tools {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Warning "winget not found. Update-Tools only supports winget-managed upgrades."
         return
@@ -1513,6 +1529,7 @@ function Update-Tools {
             }
         }
 
+        if (-not $PSCmdlet.ShouldProcess($tool.Name, 'winget upgrade')) { continue }
         # Capture pre-upgrade version
         $oldVer = Get-ProfileToolVersionText -Tool $tool -ExecutablePath $toolPath
         Write-Host "Updating $($tool.Name)..." -ForegroundColor Cyan
@@ -2794,15 +2811,19 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
     # Shutdown all WSL distros, or terminate a specific one. Useful when a distro hangs or
     # Docker Desktop / VPN adapters misbehave and need a clean restart.
     function Stop-Wsl {
-        [CmdletBinding()]
+        [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
         param([string]$Distro)
         if ($Distro) {
-            & wsl.exe --terminate $Distro
-            Write-Host "Terminated: $Distro" -ForegroundColor Green
+            if ($PSCmdlet.ShouldProcess($Distro, 'wsl --terminate')) {
+                & wsl.exe --terminate $Distro
+                Write-Host "Terminated: $Distro" -ForegroundColor Green
+            }
         }
         else {
-            & wsl.exe --shutdown
-            Write-Host "All WSL distros stopped." -ForegroundColor Green
+            if ($PSCmdlet.ShouldProcess('all WSL distros', 'wsl --shutdown')) {
+                & wsl.exe --shutdown
+                Write-Host "All WSL distros stopped." -ForegroundColor Green
+            }
         }
     }
 
@@ -5928,13 +5949,19 @@ function Get-ProfileCommand {
     $cmds = @($script:PSP.Commands)
     if ($Category) { $cmds = $cmds | Where-Object { $_.Category -like "*$Category*" } }
     if ($Name) { $cmds = $cmds | Where-Object { $_.Name -like "*$Name*" } }
+    # Seeded commands are registered unconditionally, but WSL/SSH helpers only exist when their
+    # binary is present (their function block is gated behind Get-Command wsl.exe / ssh). Hide
+    # entries that aren't actually callable on this host so discovery never lists phantom commands.
+    $cmds = $cmds | Where-Object { Get-Command $_.Name -ErrorAction SilentlyContinue }
     $cmds | Sort-Object Category, Name
 }
 
 # First-run walkthrough. Shows each category plus a handful of commands and pauses between sections.
 function Start-ProfileTour {
     if (-not [Environment]::UserInteractive) { Write-Warning 'Tour requires an interactive session.'; return }
-    $categories = @($script:PSP.Commands | Group-Object Category | Sort-Object Name)
+    # Skip seeded commands that aren't defined on this host (WSL/SSH helpers without their binary).
+    $available = $script:PSP.Commands | Where-Object { Get-Command $_.Name -ErrorAction SilentlyContinue }
+    $categories = @($available | Group-Object Category | Sort-Object Name)
     if ($categories.Count -eq 0) { Write-Warning 'Command registry is empty. Is the profile loaded?'; return }
     $oldTitle = Push-TabTitle 'profile tour'
     try {
