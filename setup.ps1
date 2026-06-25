@@ -944,7 +944,7 @@ function Get-WindowsTerminalSettingsPaths {
 
 # Resolve the real path of an external command, following aliases recursively.
 # DUPLICATED from Microsoft.PowerShell_profile.ps1's Get-ExternalCommandPath.
-# Keep these two copies in sync per CLAUDE.md "Structural Duplication" guidance.
+# Keep these two copies in sync (see "Structural Duplication" notes).
 function Get-ExternalCommandPath {
     param(
         [Parameter(Mandatory)]

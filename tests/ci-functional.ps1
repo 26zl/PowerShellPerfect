@@ -863,7 +863,8 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $pretty = prettyjson $jsonFile | Out-String
             if ($pretty -notmatch '"name"\s*:\s*"ci"') { throw 'prettyjson output missing expected key/value' }
         }
-        Invoke-CommandProbe -Command 'hb' -Code { hb $textFile | Out-Null } -SkipReason $clipboardSkipReason
+        # LIVE NETWORK: actually POSTs $textFile to the public paste at bin.christitus.com. -Confirm:$false skips the prompt.
+        Invoke-CommandProbe -Command 'hb' -Code { hb $textFile -Confirm:$false | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'timer' -Code { timer { Start-Sleep -Milliseconds 5 } | Out-Null }
         Invoke-CommandProbe -Command 'watch' -SkipReason 'Infinite loop by design'
 

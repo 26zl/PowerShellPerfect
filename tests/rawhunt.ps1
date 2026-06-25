@@ -270,7 +270,7 @@ T 'whois' { whois "google.com" }
 T 'weather' { weather "Oslo" }
 T 'http GET' { $r = http "https://httpbin.org/get"; if (-not $r) { throw "no response" } }
 T 'http POST' { $r = http "https://httpbin.org/post" -Method POST -Body '{"test":true}'; if (-not $r) { throw "no response" } }
-T 'hb' { hb $tf }
+T 'hb' { hb $tf -Confirm:$false }  # LIVE NETWORK: real upload to bin.christitus.com (rawhunt exercises real I/O by design)
 
 # --- Crypto & Encoding ---
 Write-Host "`n--- Crypto & Encoding ---" -ForegroundColor Magenta

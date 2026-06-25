@@ -246,7 +246,7 @@ function Get-Utf8FileText {
 # leave a half-written / empty settings.json. Writing to temp first means the target is only ever replaced by
 # a fully-formed file. Throws on failure like the WriteAllText it replaces, so callers keep their existing
 # try/catch and rolling-backup behavior.
-# ponytail: Move-Item -Force is remove-then-rename, not a true atomic swap - a crash in that microsecond
+# Move-Item -Force is remove-then-rename, not a true atomic swap - a crash in that microsecond
 # window can leave only the temp file; the rolling .bak the callers already take covers that residual. Use
 # [IO.File]::Replace if a zero-window swap is ever needed and PS5.1/NTFS is guaranteed.
 function Write-Utf8FileAtomic {
@@ -1118,7 +1118,12 @@ function Update-Profile {
 
             $themeOverrideChanged = $userSettingsChanged -and $userThemeOverridePresent
             $shouldDownloadTheme = $Force -or (-not $currentThemeReady) -or $configChanged -or $themeOverrideChanged
-            if ($shouldDownloadTheme -and $themeUrl) {
+            $themeUrlTrusted = $false
+            if ($themeUrl) {
+                try { $themeUri = [Uri]$themeUrl; $themeUrlTrusted = $themeUri.Scheme -eq 'https' -and $themeUri.Host -in @('raw.githubusercontent.com', 'githubusercontent.com') } catch { $themeUrlTrusted = $false }
+                if (-not $themeUrlTrusted) { Write-Warning "Skipping OMP theme download from untrusted URL: $themeUrl" }
+            }
+            if ($shouldDownloadTheme -and $themeUrl -and $themeUrlTrusted) {
                 if ($PSCmdlet.ShouldProcess($localThemePath, "Download OMP theme '$themeName'")) {
                     $tempThemePath = Join-Path $cacheDir ("{0}.{1}.download" -f $themeName, [System.IO.Path]::GetRandomFileName())
                     try {
@@ -2019,24 +2024,19 @@ function extract {
     }
 }
 
-# Hastebin-like upload function (PS5-compatible, no dependencies)
+# Hastebin-like upload function (PS5-compatible, no dependencies).
+# Publishes the WHOLE file to a public paste, so it confirms first (-Confirm:$false / -Force to skip).
 function hb {
-    if ($args.Length -eq 0) {
-        Write-Error "No file path specified."
-        return
-    }
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param([Parameter(Position = 0)][string]$Path, [switch]$Force)
 
-    $FilePath = $args[0]
-
-    if (Test-Path -LiteralPath $FilePath) {
-        $Content = Get-Content -LiteralPath $FilePath -Raw
-    }
-    else {
-        Write-Error "File path does not exist."
-        return
-    }
+    if (-not $Path) { Write-Error "No file path specified."; return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Write-Error "File path does not exist."; return }
+    $Content = Get-Content -LiteralPath $Path -Raw
 
     $uri = "https://bin.christitus.com/documents"
+    $sizeKb = [math]::Round((Get-Item -LiteralPath $Path).Length / 1KB, 1)
+    if (-not $Force -and -not $PSCmdlet.ShouldProcess($uri, "Publish '$Path' (${sizeKb} KB) to a PUBLIC paste")) { return }
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Body $Content -ErrorAction Stop -TimeoutSec 10 -UseBasicParsing
         $hasteKey = $response.key
@@ -3629,7 +3629,9 @@ function weather {
 
 # Retrieve WiFi password for a given SSID or list all known WiFi profiles with their passwords. Uses netsh under the hood, so it only works on Windows and requires appropriate permissions to view passwords.
 function wifipass {
-    param([string]$SSID)
+    param([string]$SSID, [switch]$Reveal)
+    # masked by default so passwords don't land in scrollback/screen-shares; -Reveal to print.
+    $mask = { param($p) if (-not $p) { '(no password stored)' } elseif ($Reveal) { $p } else { '******** (use -Reveal to show)' } }
     try {
         if ($SSID) {
             $safeName = $SSID -replace '["\r\n`&|<>^;$(){}]', ''
@@ -3637,8 +3639,8 @@ function wifipass {
             if ($LASTEXITCODE -ne 0) { Write-Error "Profile '$safeName' not found."; return }
             $line = $output | Select-String 'Key Content'
             $parts = if ($line) { ($line -split ':', 2) } else { $null }
-            if ($parts -and $parts.Count -gt 1) { Write-Host "$safeName : $($parts[1].Trim())" -ForegroundColor Green }
-            else { Write-Host "$safeName : (no password stored)" -ForegroundColor Yellow }
+            $pass = if ($parts -and $parts.Count -gt 1) { $parts[1].Trim() } else { $null }
+            Write-Host "$safeName : $(& $mask $pass)" -ForegroundColor Green
         }
         else {
             $profiles = netsh wlan show profiles 2>&1 | Select-String 'All User Profile' | ForEach-Object {
@@ -3650,8 +3652,8 @@ function wifipass {
                 $detail = netsh wlan show profile name="$p" key=clear 2>&1
                 $key = $detail | Select-String 'Key Content'
                 $keyParts = if ($key) { ($key -split ':', 2) } else { $null }
-                $pass = if ($keyParts -and $keyParts.Count -gt 1) { $keyParts[1].Trim() } else { '(no password)' }
-                Write-Host "${p} : $pass"
+                $pass = if ($keyParts -and $keyParts.Count -gt 1) { $keyParts[1].Trim() } else { $null }
+                Write-Host "${p} : $(& $mask $pass)"
             }
         }
     }
@@ -4299,19 +4301,19 @@ function portscan {
     Write-Host ("Scan complete ({0}/{1} open)." -f $open, $Ports.Count) -ForegroundColor Cyan
 }
 
-# IP geolocation lookup (no args = your public IP)
+# IP geolocation lookup (no args = your public IP). Uses HTTPS (ipwho.is, free, no key).
 function ipinfo {
     param([string]$IpAddress)
-    $url = if ($IpAddress) { "http://ip-api.com/json/$IpAddress" } else { "http://ip-api.com/json/" }
+    $url = if ($IpAddress) { "https://ipwho.is/$IpAddress" } else { "https://ipwho.is/" }
     try {
         $info = Invoke-RestMethod -Uri $url -TimeoutSec 10 -UseBasicParsing
         if (-not $info) { Write-Error "IP lookup returned no data."; return }
-        if ($info.status -eq 'fail') { Write-Error "Lookup failed: $($info.message)"; return }
-        Write-Host "  IP:       $($info.query)" -ForegroundColor White
-        Write-Host "  Location: $($info.city), $($info.regionName), $($info.country)" -ForegroundColor White
-        Write-Host "  ISP:      $($info.isp)" -ForegroundColor White
-        Write-Host "  Org:      $($info.org)" -ForegroundColor DarkGray
-        Write-Host "  AS:       $($info.as)" -ForegroundColor DarkGray
+        if (-not $info.success) { Write-Error "Lookup failed: $($info.message)"; return }
+        Write-Host "  IP:       $($info.ip)" -ForegroundColor White
+        Write-Host "  Location: $($info.city), $($info.region), $($info.country)" -ForegroundColor White
+        Write-Host "  ISP:      $($info.connection.isp)" -ForegroundColor White
+        Write-Host "  Org:      $($info.connection.org)" -ForegroundColor DarkGray
+        Write-Host "  AS:       AS$($info.connection.asn)" -ForegroundColor DarkGray
     }
     catch {
         if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
@@ -6330,7 +6332,7 @@ ${g}eventlog${r} [n] - Last n event log entries (default 20).
 ${g}path${r} - Display PATH entries one per line.
 ${g}weather${r} [city] - Quick weather lookup.
 ${g}speedtest${r} - Download speed test.
-${g}wifipass${r} [ssid] - Show saved WiFi passwords.
+${g}wifipass${r} [ssid] [-Reveal] - List saved WiFi profiles (passwords masked unless -Reveal).
 ${g}hosts${r} - Open hosts file in elevated editor.
 ${g}winutil${r} [-ExpectedSha256 <hash>] [-Force] - Safe-by-default Chris Titus WinUtil fetch. Shows SHA256 + URL, then requires explicit confirmation before any execution.
 ${g}harden${r} - Open Harden Windows Security (prompts before launch).
@@ -6522,7 +6524,7 @@ $script:_seedCommands = @(
     @{ Name = 'winutil'; Category = 'System'; Synopsis = 'Fetch Chris Titus WinUtil (safe-by-default; -ExpectedSha256/-Force to run)' }
     @{ Name = 'harden'; Category = 'System'; Synopsis = 'Open Harden Windows Security (prompts before launch)' }
     @{ Name = 'hosts'; Category = 'System'; Synopsis = 'Open hosts file (elevated)' }
-    @{ Name = 'wifipass'; Category = 'System'; Synopsis = 'Show saved WiFi passwords' }
+    @{ Name = 'wifipass'; Category = 'System'; Synopsis = 'List saved WiFi profiles (passwords masked; -Reveal to show)' }
     @{ Name = 'journal'; Category = 'Sysadmin'; Synopsis = 'Tail Windows Event Log' }
     @{ Name = 'lsblk'; Category = 'Sysadmin'; Synopsis = 'List disks and partitions' }
     @{ Name = 'htop'; Category = 'Sysadmin'; Synopsis = 'Interactive process viewer' }

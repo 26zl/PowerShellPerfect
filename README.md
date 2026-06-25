@@ -9,13 +9,7 @@
 > ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome.
 > A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
-<!--
-  STAR-DRIVER TODO (highest-leverage improvement): add visuals here. A terminal-theming repo with no
-  screenshots loses skeptical visitors on first scroll. Drop images under docs/img/ and reference them:
-    ![Prompt](docs/img/prompt.png)                  <- hero shot of the themed prompt
-    ![Install wizard](docs/img/wizard.gif)          <- record with `vhs` or asciinema
-    ![Scheme gallery](docs/img/schemes.png)         <- grid of the 7 curated color schemes
--->
+<!-- TODO: add screenshots under docs/img/ (themed prompt, install wizard, scheme gallery). -->
 
 ```powershell
 # Review-first (recommended): prints the install-bundle SHA256 and STOPS before changing anything.
@@ -278,7 +272,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `checkport <host> <port>` | Test TCP connectivity |
 | `portscan <host> [-Ports]` | Quick TCP port scan (15 common ports) |
 | `tlscert <domain> [port]` | Check TLS certificate expiry and details |
-| `ipinfo [ip]` | IP geolocation lookup (no args = your IP) |
+| `ipinfo [ip]` | IP geolocation lookup over HTTPS (no args = your IP) |
 | `whois <domain>` | WHOIS domain lookup (registrar, dates, nameservers) |
 | `nslook <domain> [type]` | DNS lookup (A, MX, TXT, etc.) |
 | `env [pattern]` | Search/list environment variables |
@@ -287,7 +281,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `path` | Display PATH entries one per line |
 | `weather [city]` | Quick weather lookup |
 | `speedtest` | Download speed test |
-| `wifipass [ssid]` | Show saved WiFi passwords |
+| `wifipass [ssid] [-Reveal]` | List saved WiFi profiles (passwords masked unless `-Reveal`) |
 | `hosts` | Open hosts file in elevated editor |
 | `Clear-Cache` [-IncludeSystemCaches] | Clear user temp/browser caches (optionally system dirs) |
 | `Clear-ProfileCache` | Reset profile caches plus OMP internal caches |
@@ -339,7 +333,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `killports` (alias for `Stop-ListeningPort`) | Interactive fzf picker: lists all listening ports (port/PID/process), Tab for multi-select, Enter to kill |
 | `http <url> [-Method POST] [-Body '...']` | HTTP requests, auto-formats JSON |
 | `prettyjson <file>` | Pretty-print JSON (accepts pipeline input) |
-| `hb <file>` | Upload to hastebin, copy URL |
+| `hb <file>` | Upload to hastebin, copy URL (confirms first; `-Force`/`-Confirm:$false` to skip) |
 | `timer { command }` | Measure execution time |
 | `watch { command } [-Interval n]` | Repeat command every n seconds (default 2; like Linux watch) |
 | `bak <file>` | Quick timestamped backup |
@@ -435,7 +429,7 @@ Everything in `tests/` is tracked and runs locally in seconds.
 | `tests/locallab.ps1` | `pwsh -NoProfile -File tests/locallab.ps1 -Wizard` | Dev harness: runs all the above and optionally drives `setup.ps1 -LocalRepo -Wizard` end-to-end; `-Restore` rolls back to the last sandbox backup |
 | `tests/ci-functional.ps1` | GitHub Actions `functional` job | What CI runs: full install via `setup.ps1 -LocalRepo`, profile load under `$env:CI`, uninstall sandbox, and a coverage audit that refuses to pass unless every function/alias has an `Invoke-CommandProbe` entry |
 
-CI (`.github/workflows/ci.yml`) runs three jobs on every push/PR: **lint** (rule set + secret scan + PS5 parse), **install-flow** (JSON config + `Merge-JsonObject` unit tests + curated-scheme/font validation), **functional** (the full end-to-end). Both `lint` and `install-flow` are required status checks.
+CI (`.github/workflows/ci.yml`) runs three jobs on every push/PR: **lint** (rule set + secret scan + PS5 parse), **install-flow** (JSON config + `Merge-JsonObject` unit tests + curated-scheme/font validation), **functional** (the full end-to-end). `lint` and `install-flow` are configured as required status checks in the repo's branch ruleset (a GitHub setting, not enforced by the workflow file itself).
 
 ## Compared to alternatives
 

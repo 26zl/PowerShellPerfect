@@ -16,7 +16,7 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
         with:
-          egress-policy: audit
+          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -230,7 +230,7 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
         with:
-          egress-policy: audit
+          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -471,7 +471,7 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
         with:
-          egress-policy: audit
+          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

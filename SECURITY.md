@@ -42,3 +42,16 @@ The profile has four mechanisms that execute code from places other than the mai
 - **`.psprc.ps1` per-directory profiles** - auto-loaded on `cd` into a trusted directory only. Trust is explicit and per-directory via `Add-TrustedDirectory`; untrusted directories only print a warning. This is modeled after `direnv`.
 
 Because all four surfaces require local filesystem write access (or explicit `Add-TrustedDirectory` for `.psprc.ps1`), they are not exploitable by remote attackers without first achieving arbitrary file write. Treat user-settings.json and plugin files as carefully as any dotfile.
+
+## Network Calls & Data Flow
+
+Commands that send *your* data to a third party (all over HTTPS):
+
+| Command | Endpoint | Data sent |
+| ------- | -------- | --------- |
+| `ipinfo [ip]` | `ipwho.is` | The IP you pass, or none (your public IP is then revealed to the service) |
+| `weather [city]` | `wttr.in`, fallback `open-meteo.com` + `ipinfo.io` | City name; with no city, your public IP is used for geolocation |
+| `hb <file>` | `bin.christitus.com` | The **entire file contents**, posted to a public paste. Confirms first (`-Force`/`-Confirm:$false` to skip) |
+| `vtscan <file>` | VirusTotal API | File SHA-256 first; uploads the file only if VT hasn't seen the hash. Needs `VTCLI_APIKEY`/`VT_API_KEY` |
+
+Commands that only contact targets you explicitly name (`http`, `whois`, `nslook`, `checkport`, `portscan`, `tlscert`, `speedtest`, `ssh`) send no profile-owned data. `Update-Profile`/`setup.ps1` and tool installs download from `raw.githubusercontent.com`, GitHub releases, and winget; they upload nothing.
