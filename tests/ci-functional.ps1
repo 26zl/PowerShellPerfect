@@ -1022,7 +1022,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 if ($script:PSP.TrustedDirs -notcontains (Resolve-Path $trustDir).ProviderPath) {
                     throw 'Add-TrustedDirectory did not register dir'
                 }
-                # Regression: parse-failure must NOT overwrite existing user-settings.json.
+                # Parse failures must not overwrite existing user settings.
                 [System.IO.File]::WriteAllText($origSettingsPath, '{ this is not valid json', $utf8NoBom)
                 $preCorruptContent = Get-Content $origSettingsPath -Raw
                 $trustDir2 = Join-Path $workspace 'trust-target-2'
@@ -1031,7 +1031,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 Add-TrustedDirectory -Path $trustDir2 -Confirm:$false -ErrorAction SilentlyContinue
                 $postContent = Get-Content $origSettingsPath -Raw
                 if ($postContent -ne $preCorruptContent) { throw 'Add-TrustedDirectory overwrote corrupt user-settings.json instead of aborting' }
-                # Regression: failed Save must roll back in-memory Add so state matches disk.
+                # A failed save must restore the in-memory state.
                 $trustedAfter = @($script:PSP.TrustedDirs).Count
                 if ($trustedAfter -ne $trustedBefore) { throw "Add-TrustedDirectory did not roll back in-memory state (before=$trustedBefore after=$trustedAfter)" }
             }

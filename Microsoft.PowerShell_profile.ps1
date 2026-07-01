@@ -44,8 +44,7 @@ $_q = [char]34
 $jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 
 # Admin check (used by prompt suffix, firewall helpers, Get-SystemInfo, Invoke-ProfileWizard).
-# A profile must not silently mutate machine-scope env vars; telemetry opt-out is handled by
-# setup.ps1 with explicit user consent. Uninstall-Profile Phase 6 still cleans up legacy values.
+# Telemetry opt-out is handled by setup.ps1 with explicit user consent.
 # WindowsPrincipal/WindowsIdentity throw on non-Windows (PS7). $IsWindows is absent on PS5 (always
 # Windows), so a missing variable means Windows; off-Windows we default to non-admin.
 $isWindowsOS = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows
@@ -344,9 +343,8 @@ function Get-WindowsTerminalSettingsPath {
     return $null
 }
 
-# Resolve ALL existing Windows Terminal settings.json files across installed variants so writers
-# can update every one a user has. Returns an array (possibly empty). Fixes the "wrote to Stable
-# but Preview was the active terminal" class of bugs.
+# Resolve all existing Windows Terminal settings.json files across installed variants.
+# Returns an array, possibly empty.
 function Get-WindowsTerminalSettingsPaths {
     $candidates = @(
         Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
@@ -579,8 +577,7 @@ function Invoke-OhMyPoshCommand {
     }
 }
 
-# Gather context for oh-my-posh prompt rendering, including error code, execution time, stack count, terminal width, and non-filesystem working directory.
-# This is used to provide consistent context to oh-my-posh for prompt rendering without relying on opaque internal state or caches.
+# Gather context for oh-my-posh prompt rendering.
 function Get-OhMyPoshPromptContext {
     param(
         [bool]$OriginalSuccess,
@@ -668,8 +665,7 @@ function Get-OhMyPoshPromptContext {
     return [PSCustomObject]$context
 }
 
-# Get the prompt text from oh-my-posh by invoking the executable with explicit arguments and context.
-# This avoids relying on opaque internal state or caches for prompt rendering, and allows consistent prompts even in non-interactive contexts (like SSH or CI) where init scripts may not run.
+# Get prompt text from oh-my-posh with explicit arguments and context.
 function Get-OhMyPoshPromptText {
     param(
         [Parameter(Mandatory)]
@@ -716,8 +712,7 @@ function Get-OhMyPoshPromptText {
     return Invoke-OhMyPoshCommand -ExecutablePath $ExecutablePath -Arguments $arguments
 }
 
-# Clear oh-my-posh cache by either deleting legacy cache files or invoking the built-in cache clear command (if available).
-# Legacy cache files are detected by a special comment in the first line and are removed if found. The built-in command is used if the executable is available, and any errors during cache clearing are logged as warnings.
+# Clear current and legacy oh-my-posh caches.
 function Clear-OhMyPoshCaches {
     param(
         [switch]$Quiet
@@ -1428,10 +1423,7 @@ function Update-Profile {
             }
         }
 
-        # Restart the terminal whenever *anything* that the running session would load
-        # differently has changed - not just the profile.ps1 itself. Without this, changes
-        # to theme.json / terminal-config.json / user-settings.json land on disk but the
-        # current shell still shows old prompt/features until the user manually reloads.
+        # Restart when any profile or configuration content loaded by the session changed.
         $anyRuntimeChange = $profileActuallyUpdated -or $configChanged -or $terminalConfigChanged -or $userSettingsChanged
         if ($anyRuntimeChange) {
             $reason = if ($profileActuallyUpdated) { 'Profile updated' }
@@ -3235,8 +3227,7 @@ function Invoke-ProfileWizard {
 }
 Set-Alias -Name Reconfigure-Profile -Value Invoke-ProfileWizard -Scope Script
 
-# Uninstall profile components with granular options. By default, only non-user data caches and PSFzf module are removed to allow for quick resets without data loss.
-# Use -All to remove everything including user settings and fonts. Windows Terminal settings are handled in a way to allow easy restoration of previous state if not doing a hard reset.
+# Uninstall profile components with granular options.
 function Uninstall-Profile {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
@@ -3245,10 +3236,6 @@ function Uninstall-Profile {
         [switch]$RemoveFonts,
         [switch]$All,
         [switch]$HardResetWindowsTerminal,
-        # Override the CI/agent guard so PSFzf and managed tools are uninstalled even when
-        # $env:CI or $env:AI_AGENT is set (e.g. under Claude Code, which promotes CLAUDE_CODE
-        # to AI_AGENT). Without this, those two phases are skipped to protect the host during
-        # test runs that dot-source this profile.
         [switch]$Force
     )
 
@@ -3296,9 +3283,7 @@ function Uninstall-Profile {
     $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
     if (Test-Path $cacheDir) {
         $excludes = @()
-        # plugins/ holds user-authored, auto-loaded scripts (Clear-ProfileCache preserves them too), so keep it
-        # unless -RemoveUserData. ('profile_user.ps1' lives in Split-Path $PROFILE, never here - its old exclude
-        # entry was a no-op; the real preservation happens in Phase 7.)
+        # Preserve user settings and plugins unless explicitly requested.
         if (-not $RemoveUserData) { $excludes += 'user-settings.json'; $excludes += 'plugins' }
         $cacheItems = Get-ChildItem $cacheDir -ErrorAction SilentlyContinue |
         Where-Object { $excludes -notcontains $_.Name }
@@ -3322,13 +3307,7 @@ function Uninstall-Profile {
         }
     }
 
-    # Phase 2b: Orphaned temp artifacts. These live in %TEMP% (not under $cacheDir) and can outlive
-    # the run that created them. The main offender is psp-wizard-state.json: setup.ps1 deliberately
-    # keeps it after a cancelled wizard so -Resume can pick up, and only auto-expires it after 24h on
-    # a fresh (non-resume) run - so a user who cancels the wizard and never re-runs leaves it forever.
-    # An uninstall means there is nothing left to resume, so clear it along with any leftover
-    # reconfigure/update bundles. Scoped to explicit FILE patterns (never a blanket psp-* glob) so
-    # in-flight test sandbox directories (psp-install-*, psp-sandbox-*, psp-ci-*) are never touched.
+    # Phase 2b: Temporary profile artifacts
     $tempArtifactPatterns = @(
         'psp-wizard-state.json'
         'psp-profile-*.ps1'
@@ -3349,11 +3328,6 @@ function Uninstall-Profile {
     Clear-OhMyPoshCaches -Quiet
 
     # Phase 3: Uninstall PSFzf module
-    # Note: In CI or agent runs (env:CI or env:AI_AGENT), we skip uninstalling PSFzf to avoid
-    # mutating the host user's real module installation when ci-functional.ps1 is run locally.
-    # -Force overrides this for a genuine user uninstall in a CI/agent-flavoured shell (e.g. one
-    # where CLAUDE_CODE/AI_AGENT is set). The guard only protects the *implicit* removals below
-    # (PSFzf and, in Phase 4, managed tools); explicit choices still honour -Force.
     $isCiOrAgent = (($env:CI -or $env:AI_AGENT) -and -not $Force)
     if (Get-Module -ListAvailable -Name PSFzf) {
         if ($isCiOrAgent) {
@@ -5574,9 +5548,7 @@ $PSReadLineOptions = @{
     BellStyle                     = 'None'
 }
 if ($_readlineColors) { $PSReadLineOptions.Colors = $_readlineColors }
-# A malformed color value in user-settings.json (e.g. a bad ANSI/hex string) makes Set-PSReadLineOption throw;
-# without this guard that would abort profile load and break the prompt. Retry once without the user colors so
-# the shell still comes up with working editing keys.
+# Retry without custom colors if PSReadLine rejects them.
 try { Set-PSReadLineOption @PSReadLineOptions }
 catch {
     Write-Warning "PSReadLine options rejected ($($_.Exception.Message)); applying without custom colors."
@@ -5803,7 +5775,7 @@ if ($isInteractive) {
 
         $localThemePath = if ($themeName) { Join-Path $cacheDir "$themeName.omp.json" } else { $null }
         if ($localThemePath -and -not (Test-Path $localThemePath)) {
-            # Only recover from local legacy paths at startup. We intentionally avoid network/theme downloads here.
+            # Startup recovery is limited to local theme files.
             $oldThemePath = Join-Path (Split-Path $PROFILE) "$themeName.omp.json"
             if (Test-Path $oldThemePath) {
                 try { Move-Item $oldThemePath $localThemePath -Force -ErrorAction Stop }
@@ -5827,8 +5799,7 @@ if ($isInteractive) {
             try {
                 $null = Get-Content $localThemePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 
-                # Explicit render mode avoids oh-my-posh's internal config/session cache silently
-                # dropping back to the built-in default theme on some WindowsApps/MSIX installs.
+                # Render with the validated local theme.
                 $script:OhMyPoshExecutablePath = $ompExecutablePath
                 $script:OhMyPoshConfigPath = $localThemePath
                 $script:OhMyPoshLastHistoryId = $null
@@ -6053,9 +6024,7 @@ function Add-TrustedDirectory {
     }
     if (-not $PSCmdlet.ShouldProcess($resolved, 'Trust for .psprc.ps1 auto-load')) { return }
     $script:PSP.TrustedDirs.Add($resolved)
-    # Belt-and-suspenders: even though Save-TrustedDirectories is supposed to return $false on
-    # failure, wrap in try/catch so any unexpected throw still triggers rollback and we never
-    # report "Trusted:" when disk state doesn't match memory.
+    # Roll back if persistence fails.
     $saved = $false
     try { $saved = Save-TrustedDirectories }
     catch {

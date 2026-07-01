@@ -17,10 +17,7 @@ $failed = 0
 $skipped = 0
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-# Always-on sandbox cleanup. Child pwsh processes usually clean their own $sb in a finally
-# block, but a Ctrl+C at this orchestrator kills the child before that runs, leaving psp-*
-# dirs behind. The trap fires on terminating errors (including StopUpstreamCommandsException
-# from Ctrl+C) and Register-EngineEvent fires on normal script exit.
+# Clean test sandboxes on terminating errors and normal script exit.
 $script:TestArtifactPatterns = @(
     'psp-install-*', 'psp-sandbox-*', 'psp-sandbox-all-*', 'psp-lifecycle-*',
     'psp-setprofile-*', 'psp-exec-*', 'psp-dltest-*', 'psp-omp-*', 'fresh-install-*'
@@ -694,9 +691,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
     $whatifLines = @($output | Where-Object { $_ -match 'What if' })
     if ($whatifLines.Count -eq 0) { throw 'No WhatIf output produced' }
-    # Core phases that always produce output when sandboxed with real profile + cache files.
-    # 'Restore WT' is NOT required because it only fires when Windows Terminal is installed;
-    # after Get-WindowsTerminalSettingsPath became variant-aware, WT-less hosts skip that phase.
+    # Core phases that always produce output with the sandboxed profile and cache files.
+    # Windows Terminal restoration is optional when no settings file is installed.
     $requiredPhases = @('Remove cache', 'Remove profile file')
     $missingPhases = @()
     foreach ($ph in $requiredPhases) {
@@ -1697,16 +1693,13 @@ T 'Merge-JsonObject (setup copy)' {
     if ($b.a -ne 99 -or $b.n.x -ne 10 -or $b.n.y -ne 30 -or $b.n.z -ne 40) { throw 'merge mismatch' }
 }
 
-# --- Wizard -Resume round-trip (H2 regression): restored choices must still persist ---
-# A wizard interrupted and resumed reloads $choices from JSON, which turns the [ordered] Terminal/Features
-# hashtables into PSCustomObjects (no .Keys). Start-InstallWizard now rehydrates them; without that fix
-# Save-WizardChoices' .Keys loops ran zero times and silently dropped every appearance/feature choice.
+# --- Wizard -Resume round-trip ---
 T 'Save-WizardChoices persists resumed terminal/feature choices' {
     $choices = @{
         Terminal = [ordered]@{ opacity = 90; fontSize = 12; cursorShape = 'bar' }
         Features = [ordered]@{ psfzf = $false; predictions = $true }
     }
-    # Simulate the state-file round-trip, then the resume rehydration Start-InstallWizard now performs.
+    # Simulate state serialization and restoration.
     $restored = @{}
     foreach ($p in (($choices | ConvertTo-Json -Depth 20 | ConvertFrom-Json).PSObject.Properties)) { $restored[$p.Name] = $p.Value }
     foreach ($field in 'Terminal', 'Features') {
@@ -2052,9 +2045,7 @@ try {
     # Skip-only: commands that appear ONLY as skipped (not in existence check or actual execution)
     $skipOnly = $execSkipped | Where-Object { $testedNames -notcontains $_ }
 
-    # Allowed skip-only: commands that genuinely cannot be tested safely.
-    # Update-Profile/Update-PowerShell/Update-Tools/Invoke-ProfileWizard/Reconfigure-Profile
-    # are now probed via signature checks and safe early-exit paths.
+    # Allowed skip-only: commands that cannot be tested safely.
     $allowedSkipOnly = @(
         'reload'             # reloads profile mid-test
         'Edit-Profile'       # opens editor UI

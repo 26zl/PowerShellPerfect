@@ -434,7 +434,7 @@ function Start-InstallWizard {
         AppTheme        = $null   # 'dark' | 'light' - WT window.applicationTheme
         Terminal        = $null   # ordered hashtable: opacity, fontSize, useAcrylic, cursorShape, padding, scrollbarState, historySize
         PSReadLine      = $null   # 'default' | 'scheme' - scheme derives from chosen color scheme
-        Editor          = $null   # cmd name (code, nvim, notepad, ...) - moved in from setup.ps1 [2/10]
+        Editor          = $null   # cmd name (code, nvim, notepad, ...)
         TelemetryOptOut = $null   # $true = set POWERSHELL_TELEMETRY_OPTOUT machine-wide
         CompletedSteps  = @()
     }
@@ -455,9 +455,7 @@ function Start-InstallWizard {
                 Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
             }
             else {
-                # Concurrency check: if the state file was written by a different, still-live
-                # setup.ps1 process, two wizards are racing for the same state file. Warn the
-                # user before we let this invocation stomp on the other one's progress.
+                # Detect concurrent use of the wizard state file.
                 $otherPid = if ($prev.PSObject.Properties['ownerPid']) { [int]$prev.ownerPid } else { 0 }
                 $otherAlive = $false
                 if ($otherPid -gt 0 -and $otherPid -ne $PID) {
@@ -480,11 +478,7 @@ function Start-InstallWizard {
                     foreach ($prop in $prev.Choices.PSObject.Properties) {
                         $choices[$prop.Name] = $prop.Value
                     }
-                    # ConvertFrom-Json turns the [ordered]@{} Terminal/Features back into PSCustomObjects, which
-                    # have no .Keys and don't support [$key] indexing. Save-WizardChoices (line ~364/379) and the
-                    # summary (line ~736/747) iterate .Keys, so without this rehydration every terminal-appearance
-                    # and feature-toggle choice would be silently dropped on resume. Rebuild them as ordered
-                    # hashtables so the rest of the wizard sees the shape it originally wrote.
+                    # Restore ordered hashtables after the JSON round-trip.
                     foreach ($field in 'Terminal', 'Features') {
                         if ($choices[$field] -is [System.Management.Automation.PSCustomObject]) {
                             $ht = [ordered]@{}
@@ -699,9 +693,7 @@ function Start-InstallWizard {
         Save-State
     }
 
-    # STEP 8: Editor preference (was setup.ps1 [2/10] - moved into the wizard so all
-    # interactive choices are in one place). The outer [2/10] step reads $choices.Editor
-    # and only prompts on its own when the wizard was skipped.
+    # STEP 8: Editor preference
     if ('Editor' -notin $choices.CompletedSteps) {
         Write-Host ''
         Write-Host '-- Preferred editor --' -ForegroundColor Cyan
@@ -710,8 +702,8 @@ function Start-InstallWizard {
         Save-State
     }
 
-    # STEP 9: Telemetry opt-out (was end-of-setup prompt - moved into the wizard).
-    # Only ask if the env var is not already set so repeat runs do not nag.
+    # STEP 9: Telemetry opt-out
+    # Skip when telemetry opt-out is already configured.
     if ('Telemetry' -notin $choices.CompletedSteps) {
         Write-Host ''
         Write-Host '-- PowerShell telemetry --' -ForegroundColor Cyan
@@ -929,9 +921,8 @@ function Install-NerdFonts {
     }
 }
 
-# Return ALL existing WT settings.json across variants so step [10/10] writes to every
-# installed variant (Stable + Preview + Canary + unpackaged). DUPLICATED from profile.
-# (setup needs its own copy: it runs before the profile it installs exists - chicken-and-egg.)
+# Return all existing Windows Terminal settings files across install variants.
+# Duplicated in the profile; keep both implementations in sync.
 function Get-WindowsTerminalSettingsPaths {
     $candidates = @(
         Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
@@ -1261,9 +1252,7 @@ foreach ($dir in $profileDirs) {
         $tempDownload = Join-Path $env:TEMP ("psp-profile_download_" + (Split-Path $dir -Leaf) + "_" + [System.IO.Path]::GetRandomFileName() + ".ps1")
         Copy-Item (Resolve-SetupSourcePath -Kind 'profile') $tempDownload -Force -ErrorAction Stop
         if (Test-Path -Path $targetProfile -PathType Leaf) {
-            # Timestamped + rolling so a second install never destroys the first backup.
-            # Matches the WT settings backup pattern (keep last 5). Older "oldprofile.ps1"
-            # (pre-timestamp format) is also swept by the rolling cleanup below.
+            # Keep the latest five timestamped profile backups.
             $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
             $backupPath = Join-Path $dir ("oldprofile.$backupStamp.ps1")
             Copy-Item -Path $targetProfile -Destination $backupPath -Force
@@ -1530,7 +1519,7 @@ else {
     Write-Host "  Skipped theme download ($reason)." -ForegroundColor Yellow
     $themeInstalled = $false
 }
-# Invalidate zoxide cache and any leftover legacy OMP init cache from older profile versions.
+# Invalidate generated init caches.
 foreach ($cacheFile in @('zoxide-init.ps1', 'omp-init.ps1')) {
     Remove-Item (Join-Path $configCachePath $cacheFile) -Force -ErrorAction SilentlyContinue
 }
@@ -1787,10 +1776,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
     }
 }
 
-# Optional: PowerShell telemetry opt-out (explicit consent, machine-wide env var, requires admin).
-# Previously this was written silently on every admin shell from the profile; moved here so users
-# see the prompt and understand the scope. Skipped in non-interactive / CI / agent contexts and
-# when not elevated (env var lives in HKLM).
+# Optional PowerShell telemetry opt-out (explicit consent, machine-wide env var, requires admin).
 $canPromptTelemetry = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptTelemetry) { try { $null = [Console]::KeyAvailable } catch { $canPromptTelemetry = $false } }
 $isElevatedSetup = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
