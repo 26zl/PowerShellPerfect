@@ -150,6 +150,7 @@ Uninstall-Profile              # Core cleanup: profile files, caches, WT restore
 Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (including direct/MSI Oh My Posh when detected)
 Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
 Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
+Uninstall-Profile -All -Force  # Also uninstall PSFzf/managed tools when $env:CI or $env:AI_AGENT is set (e.g. under Claude Code)
 ```
 
 Optional switches: `-RemoveTools` (winget-managed tools plus direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (`profile_user.ps1`, `user-settings.json`, and your `plugins/`), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes. A plain `Uninstall-Profile` preserves `user-settings.json`, `profile_user.ps1`, and your `plugins/` — only `-RemoveUserData`/`-All` delete them.

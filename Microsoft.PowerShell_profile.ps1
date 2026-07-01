@@ -3244,7 +3244,12 @@ function Uninstall-Profile {
         [switch]$RemoveUserData,
         [switch]$RemoveFonts,
         [switch]$All,
-        [switch]$HardResetWindowsTerminal
+        [switch]$HardResetWindowsTerminal,
+        # Override the CI/agent guard so PSFzf and managed tools are uninstalled even when
+        # $env:CI or $env:AI_AGENT is set (e.g. under Claude Code, which promotes CLAUDE_CODE
+        # to AI_AGENT). Without this, those two phases are skipped to protect the host during
+        # test runs that dot-source this profile.
+        [switch]$Force
     )
 
     if ($All) { $RemoveTools = $true; $RemoveUserData = $true; $RemoveFonts = $true }
@@ -3316,15 +3321,43 @@ function Uninstall-Profile {
             }
         }
     }
+
+    # Phase 2b: Orphaned temp artifacts. These live in %TEMP% (not under $cacheDir) and can outlive
+    # the run that created them. The main offender is psp-wizard-state.json: setup.ps1 deliberately
+    # keeps it after a cancelled wizard so -Resume can pick up, and only auto-expires it after 24h on
+    # a fresh (non-resume) run - so a user who cancels the wizard and never re-runs leaves it forever.
+    # An uninstall means there is nothing left to resume, so clear it along with any leftover
+    # reconfigure/update bundles. Scoped to explicit FILE patterns (never a blanket psp-* glob) so
+    # in-flight test sandbox directories (psp-install-*, psp-sandbox-*, psp-ci-*) are never touched.
+    $tempArtifactPatterns = @(
+        'psp-wizard-state.json'
+        'psp-profile-*.ps1'
+        'psp-theme-*.json'
+        'psp-terminal-*.json'
+        'psp-reconfigure-*.ps1'
+    )
+    foreach ($pattern in $tempArtifactPatterns) {
+        $orphans = Get-ChildItem -Path $env:TEMP -Filter $pattern -File -ErrorAction SilentlyContinue
+        foreach ($orphan in $orphans) {
+            if ($PSCmdlet.ShouldProcess($orphan.FullName, 'Remove leftover temp file')) {
+                Remove-Item $orphan.FullName -Force -ErrorAction SilentlyContinue
+                Write-Host "  Removed $($orphan.Name)" -ForegroundColor DarkGray
+            }
+        }
+    }
+
     Clear-OhMyPoshCaches -Quiet
 
     # Phase 3: Uninstall PSFzf module
     # Note: In CI or agent runs (env:CI or env:AI_AGENT), we skip uninstalling PSFzf to avoid
     # mutating the host user's real module installation when ci-functional.ps1 is run locally.
-    $isCiOrAgent = ($env:CI -or $env:AI_AGENT)
+    # -Force overrides this for a genuine user uninstall in a CI/agent-flavoured shell (e.g. one
+    # where CLAUDE_CODE/AI_AGENT is set). The guard only protects the *implicit* removals below
+    # (PSFzf and, in Phase 4, managed tools); explicit choices still honour -Force.
+    $isCiOrAgent = (($env:CI -or $env:AI_AGENT) -and -not $Force)
     if (Get-Module -ListAvailable -Name PSFzf) {
         if ($isCiOrAgent) {
-            Write-Host '  Skipping PSFzf module uninstall under CI/agent environment.' -ForegroundColor DarkGray
+            Write-Warning '  Skipping PSFzf module uninstall under CI/agent environment ($env:CI/$env:AI_AGENT set). Re-run with -Force to uninstall it anyway.'
         }
         elseif ($PSCmdlet.ShouldProcess('PSFzf', 'Uninstall module')) {
             $uninstalled = $false
@@ -3379,7 +3412,7 @@ function Uninstall-Profile {
     # Phase 4: Managed tools (winget by default, direct/MSI aware for Oh My Posh)
     if ($RemoveTools) {
         if ($isCiOrAgent) {
-            Write-Host '  Skipping managed tool uninstall under CI/agent environment.' -ForegroundColor DarkGray
+            Write-Warning '  Skipping managed tool uninstall under CI/agent environment ($env:CI/$env:AI_AGENT set). Re-run with -Force to uninstall them anyway.'
         }
         else {
             $wingetPath = Get-ExternalCommandPath -CommandName 'winget'
@@ -6285,7 +6318,7 @@ ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system temp caches.
 ${g}duration${r} - Elapsed time of the last command.
 ${g}Test-ProfileHealth${r} / ${g}psp-doctor${r} - Diagnose install: tools, caches, fonts, PATH.
-${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults.
+${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults, -Force to uninstall PSFzf/tools even under CI/agent env vars.
 
 ${c}Git${r}
 ${g}gs${r} - git status.  ${g}ga${r} - git add .  ${g}gc${r} <msg> - git commit -m.
