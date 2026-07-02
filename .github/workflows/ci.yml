@@ -88,6 +88,26 @@ jobs:
           }
           if ($errors -gt 0) { exit 1 }
 
+      - name: Smoke-test profile (PS5.1 runtime)
+        shell: powershell
+        run: |
+          $env:CI = 'true'
+          # Load the profile under Windows PowerShell 5.1 so PS5-specific runtime paths are exercised, not just parsed.
+          $smoke = powershell -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'" 2>&1
+          $code = $LASTEXITCODE
+          $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+          if ($code -ne 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile failed to load under PS5.1 (exit code: $code)"
+            exit 1
+          }
+          if ($smokeErrors.Count -gt 0) {
+            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Error "Profile loaded under PS5.1 but emitted $($smokeErrors.Count) error(s) during load"
+            exit 1
+          }
+          Write-Host "Profile loaded successfully under PS5.1 (no errors)." -ForegroundColor Green
+
       - name: Check for hardcoded paths
         shell: pwsh
         run: |

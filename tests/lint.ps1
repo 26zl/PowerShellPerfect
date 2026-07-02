@@ -1,8 +1,6 @@
-# Local PSScriptAnalyzer runner. Mirrors CI rule set and excludes tests/ (which intentionally
-# uses aliases, generates strings that match the secrets scan regex, etc.).
+# Run the CI PSScriptAnalyzer rules locally while excluding test harnesses.
 $repoRoot = Split-Path -Parent $PSScriptRoot
-# Pin to the same version CI uses (.github/workflows/ci.yml) so local and remote see the same
-# rule set and don't diverge on new analyzer releases.
+# Pin the PSScriptAnalyzer version used by CI.
 $pinnedPSSAVersion = '1.24.0'
 $have = Get-Module -ListAvailable -Name PSScriptAnalyzer | Where-Object { $_.Version -eq [version]$pinnedPSSAVersion }
 if (-not $have) {

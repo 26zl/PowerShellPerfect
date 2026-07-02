@@ -1,6 +1,4 @@
-# Copy profile to both PS7 and PS5 directories
-# Derive Documents root from $PROFILE (works correctly even when Documents is in OneDrive)
-# Normalize agent detection: if host set a known agent var, set AI_AGENT
+# Copy the profile to PS5 and PS7 directories while normalizing agent detection.
 if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_CODE -or [bool]$env:CODEX -or [bool]$env:CODEX_AGENT)) { $env:AI_AGENT = '1' }
 if (-not $PSScriptRoot -or -not (Test-Path (Join-Path $PSScriptRoot "Microsoft.PowerShell_profile.ps1"))) {
     Write-Error "Cannot find profile script. Run this script from the repo directory (e.g. .\setprofile.ps1)."
@@ -16,8 +14,7 @@ foreach ($dir in $profileDirs) {
         New-Item -Path $dir -ItemType "directory" -Force | Out-Null
     }
     $targetProfile = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
-    # Mirror setup.ps1 backup behaviour: timestamped + rolling 5 so repeated runs
-    # never clobber the original profile backup.
+    # Keep the latest five timestamped profile backups.
     if (Test-Path -Path $targetProfile -PathType Leaf) {
         $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $backupPath = Join-Path $dir ("oldprofile.$backupStamp.ps1")

@@ -1,5 +1,4 @@
-# locallab.ps1
-# Local test + install harness. Tracked in git; run from repo root.
+# Run the tracked local test and installation harness from the repository root.
 #
 # Typical usage:
 #   pwsh -NoProfile -File tests/locallab.ps1                        # run all non-destructive checks
@@ -26,7 +25,7 @@ param(
 if ($Wizard -and -not $FullInstall) { $FullInstall = $true }
 
 $ErrorActionPreference = 'Stop'
-# This script lives in tests/. repoRoot is the parent directory (where setup.ps1 + profile live).
+# Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 
@@ -96,8 +95,7 @@ if (-not $SkipLint) {
             'PSUseShouldProcessForStateChangingFunctions', 'PSUseBOMForUnicodeEncodedFile',
             'PSReviewUnusedParameter', 'PSUseSingularNouns'
         )
-        # Mirror tests/lint.ps1 and CI: exclude all tests/ harnesses (they intentionally use aliases,
-        # generate strings that match the secrets regex, etc.) and any untracked _*.ps1 scratch files.
+        # Exclude test harnesses and untracked scratch scripts from source linting.
         $testHarnesses = @('ci-functional.ps1', 'rawhunt.ps1', 'test.ps1', 'locallab.ps1', 'lint.ps1')
         $results = Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule $excluded |
             Where-Object { $_.ScriptName -notin $testHarnesses -and $_.ScriptName -notlike '_*.ps1' }
@@ -218,9 +216,7 @@ if ($Install -or $FullInstall) {
         & './setprofile.ps1'
         if ($LASTEXITCODE -eq 0) { Ok 'setprofile.ps1' } else { Fail 'setprofile.ps1' "exit $LASTEXITCODE" }
 
-        # setprofile.ps1 only copies the profile .ps1; refresh cached JSON configs too so
-        # new schema fields (psreadline.colors, windowsTerminal.themeDefinition, etc.) take
-        # effect on next pwsh launch without requiring a full setup.ps1 or Update-Profile.
+        # Refresh cached JSON configuration after copying the profile.
         Step 'Refresh cached configs (theme.json, terminal-config.json)'
         $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
         if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
@@ -232,10 +228,7 @@ if ($Install -or $FullInstall) {
                 Ok 'refreshed' $cfg
             }
         }
-        # Apply WT tab-bar theme + color scheme directly to WT settings.json. Mirrors the
-        # subset of Update-Profile Phase 6 / setup.ps1 step [10/10] needed for the cosmetic
-        # bits to take effect live, without doing network downloads or tool installs.
-        # PSReadLine colors apply automatically when the new profile loads.
+        # Apply local terminal theme changes without downloads or tool installation.
         Step 'Apply WT theme to settings.json (live)'
         $wtCandidates = @(
             Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'

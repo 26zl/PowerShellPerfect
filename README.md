@@ -4,12 +4,10 @@
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Status](https://img.shields.io/badge/status-active%20development-orange)](https://github.com/26zl/PowerShellPerfect/commits/main)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome.
-> A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ Unix-style commands, a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
-
-<!-- TODO: add screenshots under docs/img/ (themed prompt, install wizard, scheme gallery). -->
+> ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+> A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ commands (Unix-style utilities plus git, network, security, sysadmin, WSL, and docker), a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
 ```powershell
 # Review-first (recommended): prints the install-bundle SHA256 and STOPS before changing anything.
@@ -48,7 +46,7 @@ The **install wizard runs by default** — pick theme / scheme / font / features
 
 ## Install Wizard
 
-Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. **Runs automatically on every interactive install** — it's the default experience, not an opt-in. CI and AI-agent environments are auto-detected and skip it.
+Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. **Runs automatically on every interactive install** — it's the default experience, not an opt-in. Non-interactive environments skip it.
 
 ```powershell
 # Default trusted-download flow — wizard runs as part of installation
@@ -95,7 +93,7 @@ Reconfigure-Profile
 | **Self-updating** | `Update-Profile` syncs profile + theme + WT config with SHA-256 verification. Survives custom `profile_user.ps1` + `user-settings.json`. |
 | **Full uninstall** | `Uninstall-Profile` restores WT, removes caches, `-RemoveTools` drops winget packages, `-All` wipes everything |
 | **PS5 + PS7** | Installs to both profile directories; every PS5/PS7 API fork is guarded |
-| **Sandbox-safe** | CI + AI agents auto-detected; network calls and UI setup suppressed so sessions don't hang |
+| **Sandbox-safe** | Non-interactive environments skip network calls and UI setup so sessions don't hang |
 | **Hardened** | Passwords/tokens filtered from PSReadLine history; `Merge-JsonObject` + WT settings merge are unit-tested in CI |
 | **Tested** | Lint, PS5 parse, 100% command-coverage audit, full install + uninstall sandbox - all run on every PR |
 
@@ -150,7 +148,7 @@ Uninstall-Profile              # Core cleanup: profile files, caches, WT restore
 Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (including direct/MSI Oh My Posh when detected)
 Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
 Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
-Uninstall-Profile -All -Force  # Also uninstall PSFzf/managed tools when $env:CI or $env:AI_AGENT is set (e.g. under Claude Code)
+Uninstall-Profile -All -Force  # Also uninstall PSFzf/managed tools when CI or agent guards are active
 ```
 
 Optional switches: `-RemoveTools` (winget-managed tools plus direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (`profile_user.ps1`, `user-settings.json`, and your `plugins/`), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes. A plain `Uninstall-Profile` preserves `user-settings.json`, `profile_user.ps1`, and your `plugins/` — only `-RemoveUserData`/`-All` delete them.
@@ -439,7 +437,7 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | | **PowerShellPerfect** | [ChrisTitusTech](https://github.com/ChrisTitusTech/powershell-profile) | [Oh My Posh](https://ohmyposh.dev) | [Starship](https://starship.rs) |
 | --- | :---: | :---: | :---: | :---: |
 | p10k-style install wizard | ✅ | — | — | — |
-| 130+ Unix-style commands | ✅ | partial | — | — |
+| 130+ commands (Unix-style + git/net/security/sysadmin) | ✅ | partial | — | — |
 | Prompt theming | ✅ (via Oh My Posh) | ✅ (via Oh My Posh) | ✅ (engine) | ✅ (engine) |
 | Hash-verified self-update + full uninstall | ✅ | ✅ | n/a | n/a |
 | PS 5.1 + PS 7 (guarded forks) | ✅ | ✅ | ✅ | ✅ (cross-shell) |
@@ -451,10 +449,10 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | Symptom | Fix |
 | --- | --- |
 | Setup blocked by Windows Defender (Controlled Folder Access) | Allow PowerShell through (see the command in [Install](#install-alternatives)), or run the clone from a non-protected folder. |
-| `running scripts is disabled on this system` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` — or use the `-ExecutionPolicy Bypass` the one-liner already applies. |
+| `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. (The recommended one-liner runs an in-memory scriptblock, which isn't subject to the script-file execution policy.) |
 | Prompt shows boxes / missing glyphs | The terminal font isn't a Nerd Font. Set your Windows Terminal profile font to the one setup installed (e.g. *CaskaydiaCove Nerd Font*) and restart WT. |
 | `oh-my-posh` not found right after install | Reopen the terminal (PATH refresh) or run `Update-SessionPathFromRegistry`; confirm with `psp-doctor`. |
-| Turned a feature off in the wizard but it still loads | Update to the latest commit — feature toggles now apply before PSReadLine init. Check the `features` block in `user-settings.json`. |
+| Turned a feature off in the wizard but it still loads | Check the `features` block in `user-settings.json`, then restart PowerShell. |
 | Something feels off | Run `psp-doctor` (alias for `Test-ProfileHealth`): OK/WARN/FAIL per check across tools, caches, fonts, PATH, and modules. |
 
 ## Roadmap

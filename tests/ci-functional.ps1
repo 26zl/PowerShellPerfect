@@ -1,5 +1,4 @@
-# PSScriptAnalyzer suppression: this file intentionally calls profile functions
-# by their short names (gc, ls, cat, uptime, eventlog) to exercise those definitions.
+# Suppress alias warnings because the test invokes profile commands by their short names.
 [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingCmdletAliases', '')]
 param(
     [switch]$VerboseOutput,
@@ -8,8 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# This script lives in tests/. Resolve repo root (parent of tests/) so all relative
-# references to Microsoft.PowerShell_profile.ps1, setup.ps1, theme.json etc. still work.
+# Resolve repository assets relative to the parent of tests/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
 
@@ -236,8 +234,7 @@ if (-not (Test-Path $profilePath)) {
 
 try {
 Invoke-TestCase -Name 'Full install flow in sandbox (setup.ps1)' -Code {
-    # Run the real setup.ps1 against a disposable sandbox so the install flow is validated
-    # without mutating the developer's actual profile, LOCALAPPDATA, or WT settings.
+    # Validate setup.ps1 against a disposable sandbox.
     $setupPath = Join-Path $repoRoot 'setup.ps1'
     if (-not (Test-Path $setupPath)) {
         throw "setup.ps1 not found at $setupPath"
@@ -464,16 +461,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Edit-Profile' -SkipReason 'Opens interactive editor'
         Invoke-CommandProbe -Command 'ep' -SkipReason 'Alias to Edit-Profile (opens interactive editor)'
         Invoke-CommandProbe -Command 'edit' -SkipReason 'Opens interactive editor'
-        # Update flows are network/mutation-heavy; we can't run them end-to-end in CI, but at
-        # least verify the parameter contract so renames/removals don't silently break muscle
-        # memory, and drive the safe early-exit paths each function exposes.
+        # Verify update command contracts and safe early exits without external mutations.
         Invoke-CommandProbe -Command 'Update-Profile' -Code {
             $cmd = Get-Command Update-Profile
             foreach ($p in @('Force', 'SkipHashCheck', 'ExpectedSha256', 'WhatIf')) {
                 if (-not $cmd.Parameters.ContainsKey($p)) { throw "Update-Profile missing expected parameter: $p" }
             }
-            # -WhatIf must trip the ShouldProcess gate BEFORE the Phase 1 downloads so
-            # no psp-profile-*.ps1 / psp-theme-*.json / psp-terminal-*.json appears in %TEMP%.
+            # Confirm -WhatIf prevents update downloads.
             $filters = @('psp-profile-*.ps1', 'psp-theme-*.json', 'psp-terminal-*.json')
             $pre = foreach ($f in $filters) { Get-ChildItem -Path $env:TEMP -Filter $f -ErrorAction SilentlyContinue }
             Update-Profile -WhatIf -Confirm:$false | Out-Null
@@ -483,13 +477,11 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             }
         }
         Invoke-CommandProbe -Command 'Update-PowerShell' -Code {
-            # Safe early exits: PS5 prints a guidance message and returns; PS7 without winget
-            # prints a warning. Either way the function must not throw on first invocation.
+            # Confirm Update-PowerShell exits safely when updating is unavailable.
             Update-PowerShell *> $null
         }
         Invoke-CommandProbe -Command 'Update-Tools' -Code {
-            # Safe early exit when winget is absent; with winget we still need skip because
-            # it would actually mutate installed tools. Only run when winget is unavailable.
+            # Exercise Update-Tools only when winget is absent.
             if (Get-Command winget -ErrorAction SilentlyContinue) {
                 Write-Host '        (skipping live invocation; winget present in CI host)' -ForegroundColor DarkGray
             }
@@ -522,10 +514,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Clear-Cache' -Code { Clear-Cache -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Uninstall-Profile' -Code { Uninstall-Profile -All -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Invoke-ProfileWizard' -Code {
-            # SupportsShouldProcess lets us drive the invocation path without network download.
-            # -WhatIf returns before Invoke-DownloadWithRetry, so this is safe in CI.
-            # We also verify the ShouldProcess gate actually prevents the temp download by
-            # ensuring no psp-reconfigure-*.ps1 files exist in %TEMP% after the -WhatIf call.
+            # Confirm -WhatIf prevents setup wizard downloads.
             $preFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
             Invoke-ProfileWizard -WhatIf -Confirm:$false | Out-Null
             $postFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
@@ -663,8 +652,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             finally { Set-Location $before }
         }
         Invoke-CommandProbe -Command 'cdh' -Code {
-            # Seed the stack by cd'ing through two dirs, invoking Invoke-PromptStage
-            # manually since the probe does not render a prompt.
+            # Seed directory history manually because the probe does not render prompts.
             $before = Get-Location
             try {
                 $sub = Join-Path $workspace 'cdh-probe'
@@ -684,10 +672,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 $sub = Join-Path $workspace 'cdb-probe'
                 New-Item -ItemType Directory -Path $sub -Force | Out-Null
                 Set-Location -LiteralPath $sub
-                # Capture the canonical path the same way cdb does. $env:TEMP is the 8.3 short
-                # form (RUNNER~1) but $PWD.ProviderPath resolves to the long form, and that exact
-                # string is what Invoke-PromptStage pushes onto the stack and cdb restores. Comparing
-                # ProviderPath-to-ProviderPath sidesteps short/long and casing mismatches entirely.
+                # Compare canonical provider paths to avoid short-path and casing differences.
                 $subResolved = $PWD.ProviderPath
                 Invoke-PromptStage
                 Set-Location -LiteralPath $workspace
@@ -782,8 +767,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             checksum $textFile $script:sha256 | Out-Null
         }
         Invoke-CommandProbe -Command 'genpass' -Code {
-            # genpass is clipboard-only by contract (never returns/prints the plaintext), so assert the
-            # clipboard receives a 16-char password rather than a return value.
+            # Confirm genpass writes a 16-character password only to the clipboard.
             Set-Clipboard ''
             genpass 16
             $clip = ((Get-Clipboard) -join '').Trim()
@@ -863,7 +847,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $pretty = prettyjson $jsonFile | Out-String
             if ($pretty -notmatch '"name"\s*:\s*"ci"') { throw 'prettyjson output missing expected key/value' }
         }
-        # LIVE NETWORK: actually POSTs $textFile to the public paste at bin.christitus.com. -Confirm:$false skips the prompt.
+        # LIVE NETWORK: POST $textFile to bin.christitus.com without prompting.
         Invoke-CommandProbe -Command 'hb' -Code { hb $textFile -Confirm:$false | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'timer' -Code { timer { Start-Sleep -Milliseconds 5 } | Out-Null }
         Invoke-CommandProbe -Command 'watch' -SkipReason 'Infinite loop by design'
@@ -885,7 +869,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'rdp' -SkipReason 'Opens Remote Desktop UI'
         Invoke-CommandProbe -Command 'wsl' -SkipReason 'Wraps wsl.exe; would launch a distro shell'
         Invoke-CommandProbe -Command 'Get-WslDistro' -Code {
-            # Parses wsl -l -v; safe to call. May return empty list if no distros installed on runner.
+            # Parse wsl -l -v and allow an empty distro list.
             Get-WslDistro | Out-Null
         }
         Invoke-CommandProbe -Command 'Enter-WslHere' -SkipReason 'Opens interactive WSL shell'

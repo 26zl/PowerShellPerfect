@@ -1,6 +1,4 @@
-# RAW Bug Hunt - comprehensive profile test suite
-# Exercises every profile function, install/uninstall, caching, and config merge
-# Run: pwsh -NoProfile -File rawhunt.ps1
+# Exercise profile functions, lifecycle operations, caching, and configuration merging.
 $ErrorActionPreference = 'Continue'
 
 $ok = 0; $fail = 0; $bugs = @()
@@ -44,7 +42,7 @@ function Test-Throws {
 
 Write-Host "`n==================== RAW Bug Hunt ====================" -ForegroundColor Cyan
 
-# This script lives in tests/. repoRoot is the parent directory (where profile + setup.ps1 live).
+# Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
 $setupPath = Join-Path $repoRoot 'setup.ps1'

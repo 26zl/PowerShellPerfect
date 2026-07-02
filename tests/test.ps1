@@ -1,16 +1,12 @@
-# test.ps1 - Full local test suite (mirrors CI lint + install-flow, plus local-only checks)
-# Usage: pwsh -NoProfile -File tests/test.ps1
-#        pwsh -NoProfile -File tests/test.ps1 -SkipPS5
-# Covers every check from .github/workflows/ci.yml plus profile-level validation.
+# Run CI-equivalent and local profile checks with optional -SkipPS5.
 param(
     [switch]$SkipPS5  # Skip PS5 parse check if powershell.exe is unavailable
 )
 
 $ErrorActionPreference = 'Stop'
-# $env:TEMP is unset on non-Windows; the sandbox harness builds paths under it. Default to the
-# platform temp dir so the suite runs cross-platform instead of aborting on a null Join-Path.
+# Use the platform temp directory when TEMP is unavailable.
 if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
-# This script lives in tests/. repoRoot points at the parent directory (where the profile lives).
+# Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $passed = 0
 $failed = 0
@@ -272,15 +268,13 @@ catch { Write-Result 'PSScriptAnalyzer' 'FAIL' $_.Exception.Message }
 # -------------------------------------------------------
 Write-Host '[3/26] Smoke test (pwsh)' -ForegroundColor Cyan
 if ($env:OS -ne 'Windows_NT') {
-    # The profile is Windows-targeted (LOCALAPPDATA, WindowsPrincipal, etc.); it cannot load cleanly
-    # off-Windows, so loading it here only produces platform errors. CI runs this on windows-latest.
+    # Run the Windows-targeted profile smoke test only on Windows.
     Write-Result 'Smoke test (pwsh)' 'SKIP' 'non-Windows host (profile is Windows-targeted)'
 }
 else {
     try {
         $env:CI = 'true'
-        # Exit code alone misses non-terminating errors; also scan the error stream (warnings suppressed
-        # since user-file/plugin load failures are non-fatal). Mirrors the CI smoke step.
+        # Scan non-terminating errors in addition to the smoke-test exit code.
         $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '$profilePath'" 2>&1
         if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
         $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
@@ -691,8 +685,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
     $whatifLines = @($output | Where-Object { $_ -match 'What if' })
     if ($whatifLines.Count -eq 0) { throw 'No WhatIf output produced' }
-    # Core phases that always produce output with the sandboxed profile and cache files.
-    # Windows Terminal restoration is optional when no settings file is installed.
+    # Require core cleanup output while allowing Windows Terminal restoration to be absent.
     $requiredPhases = @('Remove cache', 'Remove profile file')
     $missingPhases = @()
     foreach ($ph in $requiredPhases) {
@@ -800,8 +793,7 @@ try {
         if (-not (Test-Path $uf)) { $errors += "User profile: $uf was deleted (should be preserved)" }
     }
 
-    # ===== TEST B: Recreate and test -RemoveUserData =====
-    # Recreate the files that were deleted
+    # ===== TEST B: Recreate deleted files and test -RemoveUserData =====
     [System.IO.File]::WriteAllText((Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $ps5Dir 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
 
@@ -2020,8 +2012,7 @@ try {
         }
     }
 
-    # Commands actually executed in step 22 (T 'name' { ... } with a scriptblock)
-    # vs commands skipped (T 'name' $null 'reason')
+    # Compare commands executed in step 22 with commands explicitly skipped.
     $execActual = @()
     $execSkipped = @()
     foreach ($line in (Get-Content $MyInvocation.MyCommand.Path)) {

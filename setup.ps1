@@ -1,6 +1,4 @@
-### PowerShell Profile (26zl) setup script
-### This script configures the PowerShell profile by installing necessary tools, fonts, and themes.
-### It also sets up Windows Terminal with recommended settings. Run this script in an elevated PowerShell session to ensure all changes are applied correctly.
+### Install PowerShellPerfect tools, fonts, themes, and Windows Terminal settings.
 
 param(
     [ValidateRange(0, 100)]
@@ -11,16 +9,12 @@ param(
     [ValidateRange(6, 30)]
     [int]$FontSize = 11,
 
-    # Path to a local repo clone. When set, profile/theme.json/terminal-config.json
-    # are copied from this directory instead of downloaded from GitHub.
-    # Used by ci-functional.ps1 to test local changes without a GitHub round-trip.
+    # Copy profile assets from a local repository instead of GitHub.
     [string]$LocalRepo = '',
 
     [switch]$CiMode,
 
-    # Interactive wizard: asks user for OMP theme, color scheme, font, features, background.
-    # Auto-enabled when interactive + not in CI + not AI-agent. -SkipWizard forces defaults.
-    # -Resume continues from a prior incomplete wizard run (state in $env:TEMP\psp-wizard-state.json).
+    # Control the interactive setup wizard, defaults, and resumable state.
     [switch]$Wizard,
     [switch]$SkipWizard,
     [switch]$Resume,
@@ -29,14 +23,12 @@ param(
     [switch]$SkipHashCheck
 )
 
-# Normalize agent detection (same as profile): if host set a known agent var, set AI_AGENT so we only check one name
+# Normalize known agent env vars to AI_AGENT (same as profile).
 if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_CODE -or [bool]$env:CODEX -or [bool]$env:CODEX_AGENT)) {
     $env:AI_AGENT = '1'
 }
 
-# Raise the TLS floor to 1.2 on Windows PowerShell 5.1 before the first HTTPS request. On older .NET 4.x the
-# process default can still be SSL3/TLS1.0, which github.com / raw.githubusercontent.com reject (downloads just
-# fail) and which leaves a protocol-downgrade window. PowerShell 7 (Core) negotiates via the OS and needs none.
+# Enforce TLS 1.2 for HTTPS requests on Windows PowerShell 5.1.
 if ($PSVersionTable.PSVersion.Major -lt 6) {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { $null = $_ }
 }
@@ -47,10 +39,7 @@ $script:DownloadedThemeConfigPath = $null
 $script:DownloadedTerminalConfigPath = $null
 $script:VerifiedInstallBundle = $false
 
-# Auto-detect local repo: when the script sits next to Microsoft.PowerShell_profile.ps1 and
-# -LocalRepo was not supplied, prefer the local checkout over a GitHub round-trip. This makes
-# `.\setup.ps1` work as expected from a manual clone and matches README's "manual setup" doc.
-# Skipped when piped via `irm | iex` because $PSScriptRoot is empty in that mode.
+# Use the adjacent local repository when available and -LocalRepo is omitted.
 if ([string]::IsNullOrWhiteSpace($LocalRepo) -and $PSScriptRoot -and
     (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Microsoft.PowerShell_profile.ps1')) -and
     (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'theme.json')) -and
@@ -70,8 +59,7 @@ function Get-CombinedSha256 {
     finally { $sha.Dispose() }
 }
 
-# Download helper with retry, size validation, and corrupt-file cleanup.
-# Defined before remote bundle verification so setup can fail before any local mutations.
+# Download with retries, size validation, and corrupt-file cleanup.
 function Invoke-DownloadWithRetry {
     param(
         [Parameter(Mandatory)]
@@ -196,9 +184,7 @@ function Resolve-SetupSourcePath {
     }
 }
 
-# Curated color scheme library (used by install wizard).
-# Each entry is a full Windows Terminal scheme definition. Users who want more
-# can paste their own into user-settings.json.windowsTerminal.scheme.
+# Define the install wizard's curated Windows Terminal color schemes.
 $script:CuratedSchemes = @(
     @{ Name = 'Tokyo Night'; Desc = 'Cool blue-purple, balanced for long coding sessions (default)'
         Scheme = @{ name = 'Tokyo Night'; background = '#1a1b26'; foreground = '#a9b1d6'; cursorColor = '#a9b1d6'; selectionBackground = '#33467c'
@@ -230,8 +216,7 @@ $script:CuratedSchemes = @(
             brightBlack = '#002b36'; brightRed = '#cb4b16'; brightGreen = '#586e75'; brightYellow = '#657b83'; brightBlue = '#839496'; brightPurple = '#6c71c4'; brightCyan = '#93a1a1'; brightWhite = '#fdf6e3' } }
 )
 
-# Curated Nerd Fonts (name = ryanoasis release asset name without .zip).
-# DisplayName is what appears in Windows after install, used for WT "face" setting.
+# Map curated Nerd Font release assets to their Windows display names.
 $script:CuratedFonts = @(
     @{ Asset = 'CascadiaCode';   DisplayName = 'CaskaydiaCove NF';    Desc = 'Microsoft Cascadia + icons (default)' }
     @{ Asset = 'JetBrainsMono';  DisplayName = 'JetBrainsMono NF';    Desc = 'JetBrains flagship, tight + readable' }
@@ -241,10 +226,7 @@ $script:CuratedFonts = @(
     @{ Asset = 'Iosevka';        DisplayName = 'Iosevka NF';          Desc = 'Narrow monospace, space-efficient' }
 )
 
-# Install wizard (setup.ps1 -Wizard). Guarded so CI/non-interactive hosts skip.
-# Internal: show a numbered pick list from stdin/Out-GridView/fzf. Returns the picked
-# item (or the user's -Default if they press Enter/skip). Multi-select via fzf --multi
-# not supported here; each wizard step picks one item.
+# Return one wizard choice from stdin, Out-GridView, or fzf.
 function Select-WizardItem {
     param(
         [Parameter(Mandatory)][string]$Title,
@@ -279,8 +261,7 @@ function Select-WizardItem {
     } while ($true)
 }
 
-# Internal: fetch latest Nerd Fonts release tag (e.g. 'v3.2.1' -> '3.2.1').
-# Fallback to the version in terminal-config.json, then a hardcoded fallback.
+# Return the latest Nerd Fonts version with configured and hardcoded fallbacks.
 function Get-LatestNerdFontVersion {
     try {
         $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest' `
@@ -291,8 +272,7 @@ function Get-LatestNerdFontVersion {
     return '3.2.1'
 }
 
-# Internal: fetch the upstream OMP theme list from GitHub API. Returns array of
-# @{ Name='atomic'; Url='https://...atomic.omp.json' }. Empty array on network failure.
+# Return Oh My Posh theme names and URLs from GitHub or an empty array on failure.
 function Get-OmpThemeList {
     $apiUrl = 'https://api.github.com/repos/JanDeDobbeleer/oh-my-posh/contents/themes?ref=main'
     try {
@@ -309,10 +289,7 @@ function Get-OmpThemeList {
     return $themes | Sort-Object { $_.Name }
 }
 
-# Internal: write all wizard choices to user-settings.json via Merge-JsonObject.
-# Overwrites in place so re-running the wizard applies the new set without piling
-# up stale overrides. Choices is a hashtable with keys: Theme, Scheme, Font, Features,
-# Background, TabBar. Any $null key is skipped (user chose 'keep current').
+# Merge non-null wizard choices into user-settings.json.
 function Save-WizardChoices {
     param(
         [Parameter(Mandatory)][hashtable]$Choices,
@@ -364,9 +341,7 @@ function Save-WizardChoices {
         $s.defaults | Add-Member -NotePropertyName 'backgroundImageStretchMode' -NotePropertyValue 'uniformToFill' -Force
         $s.defaults | Add-Member -NotePropertyName 'backgroundImageAlignment' -NotePropertyValue 'center' -Force
     }
-    # Terminal appearance: opacity, useAcrylic, cursorShape, padding, scrollbarState, historySize
-    # go straight into defaults; fontSize is nested under defaults.font.size so the wizard's
-    # face pick (if any) is preserved.
+    # Store terminal appearance defaults while preserving the selected font face.
     if ($Choices.Terminal) {
         foreach ($k in $Choices.Terminal.Keys) {
             $v = $Choices.Terminal[$k]
@@ -387,9 +362,7 @@ function Save-WizardChoices {
             $s.features | Add-Member -NotePropertyName $k -NotePropertyValue $Choices.Features[$k] -Force
         }
     }
-    # PSReadLine: when 'scheme', derive a syntax palette from the chosen color scheme so the
-    # shell reflects the picked theme without asking 10 hex questions. Profile reads
-    # user-settings.json.psreadline.colors on top of theme.json's palette.
+    # Derive PSReadLine colors from the selected terminal scheme when requested.
     if ($Choices.PSReadLine -eq 'scheme' -and $Choices.Scheme) {
         $sc = $Choices.Scheme
         $rl = [PSCustomObject]@{
@@ -411,7 +384,7 @@ function Save-WizardChoices {
     [System.IO.File]::WriteAllText($UserSettingsPath, $json, $utf8)
 }
 
-# Yes/no prompt with default (Enter = default). Returns [bool].
+# Return a yes/no choice with Enter mapped to the default.
 function Read-WizardYesNo {
     param([Parameter(Mandatory)][string]$Prompt, [bool]$Default = $true)
     $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
@@ -420,7 +393,7 @@ function Read-WizardYesNo {
     return ($raw -match '^(?i:y|yes)$')
 }
 
-# Main wizard. Returns hashtable of choices; caller writes them via Save-WizardChoices.
+# Return the main wizard choices as a hashtable for Save-WizardChoices.
 function Start-InstallWizard {
     param([string]$StatePath)
 
@@ -439,9 +412,7 @@ function Start-InstallWizard {
         CompletedSteps  = @()
     }
 
-    # Bump when the $choices shape changes (new fields, renamed keys, different step order).
-    # Resume loads from state only when the stored version matches; mismatches start fresh so
-    # stale state from an older setup.ps1 can't apply ghost fields to current logic.
+    # Increment the state version whenever the wizard choice schema changes.
     $WIZARD_STATE_SCHEMA = 2
 
     # Resume from state file if caller passed one that exists
@@ -511,9 +482,7 @@ function Start-InstallWizard {
     Write-Host '  Pick your cosmetics. All 130+ commands and extensibility APIs ship regardless.' -ForegroundColor DarkGray
     Write-Host '  Press Enter at any prompt to accept default / skip that step.' -ForegroundColor DarkGray
 
-    # STEP 0: Quick start shortcut - offers a "just make it nice" preset that fills all 10
-    # steps with sensible defaults and skips straight to the summary. Users who want to
-    # customize say No and get the full wizard. Skipped when resuming (choices already loaded).
+    # STEP 0: Offer the default preset before the full wizard on new runs.
     if ($choices.CompletedSteps.Count -eq 0) {
         Write-Host ''
         Write-Host '-- Quick start --' -ForegroundColor Cyan
@@ -593,9 +562,7 @@ function Start-InstallWizard {
         }
         elseif ($pick -and $pick.Value) { $choices.TabBar = $pick.Value }
 
-        # WT application theme controls window chrome (title bar, rounded corners) when a
-        # custom themeDefinition is applied. 'dark' matches the curated color schemes; 'light'
-        # inverts chrome for users on light system themes.
+        # Select dark or light Windows Terminal window chrome.
         $wantLight = Read-WizardYesNo -Prompt '  Use light window chrome (title bar, borders)?' -Default $false
         $choices.AppTheme = if ($wantLight) { 'light' } else { 'dark' }
 
@@ -603,9 +570,7 @@ function Start-InstallWizard {
         Save-State
     }
 
-    # STEP 5: Terminal appearance (opacity, font size, cursor, padding, scrollbar, history).
-    # Each prompt accepts Enter = keep default (nothing is written for that field, so the
-    # terminal-config.json default still wins). Invalid values are rejected silently.
+    # STEP 5: Collect optional terminal appearance overrides.
     if ('Terminal' -notin $choices.CompletedSteps) {
         Write-Host ''
         Write-Host '-- Terminal appearance --' -ForegroundColor Cyan
@@ -656,10 +621,7 @@ function Start-InstallWizard {
         Save-State
     }
 
-    # STEP 6: PSReadLine syntax colors. Three options:
-    #   1) Keep theme.json default (ship-time palette)
-    #   2) Derive from chosen WT color scheme (maps scheme roles to PSReadLine roles)
-    #   3) Skip - user edits user-settings.json.psreadline.colors manually later
+    # STEP 6: Keep, derive, or skip PSReadLine syntax colors.
     if ('PSReadLine' -notin $choices.CompletedSteps) {
         Write-Host ''
         Write-Host '-- PSReadLine syntax colors --' -ForegroundColor Cyan
@@ -702,8 +664,7 @@ function Start-InstallWizard {
         Save-State
     }
 
-    # STEP 9: Telemetry opt-out
-    # Skip when telemetry opt-out is already configured.
+    # STEP 9: Offer telemetry opt-out when it is not already configured.
     if ('Telemetry' -notin $choices.CompletedSteps) {
         Write-Host ''
         Write-Host '-- PowerShell telemetry --' -ForegroundColor Cyan
@@ -773,11 +734,7 @@ function Start-InstallWizard {
 $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 $isCiHost = $CiMode -or [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
 
-# Ensure the script can run with elevated privileges for local installs.
-# In CI/non-admin mode we continue and skip admin-only steps instead of exiting.
-# Hard-failure paths use `exit 1` (when run as a file) so callers and CI see a non-zero
-# exit code. In `irm | iex` mode $PSCommandPath is empty, so we fall back to `return`
-# to avoid terminating the user's shell.
+# Elevate local installs while allowing non-admin automation to skip privileged steps.
 if (-not $isElevated -and -not $isCiHost) {
     Write-Host "Please run this script as an Administrator!" -ForegroundColor Red
     if ($PSCommandPath) { exit 1 } else { return }
@@ -786,8 +743,7 @@ elseif (-not $isElevated -and $isCiHost) {
     Write-Host "Running setup.ps1 in CI/non-admin mode. Admin-only steps (LocalMachine execution policy, system-wide font install) will be skipped." -ForegroundColor Yellow
 }
 
-# For remote installs, verify/download the profile bundle before any local mutation
-# (execution policy prompts, wizard writes, tool installs, profile copy, WT changes).
+# For remote installs, verify/download the profile bundle before any local mutation.
 if (-not $LocalRepo) {
     try {
         Initialize-RemoteInstallBundle
@@ -799,8 +755,7 @@ if (-not $LocalRepo) {
     }
 }
 
-# ExecutionPolicy is security-sensitive. setup.ps1 must never silently relax it.
-# We only surface guidance; users can opt in manually if their environment requires it.
+# Report restrictive execution policies without changing them.
 $currentUserPolicy = Get-ExecutionPolicy -Scope CurrentUser
 if ($currentUserPolicy -eq 'AllSigned') {
     $canPromptPolicy = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
@@ -825,8 +780,7 @@ elseif ($currentUserPolicy -in @('Restricted', 'Undefined')) {
     Write-Host "  If the installed profile is blocked, opt in manually with:" -ForegroundColor DarkYellow
     Write-Host "  Set-ExecutionPolicy RemoteSigned -Scope CurrentUser" -ForegroundColor DarkYellow
 }
-# Offer LocalMachine scope (covers all users and both PS editions) but don't force it.
-# In CI/non-admin mode we skip this prompt entirely.
+# Offer LocalMachine execution policy guidance only in eligible interactive sessions.
 if (-not $isCiHost) {
     $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
     if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
@@ -901,8 +855,7 @@ function Install-NerdFonts {
             Remove-SafeTempDirectory -Path $tempRoot -NamePrefix 'psp-font-'
             $tempRoot = $null
             if ($copied -gt 0 -and $pending) {
-                # Partial install: some files never appeared under %SystemRoot%\Fonts within the
-                # timeout. Report failure so callers can surface it instead of claiming success.
+                # Report a partial font installation when files do not appear before timeout.
                 Write-Host "  Font copy timed out: $(@($pending).Count) of $copied file(s) did not install." -ForegroundColor Red
                 return $false
             }
@@ -921,8 +874,7 @@ function Install-NerdFonts {
     }
 }
 
-# Return all existing Windows Terminal settings files across install variants.
-# Duplicated in the profile; keep both implementations in sync.
+# Return all Windows Terminal settings files using the same implementation as the profile.
 function Get-WindowsTerminalSettingsPaths {
     $candidates = @(
         Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
@@ -933,9 +885,7 @@ function Get-WindowsTerminalSettingsPaths {
     @($candidates | Where-Object { Test-Path -LiteralPath $_ })
 }
 
-# Resolve the real path of an external command, following aliases recursively.
-# DUPLICATED from Microsoft.PowerShell_profile.ps1's Get-ExternalCommandPath.
-# Keep these two copies in sync (see "Structural Duplication" notes).
+# Resolve external command aliases using the same implementation as the profile.
 function Get-ExternalCommandPath {
     param(
         [Parameter(Mandatory)]
@@ -1006,7 +956,7 @@ if (-not $LocalRepo -and -not $script:VerifiedInstallBundle -and -not (Test-Inte
     if ($PSCommandPath) { exit 1 } else { return }
 }
 
-# JSONC comment-stripping regex (built via variable to avoid PS5 parser bug with [^"] in strings)
+# JSONC comment-stripping regex.
 $_q = [char]34
 $jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 
@@ -1017,16 +967,13 @@ if (!(Test-Path -Path $configCachePath)) {
     New-Item -Path $configCachePath -ItemType "directory" -Force | Out-Null
 }
 
-# Install wizard. Writes user choices to user-settings.json BEFORE downstream steps, so
-# the rest of setup.ps1 (WT sync, font install, cache writes) picks up those overrides
-# via the existing user-settings merge logic. Non-interactive hosts always skip.
+# Run the wizard before downstream installation steps consume user settings.
 $canRunWizard = [Environment]::UserInteractive -and -not $isCiHost -and -not [bool]$env:AI_AGENT
 $wantWizard = ($Wizard -or $canRunWizard) -and -not $SkipWizard
 if ($wantWizard) {
     $wizardState = Join-Path $env:TEMP 'psp-wizard-state.json'
     if (-not $Resume -and (Test-Path $wizardState)) {
-        # Stale state file from a previous aborted run; the wizard itself asks if we resume,
-        # but if -Resume was not passed explicitly, clean out any state older than 24h.
+        # Remove wizard state older than 24 hours unless resume was requested.
         $age = (Get-Date) - (Get-Item $wizardState).LastWriteTime
         if ($age.TotalHours -gt 24) { Remove-Item $wizardState -Force -ErrorAction SilentlyContinue }
     }
@@ -1037,10 +984,7 @@ if ($wantWizard) {
         Write-Host ''
         Write-Host 'Wizard choices saved to user-settings.json.' -ForegroundColor Green
 
-        # If user picked a Nerd Font, override the version-pinned font install step
-        # by re-invoking Install-NerdFonts with the chosen asset/display name + latest release.
-        # Only mark WizardFontInstalled = $true when the install actually succeeded so step
-        # [4/10] falls back to the default install instead of silently leaving no font.
+        # Install the selected Nerd Font and retain the default fallback on failure.
         if ($wizChoices.Font) {
             $latestVer = Get-LatestNerdFontVersion
             Write-Host ("Installing Nerd Font: {0} v{1}..." -f $wizChoices.Font.DisplayName, $latestVer) -ForegroundColor Cyan
@@ -1053,17 +997,14 @@ if ($wantWizard) {
             }
         }
 
-        # If OMP theme chosen, write its URL so downstream OMP install uses that instead of
-        # theme.json's default. We do this by patching the fetched $profileConfig below.
+        # Apply the selected Oh My Posh theme URL to the fetched profile configuration.
         $script:WizardOmpTheme = $wizChoices.Theme
 
-        # Expose editor + telemetry choices so [2/10] and the end-of-setup prompt skip
-        # their own interactive prompts (the wizard already captured the user's answer).
+        # Reuse wizard editor and telemetry choices in later setup steps.
         $script:WizardEditor = $wizChoices.Editor
         $script:WizardTelemetryHandled = ($null -ne $wizChoices.TelemetryOptOut)
 
-        # Apply telemetry opt-out immediately (we are already elevated inside setup.ps1).
-        # Ownership marker lets Uninstall-Profile know the value is ours and safe to remove.
+        # Apply the telemetry choice and record ownership for uninstall.
         if ($wizChoices.TelemetryOptOut -and -not [System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
             try {
                 [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'true', [System.EnvironmentVariableTarget]::Machine)
@@ -1125,8 +1066,7 @@ function Merge-JsonObject($base, $override) {
     }
 }
 
-# Editor candidates for interactive selection. WingetId = $null means built-in (not installed via winget).
-# WingetIds verified with: winget search --id <Id>
+# Define editor choices and optional winget package IDs.
 $EditorCandidates = @(
     @{ Cmd = 'code'; Display = 'Visual Studio Code'; WingetId = 'Microsoft.VisualStudioCode' }
     @{ Cmd = 'nvim'; Display = 'Neovim'; WingetId = 'Neovim.Neovim' }
@@ -1219,10 +1159,7 @@ if (Test-Path $userSettingsPath) {
     }
 }
 
-# winget is optional. The profile + config steps below do not need it, and every tool
-# installer (Install-WingetPackage, the editor install) already skips gracefully when it is
-# absent. Warn and continue instead of aborting, so LTSC/offline/locked-down hosts still get
-# the profile (matches README: optional tools "degrade gracefully if a tool is absent").
+# Continue profile installation without optional winget-managed tools.
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "winget (App Installer) not found - skipping optional tool installs (eza, bat, fzf, zoxide, ripgrep, Oh My Posh)." -ForegroundColor Yellow
     Write-Host "  Install it later from the Microsoft Store or https://aka.ms/getwinget to add those tools." -ForegroundColor DarkYellow
@@ -1235,7 +1172,7 @@ Write-Host ""
 
 # Profile creation or update (install for both PS5 and PS7)
 Write-Host "[1/10] Profile" -ForegroundColor Cyan
-# Derive Documents root from $PROFILE (works correctly even when Documents is in OneDrive)
+# Derive Documents root from $PROFILE.
 $docsRoot = Split-Path (Split-Path $PROFILE)
 $profileDirs = @(
     Join-Path $docsRoot "PowerShell"          # PS7 (Core)
@@ -1270,9 +1207,7 @@ foreach ($dir in $profileDirs) {
         $userProfilePath = Join-Path $dir "profile_user.ps1"
         if (-not (Test-Path $userProfilePath)) {
             $userProfileContent = @'
-### profile_user.ps1 - Personal overrides (survives Update-Profile)
-### This file is dot-sourced at the end of the main profile.
-### Uncomment or add your own customizations below.
+### Persistent personal overrides loaded by the main profile.
 
 # --- Preferred editor (used by the edit command) ---
 # $script:EditorPriority = @('code', 'notepad')
@@ -1384,9 +1319,7 @@ function Resolve-ConfiguredEditor {
             Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
             $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
             if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
-                # Filter null/empty before joining: a missing User PATH would otherwise produce
-                # a trailing ';' in $env:PATH, which Windows path parsing has historically
-                # interpreted as "include CWD" - a classic command-hijack surface during setup.
+                # Exclude empty PATH entries that Windows could interpret as the current directory.
                 Update-SessionPathFromRegistry
                 Write-Host "  $($chosen.Display) installed." -ForegroundColor Green
             }
@@ -1403,8 +1336,7 @@ function Resolve-ConfiguredEditor {
     return $resolvedEditor
 }
 
-# Editor preference (interactive prompt writes $script:EditorPriority into profile_user.ps1).
-# When the wizard already captured an editor choice we skip the prompt and use it directly.
+# Use the wizard's editor choice or collect one interactively.
 Write-Host "[2/10] Editor preference" -ForegroundColor Cyan
 $canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
@@ -1615,8 +1547,7 @@ else {
     $rgInstalled = Install-WingetPackage -Name "ripgrep" -Id "BurntSushi.ripgrep.MSVC"
 }
 
-# Windows Terminal configuration (merges font, theme, and appearance into existing settings).
-# Iterates ALL installed WT variants so Stable + Preview + Canary all receive the merge.
+# Merge font, theme, and appearance into every Windows Terminal variant.
 Write-Host "[10/10] Windows Terminal" -ForegroundColor Cyan
 $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
 if (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
@@ -1624,7 +1555,7 @@ if (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
 }
 foreach ($wtSettingsPath in $wtSettingsPaths) {
     try {
-        # Backup original (ConvertTo-Json strips JSONC comments and may reorder keys)
+        # Backup settings.json before rewriting.
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $backupPath = "$wtSettingsPath.$timestamp.bak"
         Copy-Item $wtSettingsPath $backupPath -Force
@@ -1638,7 +1569,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
             Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
         }
 
-        # Read WT settings with retry (race condition mitigation if WT is writing)
+        # Read WT settings with retry.
         $wt = $null
         for ($wtAttempt = 1; $wtAttempt -le 2; $wtAttempt++) {
             try {
@@ -1716,8 +1647,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
             else { $wt | Add-Member -NotePropertyName "theme" -NotePropertyValue $profileConfig.windowsTerminal.theme -Force }
         }
 
-        # Ensure PowerShell profiles launch with -NoLogo to suppress
-        # the copyright banner and "Loading personal and system profiles took ..." message
+        # Launch PowerShell profiles with -NoLogo.
         if ($wt.profiles.list) {
             foreach ($prof in @($wt.profiles.list)) {
                 if (-not $prof) { continue }
@@ -1763,8 +1693,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
             }
         }
 
-        # Depth 100: WT settings can have deeply nested action/command objects;
-        # depth 10 silently truncates those to their type name string and corrupts settings.
+        # Preserve deeply nested Windows Terminal action objects during serialization.
         $wtJson = $wt | ConvertTo-Json -Depth 100
         $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
         [System.IO.File]::WriteAllText($wtSettingsPath, $wtJson, $utf8NoBom)
@@ -1790,9 +1719,7 @@ elseif ($canPromptTelemetry -and $isElevatedSetup -and -not [System.Environment]
     if ($answer -match '^(?i:y|yes)$') {
         try {
             [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'true', [System.EnvironmentVariableTarget]::Machine)
-            # Ownership marker so Uninstall-Profile knows this value is ours and safe to remove.
-            # Without the marker, uninstall leaves an existing env var alone (user may have set
-            # it themselves for other tools).
+            # Record ownership so uninstall removes only the telemetry setting created here.
             try {
                 $telemetryMarker = Join-Path $configCachePath 'telemetry.owned'
                 [System.IO.File]::WriteAllText($telemetryMarker, "set by setup.ps1 at $(Get-Date -Format o)`n", [System.Text.UTF8Encoding]::new($false))
@@ -1806,9 +1733,7 @@ elseif ($canPromptTelemetry -and $isElevatedSetup -and -not [System.Environment]
     }
 }
 
-# Final summary. Exit code is driven ONLY by the core deliverable (the profile). The optional tools
-# (Oh My Posh, Nerd Font, eza, zoxide, fzf, bat, ripgrep) degrade gracefully per README, so a skipped
-# or failed optional install -- or a missing winget -- is a warning, never a non-zero exit.
+# Base the final exit code on profile installation while reporting optional tool failures as warnings.
 Write-Host ""
 $optionalOk = $themeInstalled -and $fontInstalled -and $ompInstalled -and $ezaInstalled -and $zoxideInstalled -and $fzfInstalled -and $batInstalled -and $rgInstalled
 if (-not $profileInstalled) {
@@ -1821,10 +1746,10 @@ else {
     Write-Host "Setup complete!" -ForegroundColor Green
 }
 Write-Host ""
-# AI_AGENT or CI = skip "Press Enter to restart" (agent/AI/automation context)
+# Skip the restart prompt in automated environments.
 $canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
 if ($canPromptExit) { try { $null = [Console]::KeyAvailable } catch { $canPromptExit = $false } }
-# Same restart logic as profile's Restart-TerminalToApply: prefer WT (new tab), else pwsh/powershell. Applies for both .\setup.ps1 and irm | iex.
+# Restart local and piped installs in Windows Terminal, pwsh, or powershell.
 if ($canPromptExit) {
     Write-Host "Setup applied. Restarting terminal..." -ForegroundColor Green
     Start-Sleep -Seconds 2
