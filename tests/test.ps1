@@ -1435,7 +1435,9 @@ T 'Stop-StuckProcess' $null 'destructive - kills processes'
 T 'Remove-LockedItem' $null 'destructive - kills + deletes'
 T 'http'       { http "https://httpbin.org/get" }
 T 'prettyjson' { prettyjson $jf }
-T 'hb'         { hb $tf }
+# -WhatIf stops at the ShouldProcess gate; a live call publishes $tf to a PUBLIC paste.
+# ci-functional.ps1 and rawhunt.ps1 cover the real upload on purpose.
+T 'hb'         { if (hb $tf -WhatIf) { throw 'hb published under -WhatIf' } }
 T 'timer'      { timer { Start-Sleep -Milliseconds 10 } }
 T 'watch'      $null 'infinite loop'
 

@@ -948,6 +948,11 @@ function Get-OhMyPoshExecutablePath {
         return $candidatePath
     }
 
+    # Last resort: the WindowsApps app-execution alias. MSIX/Store installs of oh-my-posh
+    # expose the CLI only through this shim - it is a 0-byte reparse point, so it is
+    # preferred last, but it launches normally and is the only entry point available.
+    if ($resolvedPath) { return $resolvedPath }
+
     return $null
 }
 
@@ -965,6 +970,65 @@ $profileConfig = $null
 $configCachePath = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
 if (!(Test-Path -Path $configCachePath)) {
     New-Item -Path $configCachePath -ItemType "directory" -Force | Out-Null
+}
+
+# Define editor choices and optional winget package IDs.
+# Defined before the wizard runs: PowerShell only registers a function once its
+# definition statement executes, so anything Start-InstallWizard calls must appear above it.
+$EditorCandidates = @(
+    @{ Cmd = 'code'; Display = 'Visual Studio Code'; WingetId = 'Microsoft.VisualStudioCode' }
+    @{ Cmd = 'nvim'; Display = 'Neovim'; WingetId = 'Neovim.Neovim' }
+    @{ Cmd = 'vim'; Display = 'Vim'; WingetId = 'vim.vim' }
+    @{ Cmd = 'msedit'; Display = 'Microsoft Edit'; WingetId = 'Microsoft.Edit' }
+    @{ Cmd = 'subl'; Display = 'Sublime Text'; WingetId = 'SublimeHQ.SublimeText.4' }
+    @{ Cmd = 'notepad++'; Display = 'Notepad++'; WingetId = 'Notepad++.Notepad++' }
+    @{ Cmd = 'notepad'; Display = 'Notepad (always available)'; WingetId = $null }
+)
+
+# Interactive editor preference prompt - returns chosen Cmd string
+function Select-PreferredEditor {
+    $defaultChoice = $null
+    Write-Host ""
+    Write-Host "  Select your preferred code editor:" -ForegroundColor Cyan
+    Write-Host ""
+    for ($i = 0; $i -lt $EditorCandidates.Count; $i++) {
+        $ed = $EditorCandidates[$i]
+        $num = $i + 1
+        $installed = [bool](Get-Command $ed.Cmd -ErrorAction SilentlyContinue)
+        if ($installed) {
+            if ($null -eq $defaultChoice) { $defaultChoice = $i }
+            Write-Host "   $num) $($ed.Display) ($($ed.Cmd)) " -NoNewline -ForegroundColor White
+            Write-Host '[installed]' -ForegroundColor Green
+        }
+        else {
+            Write-Host "   $num) $($ed.Display) ($($ed.Cmd))" -ForegroundColor DarkGray
+        }
+    }
+    if ($null -eq $defaultChoice) { $defaultChoice = 0 }
+    $defaultNum = $defaultChoice + 1
+    Write-Host ""
+    $reply = Read-Host "  Choice [$defaultNum]"
+    if ([string]::IsNullOrWhiteSpace($reply)) {
+        return $EditorCandidates[$defaultChoice].Cmd
+    }
+    $parsed = 0
+    $chosen = $null
+    if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $EditorCandidates.Count) {
+        $chosen = $EditorCandidates[$parsed - 1]
+    }
+    else {
+        Write-Host "  Invalid choice, using default." -ForegroundColor Yellow
+        return $EditorCandidates[$defaultChoice].Cmd
+    }
+    if (-not (Get-Command $chosen.Cmd -ErrorAction SilentlyContinue)) {
+        Write-Host "  '$($chosen.Cmd)' is not installed." -ForegroundColor Yellow
+        $confirm = Read-Host "  Use anyway? [y/N]"
+        if ($confirm -notmatch '^[Yy]') {
+            Write-Host "  Using default instead." -ForegroundColor Yellow
+            return $EditorCandidates[$defaultChoice].Cmd
+        }
+    }
+    return $chosen.Cmd
 }
 
 # Run the wizard before downstream installation steps consume user settings.
@@ -1064,63 +1128,6 @@ function Merge-JsonObject($base, $override) {
             $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
         }
     }
-}
-
-# Define editor choices and optional winget package IDs.
-$EditorCandidates = @(
-    @{ Cmd = 'code'; Display = 'Visual Studio Code'; WingetId = 'Microsoft.VisualStudioCode' }
-    @{ Cmd = 'nvim'; Display = 'Neovim'; WingetId = 'Neovim.Neovim' }
-    @{ Cmd = 'vim'; Display = 'Vim'; WingetId = 'vim.vim' }
-    @{ Cmd = 'msedit'; Display = 'Microsoft Edit'; WingetId = 'Microsoft.Edit' }
-    @{ Cmd = 'subl'; Display = 'Sublime Text'; WingetId = 'SublimeHQ.SublimeText.4' }
-    @{ Cmd = 'notepad++'; Display = 'Notepad++'; WingetId = 'Notepad++.Notepad++' }
-    @{ Cmd = 'notepad'; Display = 'Notepad (always available)'; WingetId = $null }
-)
-
-# Interactive editor preference prompt - returns chosen Cmd string
-function Select-PreferredEditor {
-    $defaultChoice = $null
-    Write-Host ""
-    Write-Host "  Select your preferred code editor:" -ForegroundColor Cyan
-    Write-Host ""
-    for ($i = 0; $i -lt $EditorCandidates.Count; $i++) {
-        $ed = $EditorCandidates[$i]
-        $num = $i + 1
-        $installed = [bool](Get-Command $ed.Cmd -ErrorAction SilentlyContinue)
-        if ($installed) {
-            if ($null -eq $defaultChoice) { $defaultChoice = $i }
-            Write-Host "   $num) $($ed.Display) ($($ed.Cmd)) " -NoNewline -ForegroundColor White
-            Write-Host '[installed]' -ForegroundColor Green
-        }
-        else {
-            Write-Host "   $num) $($ed.Display) ($($ed.Cmd))" -ForegroundColor DarkGray
-        }
-    }
-    if ($null -eq $defaultChoice) { $defaultChoice = 0 }
-    $defaultNum = $defaultChoice + 1
-    Write-Host ""
-    $reply = Read-Host "  Choice [$defaultNum]"
-    if ([string]::IsNullOrWhiteSpace($reply)) {
-        return $EditorCandidates[$defaultChoice].Cmd
-    }
-    $parsed = 0
-    $chosen = $null
-    if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $EditorCandidates.Count) {
-        $chosen = $EditorCandidates[$parsed - 1]
-    }
-    else {
-        Write-Host "  Invalid choice, using default." -ForegroundColor Yellow
-        return $EditorCandidates[$defaultChoice].Cmd
-    }
-    if (-not (Get-Command $chosen.Cmd -ErrorAction SilentlyContinue)) {
-        Write-Host "  '$($chosen.Cmd)' is not installed." -ForegroundColor Yellow
-        $confirm = Read-Host "  Use anyway? [y/N]"
-        if ($confirm -notmatch '^[Yy]') {
-            Write-Host "  Using default instead." -ForegroundColor Yellow
-            return $EditorCandidates[$defaultChoice].Cmd
-        }
-    }
-    return $chosen.Cmd
 }
 
 # Apply user-settings.json overrides (never downloaded, never overwritten)

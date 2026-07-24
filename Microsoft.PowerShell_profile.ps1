@@ -349,6 +349,11 @@ function Get-OhMyPoshExecutablePath {
         return $candidatePath
     }
 
+    # Last resort: the WindowsApps app-execution alias. MSIX/Store installs of oh-my-posh
+    # expose the CLI only through this shim - it is a 0-byte reparse point, so it is
+    # preferred last, but it launches normally and is the only entry point available.
+    if ($resolvedPath) { return $resolvedPath }
+
     return $null
 }
 
