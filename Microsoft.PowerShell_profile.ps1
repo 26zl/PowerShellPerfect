@@ -3200,9 +3200,13 @@ function Uninstall-Profile {
 
     Clear-OhMyPoshCaches -Quiet
 
-    # Phase 3: Uninstall PSFzf module
+    # Phase 3: PSFzf module - opt-in with -RemoveTools, since it is one of the managed tools.
     $isCiOrAgent = (($env:CI -or $env:AI_AGENT) -and -not $Force)
-    if (Get-Module -ListAvailable -Name PSFzf) {
+    $psfzfPresent = [bool](Get-Module -ListAvailable -Name PSFzf)
+    if ($psfzfPresent -and -not $RemoveTools) {
+        $preserved += 'PSFzf module (use -RemoveTools to remove)'
+    }
+    elseif ($psfzfPresent) {
         if ($isCiOrAgent) {
             Write-Warning '  Skipping PSFzf module uninstall under CI/agent environment ($env:CI/$env:AI_AGENT set). Re-run with -Force to uninstall it anyway.'
         }
