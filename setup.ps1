@@ -479,7 +479,7 @@ function Start-InstallWizard {
     Write-Host '=========================================' -ForegroundColor Magenta
     Write-Host '  PowerShellPerfect Install Wizard' -ForegroundColor Magenta
     Write-Host '=========================================' -ForegroundColor Magenta
-    Write-Host '  Pick your cosmetics. All 130+ commands and extensibility APIs ship regardless.' -ForegroundColor DarkGray
+    Write-Host '  Pick your cosmetics. All 145+ commands and extensibility APIs ship regardless.' -ForegroundColor DarkGray
     Write-Host '  Press Enter at any prompt to accept default / skip that step.' -ForegroundColor DarkGray
 
     # STEP 0: Offer the default preset before the full wizard on new runs.

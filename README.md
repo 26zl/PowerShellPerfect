@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-> A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 130+ commands (Unix-style utilities plus git, network, security, sysadmin, WSL, and docker), a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
+> A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 145+ commands (Unix-style utilities plus git, network, security, sysadmin, WSL, and docker), a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
 ```powershell
 # Review-first (recommended): prints the install-bundle SHA256 and STOPS before changing anything.
@@ -81,13 +81,13 @@ Reconfigure-Profile
 - All choices persist to `user-settings.json` so `Update-Profile` re-applies them; nothing hardcoded into the profile.
 - Summary screen at the end with "apply all?" confirmation.
 - State file enables `-Resume` if the wizard is interrupted or cancelled.
-- All 130+ commands and the extensibility system ship regardless of wizard choices; the wizard only selects cosmetics and opt-ins.
+- All 145+ commands and the extensibility system ship regardless of wizard choices; the wizard only selects cosmetics and opt-ins.
 
 ## At a glance
 
 | | |
 | --- | --- |
-| **130+ commands** | git, files, unix tools, network, security, developer, sysadmin, WSL, docker, ssh, clipboard |
+| **145+ commands** | git, files, unix tools, network, security, developer, sysadmin, WSL, docker, ssh, clipboard |
 | **Install wizard (default)** | Runs automatically when setup is invoked. Picks OMP theme, WT color scheme (7 curated), Nerd Font (6 curated), tab-bar + window chrome, terminal appearance, PSReadLine colors, background, editor, telemetry opt-out, feature toggles. `-Resume` on interrupt. See [Install Wizard](#install-wizard) for details. |
 | **Transient prompt** | Scrollback shows collapsed `$`; new input gets the full OMP prompt (opt-in feature flag) |
 | **Self-updating** | `Update-Profile` syncs profile + theme + WT config with SHA-256 verification. Survives custom `profile_user.ps1` + `user-settings.json`. |
@@ -437,7 +437,7 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | | **PowerShellPerfect** | [ChrisTitusTech](https://github.com/ChrisTitusTech/powershell-profile) | [Oh My Posh](https://ohmyposh.dev) | [Starship](https://starship.rs) |
 | --- | :---: | :---: | :---: | :---: |
 | p10k-style install wizard | ✅ | — | — | — |
-| 130+ commands (Unix-style + git/net/security/sysadmin) | ✅ | partial | — | — |
+| 145+ commands (Unix-style + git/net/security/sysadmin) | ✅ | partial | — | — |
 | Prompt theming | ✅ (via Oh My Posh) | ✅ (via Oh My Posh) | ✅ (engine) | ✅ (engine) |
 | Hash-verified self-update + full uninstall | ✅ | ✅ | n/a | n/a |
 | PS 5.1 + PS 7 (guarded forks) | ✅ | ✅ | ✅ | ✅ (cross-shell) |

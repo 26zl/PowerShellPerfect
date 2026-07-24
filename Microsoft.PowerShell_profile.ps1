@@ -2845,8 +2845,8 @@ function Test-ProfileHealth {
         }
     }
 
-    # Disk caches
-    foreach ($c in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json')) {
+    # Disk caches (OMP has no init-file cache; it renders via the binary each prompt)
+    foreach ($c in @('zoxide-init.ps1', 'theme.json', 'terminal-config.json')) {
         $p = Join-Path $cacheDir $c
         if (-not (Test-Path $p)) {
             $results += [pscustomobject]@{ Category = 'Caches'; Check = $c; Status = 'WARN'; Detail = 'missing (will regenerate on next load)' }
@@ -3727,9 +3727,7 @@ function Stop-ListeningPort {
 }
 Set-Alias -Name killports -Value Stop-ListeningPort
 
-# ==========================================================================
 # Stuck processes / locked files
-# ==========================================================================
 
 # Compile the Windows Restart Manager wrapper once per session.
 function Initialize-RestartManagerType {
@@ -6065,6 +6063,7 @@ ${g}edit${r} <file> - Open file in preferred editor.
 ${g}Update-Profile${r} - Sync profile, theme, caches, and WT settings. Use -Force to re-apply.
 ${g}Update-PowerShell${r} - Check for new PowerShell releases.
 ${g}Update-Tools${r} - Update winget-managed tools; direct/MSI Oh My Posh installs are preserved.
+${g}Invoke-ProfileWizard${r} / ${g}Reconfigure-Profile${r} - Re-run the install wizard (theme, scheme, font, features).
 ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
 ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
@@ -6216,7 +6215,7 @@ ${g}Alt+V${r} - Smart paste into prompt.
 ${c}Extensibility${r}
 ${g}Get-ProfileCommand${r} [-Category ...] [-Name ...] - Query the command registry.
 ${g}Start-ProfileTour${r} - Interactive walkthrough of every category.
-${g}Register-ProfileHook${r} -Event OnProfileLoad/PrePrompt/OnCd -Action { ... } - Hook lifecycle events.
+${g}Register-ProfileHook${r} -EventName OnProfileLoad/PrePrompt/OnCd -Action { ... } - Hook lifecycle events.
 ${g}Register-HelpSection${r} -Title ... -Lines @(...) - Add a section to this help.
 ${g}Register-ProfileCommand${r} -Name ... -Category ... [-Synopsis ...] - Add to command registry.
 ${g}Add-TrustedDirectory${r} / ${g}Remove-TrustedDirectory${r} [path] - Trust a dir so .psprc.ps1 auto-loads.
@@ -6379,6 +6378,16 @@ $script:_seedCommands = @(
     @{ Name = 'Open-WslExplorer'; Category = 'WSL'; Synopsis = 'Open distro in Windows Explorer (alias: wsl-explorer)' }
     @{ Name = 'keygen'; Category = 'SSH'; Synopsis = 'Generate ed25519 key pair' }
     @{ Name = 'rdp'; Category = 'SSH'; Synopsis = 'Launch RDP session' }
+    @{ Name = 'ssh'; Category = 'SSH'; Synopsis = 'ssh.exe wrapper with fast-fail timeout + keepalive' }
+    @{ Name = 'edit'; Category = 'Profile'; Synopsis = 'Open file in preferred editor' }
+    @{ Name = 'vt'; Category = 'Cybersec'; Synopsis = 'VirusTotal CLI (vt-cli)' }
+    @{ Name = 'dps'; Category = 'Docker'; Synopsis = 'List running containers' }
+    @{ Name = 'dpa'; Category = 'Docker'; Synopsis = 'List all containers' }
+    @{ Name = 'dimg'; Category = 'Docker'; Synopsis = 'List images' }
+    @{ Name = 'dlogs'; Category = 'Docker'; Synopsis = 'Follow container logs' }
+    @{ Name = 'dex'; Category = 'Docker'; Synopsis = 'Exec into container' }
+    @{ Name = 'dstop'; Category = 'Docker'; Synopsis = 'Stop all running containers' }
+    @{ Name = 'dprune'; Category = 'Docker'; Synopsis = 'docker system prune' }
     @{ Name = 'cpy'; Category = 'Clipboard'; Synopsis = 'Copy text to clipboard' }
     @{ Name = 'pst'; Category = 'Clipboard'; Synopsis = 'Paste from clipboard' }
     @{ Name = 'icb'; Category = 'Clipboard'; Synopsis = 'Insert clipboard into prompt' }

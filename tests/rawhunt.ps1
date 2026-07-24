@@ -477,16 +477,6 @@ T 'OMP theme file in cache' {
     if (-not $j) { throw "Theme file is not valid JSON" }
 }
 
-T 'OMP init cache format' {
-    $f = Join-Path $realCacheDir 'omp-init.ps1'
-    if (-not (Test-Path $f)) { throw "omp-init.ps1 not in cache" }
-    $size = (Get-Item $f).Length
-    if ($size -eq 0) { throw "omp-init.ps1 is 0 bytes (corrupt)" }
-    $header = Get-Content $f -First 1
-    if ($header -notmatch '^# OMP_CACHE:') { throw "Invalid header: $header" }
-    if ($header -notmatch '\|') { throw "Header missing pipe separator (no theme path): $header" }
-}
-
 T 'zoxide init cache format' {
     $f = Join-Path $realCacheDir 'zoxide-init.ps1'
     if (-not (Test-Path $f)) { throw "zoxide-init.ps1 not in cache" }
@@ -498,30 +488,6 @@ T 'zoxide init cache format' {
 
 # --- Cache corruption recovery ---
 Write-Host "`n--- Cache corruption recovery ---" -ForegroundColor Magenta
-
-T 'OMP cache: 0-byte recovery' {
-    $f = Join-Path $ws 'omp-init.ps1'
-    New-Item $f -ItemType File -Force | Out-Null
-    $size = (Get-Item $f).Length
-    if ($size -ne 0) { throw "Setup failed - file not 0 bytes" }
-    $fileSize = (Get-Item $f).Length
-    $cacheValid = $false
-    if ($fileSize -gt 0) {
-        $cacheContent = Get-Content $f -First 1
-        if ($cacheContent -eq '# OMP_CACHE: test | test') { $cacheValid = $true }
-    }
-    if ($cacheValid) { throw "0-byte file was treated as valid cache" }
-}
-
-T 'OMP cache: wrong version invalidation' {
-    $f = Join-Path $ws 'omp-init.ps1'
-    $utf8 = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($f, "# OMP_CACHE: old_version | old_path`nWrite-Host test", $utf8)
-    $header = Get-Content $f -First 1
-    $expected = '# OMP_CACHE: current_version | current_path'
-    $cacheValid = ($header -eq $expected)
-    if ($cacheValid) { throw "Wrong version was accepted as valid" }
-}
 
 T 'zoxide cache: wrong version invalidation' {
     $f = Join-Path $ws 'zoxide-init.ps1'
