@@ -3115,6 +3115,12 @@ function Uninstall-Profile {
     if ($All) { $RemoveTools = $true; $RemoveUserData = $true; $RemoveFonts = $true }
     $preserved = @()
 
+    # Record telemetry ownership up front: Phase 2 deletes the cache directory this marker lives
+    # in, so a live run would reach Phase 6 with the evidence already gone and leave the variable
+    # behind. Under -WhatIf nothing is deleted, which is why the plan alone never showed this.
+    $telemetryMarker = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\telemetry.owned'
+    $telemetryOwned = Test-Path -LiteralPath $telemetryMarker
+
     # Phase 1: Windows Terminal settings
     $wtSettingsPath = Get-WindowsTerminalSettingsPath
     if ($wtSettingsPath -and (Test-Path (Split-Path $wtSettingsPath))) {
@@ -3452,9 +3458,8 @@ function Uninstall-Profile {
 
     # Phase 6: Remove the telemetry opt-out only when the ownership marker exists.
     $isElevatedNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $telemetryMarker = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\telemetry.owned'
     if ([System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
-        if (-not (Test-Path -LiteralPath $telemetryMarker)) {
+        if (-not $telemetryOwned) {
             Write-Host '  Leaving POWERSHELL_TELEMETRY_OPTOUT alone (no ownership marker; value may belong to another tool or user setting).' -ForegroundColor DarkGray
         }
         elseif ($isElevatedNow) {
