@@ -477,8 +477,8 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             }
         }
         Invoke-CommandProbe -Command 'Update-PowerShell' -Code {
-            # Confirm Update-PowerShell exits safely when updating is unavailable.
-            Update-PowerShell *> $null
+            # -WhatIf: a live run spawns a winget MSI upgrade that replaces the running pwsh.
+            Update-PowerShell -WhatIf *> $null
         }
         Invoke-CommandProbe -Command 'Update-Tools' -Code {
             # Exercise Update-Tools only when winget is absent.

@@ -1184,8 +1184,8 @@ T 'Update-Profile'    {
     if (@($post).Count -gt @($pre).Count) { throw 'Update-Profile -WhatIf leaked temp files' }
 }
 T 'Update-PowerShell' {
-    # Safe early-exit paths: PS5 prints guidance and returns; PS7 without winget warns and returns.
-    Update-PowerShell *> $null
+    # -WhatIf: a live run spawns a winget MSI upgrade that replaces the running pwsh.
+    Update-PowerShell -WhatIf *> $null
 }
 T 'Update-Tools'      {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
