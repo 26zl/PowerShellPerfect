@@ -830,10 +830,18 @@ function Install-NerdFonts {
 
             Expand-Archive -Path $zipFilePath -DestinationPath $extractPath -Force
             $destination = (New-Object -ComObject Shell.Application).Namespace(0x14)
+            # A shell font install lands machine-wide when elevated and per-user otherwise, so
+            # presence must be checked in both stores - watching only the system one makes the
+            # wait loop below time out and report failure after a perfectly good install.
+            $fontStores = @(
+                (Join-Path $env:SystemRoot 'Fonts')
+                (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts')
+            )
             $fontFiles = Get-ChildItem -Path $extractPath -Recurse -Filter "*.ttf"
             $copied = 0
             foreach ($f in $fontFiles) {
-                if (-not (Test-Path "$env:SystemRoot\Fonts\$($f.Name)")) {
+                $fontName = $f.Name
+                if (-not @($fontStores | Where-Object { Test-Path -LiteralPath (Join-Path $_ $fontName) })) {
                     $destination.CopyHere($f.FullName, 0x10)
                     $copied++
                 }
@@ -844,7 +852,8 @@ function Install-NerdFonts {
                 $timeout = 60; $elapsed = 0
                 while ($elapsed -lt $timeout) {
                     $pending = $fontFiles | Where-Object {
-                        -not (Test-Path "$env:SystemRoot\Fonts\$($_.Name)")
+                        $fontName = $_.Name
+                        -not @($fontStores | Where-Object { Test-Path -LiteralPath (Join-Path $_ $fontName) })
                     }
                     if (-not $pending) { break }
                     Start-Sleep -Milliseconds 500

@@ -3198,7 +3198,8 @@ function Uninstall-Profile {
         }
     }
 
-    Clear-OhMyPoshCaches -Quiet
+    # Gated so -WhatIf stays read-only; the OMP cache clear deletes files of its own.
+    if ($PSCmdlet.ShouldProcess('Oh My Posh caches', 'Clear')) { Clear-OhMyPoshCaches -Quiet }
 
     # Phase 3: PSFzf module - opt-in with -RemoveTools, since it is one of the managed tools.
     $isCiOrAgent = (($env:CI -or $env:AI_AGENT) -and -not $Force)
@@ -3344,52 +3345,110 @@ function Uninstall-Profile {
     }
     elseif (-not $RemoveTools) { $preserved += 'Managed tools (use -RemoveTools to uninstall)' }
 
-    # Phase 5: Nerd Fonts (opt-in, requires admin)
+    # Phase 5: Nerd Fonts (opt-in). Shell font installs land per-user on Windows 10/11 unless
+    # elevated, so both scopes are swept; only the machine-wide one needs admin.
     if ($RemoveFonts) {
-        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if (-not $isElevated) {
-            Write-Warning '  Font removal requires an elevated (admin) terminal. Skipping.'
-        }
-        else {
-            # Derive the uninstall font filter from terminal-config.json with the install default as fallback.
-            $fontDisplayName = 'CaskaydiaCove NF'
-            try {
-                $tcPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\terminal-config.json'
-                if (Test-Path $tcPath) {
-                    $tc = Get-Content $tcPath -Raw | ConvertFrom-Json
-                    if ($tc.fontInstall.displayName) { $fontDisplayName = $tc.fontInstall.displayName }
-                }
+        # Derive the uninstall font filter from terminal-config.json with the install default as fallback.
+        $fontDisplayName = 'CaskaydiaCove NF'
+        try {
+            $tcPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\terminal-config.json'
+            if (Test-Path $tcPath) {
+                $tc = Get-Content $tcPath -Raw | ConvertFrom-Json
+                if ($tc.fontInstall.displayName) { $fontDisplayName = $tc.fontInstall.displayName }
             }
-            catch { $null = $_ }
-            $tokens = $fontDisplayName -split '\s+' | Where-Object { $_ }
-            # Match escaped font names against .ttf files without wildcard expansion.
-            $regexPattern = ($tokens | ForEach-Object { [regex]::Escape($_) }) -join '.*'
-            $fontDir = Join-Path $env:SystemRoot 'Fonts'
-            $regPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-            $fontFiles = Get-ChildItem $fontDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -eq '.ttf' -and $_.Name -match $regexPattern }
-            if ($fontFiles) {
-                foreach ($f in $fontFiles) {
-                    if ($PSCmdlet.ShouldProcess($f.Name, 'Remove font file')) {
-                        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
-                    }
-                }
-                $regEntries = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
-                if ($regEntries) {
-                    $regEntries.PSObject.Properties | Where-Object { $_.Name -match $regexPattern } | ForEach-Object {
-                        if ($PSCmdlet.ShouldProcess($_.Name, 'Remove font registry entry')) {
-                            Remove-ItemProperty -Path $regPath -Name $_.Name -Force -ErrorAction SilentlyContinue
+        }
+        catch { $null = $_ }
+        $tokens = @($fontDisplayName -split '\s+' | Where-Object { $_ })
+        # Registry entries keep the display form ("CaskaydiaCove NF Bold (TrueType)")...
+        $regNamePattern = ($tokens | ForEach-Object { [regex]::Escape($_) }) -join '.*'
+        # ...but on disk the same family is written "CaskaydiaCoveNerdFont-Bold.ttf", so the
+        # abbreviated "NF" never matches a filename. Match family prefix + the NerdFont marker,
+        # which also keeps this away from Microsoft's own Cascadia Code files.
+        $fileNamePattern = '^' + [regex]::Escape($tokens[0]) + '.*NerdFont'
+        $fontExtensions = @('.ttf', '.otf')
+
+        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $fontScopes = @(
+            @{ Name = 'per-user'; Dir = (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'); Reg = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; NeedsAdmin = $false }
+            @{ Name = 'machine-wide'; Dir = (Join-Path $env:SystemRoot 'Fonts'); Reg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'; NeedsAdmin = $true }
+        )
+
+        $fontMatches = 0
+        $removedFontCount = 0
+        $skippedMachineScope = $false
+        # Under -WhatIf nothing is actually deleted, so the orphan sweep would re-list every file
+        # the registry pass already claimed. Track them to keep the plan honest.
+        $handledFontFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($scope in $fontScopes) {
+            if ($scope.NeedsAdmin -and -not $isElevated) {
+                # Only nag about elevation when that scope actually holds matching fonts.
+                $blocked = @(Get-ChildItem $scope.Dir -ErrorAction SilentlyContinue |
+                    Where-Object { $fontExtensions -contains $_.Extension -and $_.Name -match $fileNamePattern })
+                if ($blocked) { $skippedMachineScope = $true }
+                continue
+            }
+
+            # Registry first - each entry points at the file that belongs to it.
+            $scopeDirFull = $null
+            try { $scopeDirFull = [System.IO.Path]::GetFullPath($scope.Dir).TrimEnd('\') } catch { $null = $_ }
+            $regEntries = Get-ItemProperty -Path $scope.Reg -ErrorAction SilentlyContinue
+            if ($regEntries) {
+                foreach ($prop in @($regEntries.PSObject.Properties | Where-Object { $_.Name -match $regNamePattern })) {
+                    $fontFile = [string]$prop.Value
+                    if ($fontFile) {
+                        # Machine entries often store a bare filename; per-user ones store a full path.
+                        if (-not [System.IO.Path]::IsPathRooted($fontFile)) { $fontFile = Join-Path $scope.Dir $fontFile }
+                        # Only ever touch files inside the store this scope owns. Registry values are
+                        # absolute, so without this an env-redirected run (tests, sandboxes) would
+                        # follow them straight back out to the real font directory.
+                        $inScope = $false
+                        if ($scopeDirFull) {
+                            try {
+                                $inScope = [System.IO.Path]::GetFullPath($fontFile).StartsWith(
+                                    $scopeDirFull + [System.IO.Path]::DirectorySeparatorChar,
+                                    [System.StringComparison]::OrdinalIgnoreCase)
+                            }
+                            catch { $inScope = $false }
+                        }
+                        if (-not $inScope) { continue }
+                        if ((Test-Path -LiteralPath $fontFile) -and $handledFontFiles.Add($fontFile)) {
+                            $fontMatches++
+                            if ($PSCmdlet.ShouldProcess($fontFile, 'Remove font file')) {
+                                Remove-Item -LiteralPath $fontFile -Force -ErrorAction SilentlyContinue
+                                $removedFontCount++
+                            }
                         }
                     }
+                    if ($PSCmdlet.ShouldProcess($prop.Name, "Remove $($scope.Name) font registry entry")) {
+                        Remove-ItemProperty -Path $scope.Reg -Name $prop.Name -Force -ErrorAction SilentlyContinue
+                    }
                 }
-                Write-Host "  Removed $fontDisplayName font files." -ForegroundColor Green
             }
-            else {
-                Write-Host "  No Nerd Font files matching '$fontDisplayName' found to remove." -ForegroundColor DarkGray
+
+            # Then sweep files whose registry entry was already gone.
+            foreach ($orphan in @(Get-ChildItem $scope.Dir -ErrorAction SilentlyContinue |
+                    Where-Object { $fontExtensions -contains $_.Extension -and $_.Name -match $fileNamePattern })) {
+                if (-not $handledFontFiles.Add($orphan.FullName)) { continue }
+                $fontMatches++
+                if ($PSCmdlet.ShouldProcess($orphan.FullName, 'Remove font file')) {
+                    Remove-Item -LiteralPath $orphan.FullName -Force -ErrorAction SilentlyContinue
+                    $removedFontCount++
+                }
             }
         }
+
+        if ($removedFontCount -gt 0) {
+            Write-Host "  Removed $removedFontCount $fontDisplayName font file(s)." -ForegroundColor Green
+        }
+        elseif ($fontMatches -eq 0) {
+            Write-Host "  No Nerd Font files matching '$fontDisplayName' found to remove." -ForegroundColor DarkGray
+        }
+        if ($skippedMachineScope) {
+            Write-Warning '  Machine-wide font files need an elevated (admin) terminal. Re-run elevated to remove them.'
+            $preserved += 'Nerd Fonts installed machine-wide (re-run elevated with -RemoveFonts)'
+        }
     }
-    else { $preserved += 'Nerd Fonts (use -RemoveFonts to remove, requires admin)' }
+    else { $preserved += 'Nerd Fonts (use -RemoveFonts to remove)' }
 
     # Phase 6: Remove the telemetry opt-out only when the ownership marker exists.
     $isElevatedNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

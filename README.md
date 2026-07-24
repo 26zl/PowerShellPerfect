@@ -152,7 +152,7 @@ Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete
 Uninstall-Profile -All -Force  # Also uninstall PSFzf/managed tools when CI or agent guards are active
 ```
 
-Optional switches: `-RemoveTools` (winget-managed tools plus the PSFzf module, and direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (`profile_user.ps1`, `user-settings.json`, and your `plugins/`), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes. A plain `Uninstall-Profile` preserves `user-settings.json`, `profile_user.ps1`, and your `plugins/` — only `-RemoveUserData`/`-All` delete them.
+Optional switches: `-RemoveTools` (winget-managed tools plus the PSFzf module, and direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (`profile_user.ps1`, `user-settings.json`, and your `plugins/`), `-RemoveFonts` (Nerd Fonts from both the per-user and machine-wide font stores; the machine-wide store needs admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes. A plain `Uninstall-Profile` preserves `user-settings.json`, `profile_user.ps1`, and your `plugins/` — only `-RemoveUserData`/`-All` delete them.
 
 ## Customization
 
