@@ -286,7 +286,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `Clear-Cache` [-IncludeSystemCaches] | Clear user temp/browser caches (optionally system dirs) |
 | `Clear-ProfileCache` | Reset profile caches plus OMP internal caches |
 | `duration` | Show elapsed time of the last executed command |
-| `Test-ProfileHealth` / `psp-doctor` | Diagnose install (tools, caches, fonts, PATH, modules) |
+| `Test-ProfileHealth [-PassThru]` / `psp-doctor` | Diagnose install (tools, caches, fonts, PATH, modules); `-PassThru` also emits the result rows for scripting |
 | `winutil [-ExpectedSha256 <hash>]` / `winutil -Force` | Fetch [Chris Titus WinUtil](https://github.com/ChrisTitusTech/winutil). Safe-by-default: prints source URL and SHA256, then stops. Re-run with `-ExpectedSha256 '<hash>'` (hash-pinned) or `-Force` (trust without verification) to stage execution, and PowerShell still asks for a high-impact confirmation before launch. |
 | `harden` | Open [Harden Windows Security](https://github.com/HotCakeX/Harden-Windows-Security) with an explicit confirmation prompt before launch. |
 

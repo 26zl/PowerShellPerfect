@@ -1974,7 +1974,7 @@ function df {
 # Find and replace text in a file
 function sed($file, $find, $replace) {
     if (-not $file -or -not (Test-Path -LiteralPath $file)) {
-        Write-Warning "File not found: $file"
+        Write-Error "File not found: $file"
         return
     }
     if ($null -eq $find -or $find -eq '') { Write-Error "Usage: sed <file> <find> <replace>"; return }
@@ -2206,11 +2206,12 @@ if (Get-Command eza -ErrorAction SilentlyContinue) {
     else {
         Remove-Item Alias:\ls -Force -ErrorAction SilentlyContinue
     }
-    # ls/la/ll/lt: directory listing via eza (icons, git status, tree)
-    function ls { eza --icons @args }
-    function la { eza -a --icons @args }
-    function ll { eza -la --icons --git @args }
-    function lt { eza --tree --icons --level=2 @args }
+    # ls/la/ll/lt: directory listing via eza (icons, git status, tree). Pass the icon setting as
+    # --icons=WHEN: eza takes an optional value there, so a bare --icons swallows a following path.
+    function ls { eza --icons=auto @args }
+    function la { eza -a --icons=auto @args }
+    function ll { eza -la --icons=auto --git @args }
+    function lt { eza --tree --icons=auto --level=2 @args }
 }
 else {
     if ($isInteractive) { Write-Warning "eza not found. Install it with: winget install -e --id eza-community.eza" }
@@ -2765,7 +2766,7 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
         $unc = Resolve-WslUncPath -Distro $Distro -Path $Path
         if (-not $unc) { return }
         if (Get-Command eza -ErrorAction SilentlyContinue) {
-            $ezaArgs = @('--tree', "--level=$Depth", '--icons', '--git-ignore')
+            $ezaArgs = @('--tree', "--level=$Depth", '--icons=auto', '--git-ignore')
             if ($All) { $ezaArgs += '-a' }
             & eza @ezaArgs $unc
         }
@@ -2835,7 +2836,10 @@ function reload { . $PROFILE }
 # Diagnose tools, caches, fonts, PATH, modules, and plugins with OK, WARN, or FAIL results.
 function Test-ProfileHealth {
     [CmdletBinding()]
-    param()
+    param(
+        # Emit the result objects for scripting; the rendered report prints either way.
+        [switch]$PassThru
+    )
 
     $results = @()
 
@@ -2891,38 +2895,65 @@ function Test-ProfileHealth {
         $results += [pscustomobject]@{ Category = 'Config'; Check = 'user-settings.json'; Status = 'WARN'; Detail = 'missing (no overrides applied)' }
     }
 
-    # Font from terminal-config.json.fontInstall.displayName
-    $tcPath = Join-Path $cacheDir 'terminal-config.json'
-    if (Test-Path $tcPath) {
-        try {
-            $tc = Get-Content $tcPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            $fontName = if ($tc.fontInstall) { $tc.fontInstall.displayName } else { $null }
-            if ($fontName) {
-                # Report unavailable System.Drawing as WARN on non-Windows platforms.
-                if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
-                    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
-                }
-                if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
-                    $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'WARN'; Detail = 'System.Drawing unavailable on this host; cannot verify' }
-                }
-                else {
-                    $installed = $false
-                    try {
-                        $fc = New-Object System.Drawing.Text.InstalledFontCollection
-                        $installed = $fc.Families.Name -contains $fontName
-                        $fc.Dispose()
-                    }
-                    catch { $null = $_ }
-                    if ($installed) {
-                        $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'OK'; Detail = 'installed' }
-                    }
-                    else {
-                        $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'FAIL'; Detail = 'not installed (run setup.ps1 -Wizard or Update-Profile)' }
-                    }
-                }
+    # Check the font this install actually uses: a wizard choice in user-settings.json
+    # overrides the shipped terminal-config.json default.
+    $fontName = $null
+    try {
+        if (Test-Path $us) {
+            $userCfg = Get-Content $us -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($userCfg.defaults -and $userCfg.defaults.font -and $userCfg.defaults.font.face) {
+                $fontName = [string]$userCfg.defaults.font.face
             }
         }
-        catch { $null = $_ }
+    }
+    catch { $null = $_ }
+    if (-not $fontName) {
+        $tcPath = Join-Path $cacheDir 'terminal-config.json'
+        if (Test-Path $tcPath) {
+            try {
+                $tc = Get-Content $tcPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if ($tc.fontInstall) { $fontName = [string]$tc.fontInstall.displayName }
+            }
+            catch { $null = $_ }
+        }
+    }
+    if ($fontName) {
+        # Report unavailable System.Drawing as WARN on non-Windows platforms.
+        if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        }
+        if (-not ('System.Drawing.Text.InstalledFontCollection' -as [type])) {
+            $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'WARN'; Detail = 'System.Drawing unavailable on this host; cannot verify' }
+        }
+        else {
+            $installed = $false
+            try {
+                $fc = New-Object System.Drawing.Text.InstalledFontCollection
+                $installed = $fc.Families.Name -contains $fontName
+                $fc.Dispose()
+            }
+            catch { $null = $_ }
+            # GDI+ caches the family list per process, so a font installed after this session
+            # started reads as missing; the font registry is the authoritative fallback.
+            if (-not $installed) {
+                foreach ($hive in @('HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts', 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts')) {
+                    try {
+                        $fontKey = Get-ItemProperty -Path $hive -ErrorAction Stop
+                        if (@($fontKey.PSObject.Properties.Name | Where-Object { $_ -like "$fontName*" }).Count -gt 0) {
+                            $installed = $true
+                            break
+                        }
+                    }
+                    catch { $null = $_ }
+                }
+            }
+            if ($installed) {
+                $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'OK'; Detail = 'installed' }
+            }
+            else {
+                $results += [pscustomobject]@{ Category = 'Fonts'; Check = $fontName; Status = 'FAIL'; Detail = 'not installed (run setup.ps1 -Wizard or Update-Profile)' }
+            }
+        }
     }
 
     # PATH - WindowsApps (winget shims location)
@@ -2979,8 +3010,9 @@ function Test-ProfileHealth {
     $summaryColor = if ($failCount -gt 0) { 'Red' } elseif ($warnCount -gt 0) { 'Yellow' } else { 'Green' }
     Write-Host ("Summary: {0} OK, {1} WARN, {2} FAIL" -f $okCount, $warnCount, $failCount) -ForegroundColor $summaryColor
 
-    # Return the objects too so scripts can query: Test-ProfileHealth | Where Status -eq 'FAIL'
-    $results
+    # Emit objects only on request: a bare call would otherwise render the table a second
+    # time through the default formatter. Scripts use -PassThru to query the rows.
+    if ($PassThru) { $results }
 }
 Set-Alias -Name psp-doctor -Value Test-ProfileHealth -Scope Script
 
@@ -3354,13 +3386,24 @@ function Uninstall-Profile {
     # Phase 5: Nerd Fonts (opt-in). Shell font installs land per-user on Windows 10/11 unless
     # elevated, so both scopes are swept; only the machine-wide one needs admin.
     if ($RemoveFonts) {
-        # Derive the uninstall font filter from terminal-config.json with the install default as fallback.
+        # Derive the uninstall font filter from what setup actually installed: a wizard font choice
+        # in user-settings.json wins over terminal-config.json, which wins over the install default.
         $fontDisplayName = 'CaskaydiaCove NF'
         try {
             $tcPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\terminal-config.json'
             if (Test-Path $tcPath) {
                 $tc = Get-Content $tcPath -Raw | ConvertFrom-Json
                 if ($tc.fontInstall.displayName) { $fontDisplayName = $tc.fontInstall.displayName }
+            }
+        }
+        catch { $null = $_ }
+        try {
+            $usPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\user-settings.json'
+            if (Test-Path $usPath) {
+                $usCfg = Get-Content $usPath -Raw | ConvertFrom-Json
+                if ($usCfg.defaults -and $usCfg.defaults.font -and $usCfg.defaults.font.face) {
+                    $fontDisplayName = [string]$usCfg.defaults.font.face
+                }
             }
         }
         catch { $null = $_ }
@@ -5856,7 +5899,8 @@ function Start-ProfileTour {
     $null = Read-Host 'Ready'
     foreach ($cat in $categories) {
         Write-Host ''
-        Write-Host ("-- {0} ({1} commands) --" -f $cat.Name, $cat.Count) -ForegroundColor Cyan
+        $countLabel = if ($cat.Count -eq 1) { 'command' } else { 'commands' }
+        Write-Host ("-- {0} ({1} {2}) --" -f $cat.Name, $cat.Count, $countLabel) -ForegroundColor Cyan
         foreach ($entry in ($cat.Group | Sort-Object Name | Select-Object -First 8)) {
             $synopsis = if ($entry.Synopsis) { $entry.Synopsis } else { '' }
             Write-Host ("  {0,-22} {1}" -f $entry.Name, $synopsis) -ForegroundColor Gray
@@ -6142,7 +6186,7 @@ ${g}reload${r} - Reload the PowerShell profile.
 ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system temp caches.
 ${g}duration${r} - Elapsed time of the last command.
-${g}Test-ProfileHealth${r} / ${g}psp-doctor${r} - Diagnose install: tools, caches, fonts, PATH.
+${g}Test-ProfileHealth${r} [-PassThru] / ${g}psp-doctor${r} - Diagnose install: tools, caches, fonts, PATH. -PassThru also returns the rows for scripting.
 ${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults, -Force to uninstall PSFzf/tools even under CI/agent env vars.
 
 ${c}Git${r}

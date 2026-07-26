@@ -689,12 +689,15 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             if ([string]::IsNullOrWhiteSpace($out)) { throw 'duration produced no output' }
         }
         Invoke-CommandProbe -Command 'Test-ProfileHealth' -Code {
-            $report = Test-ProfileHealth
-            if (-not $report) { throw 'Test-ProfileHealth returned no rows' }
+            $report = Test-ProfileHealth -PassThru
+            if (-not $report) { throw 'Test-ProfileHealth -PassThru returned no rows' }
             $expected = @('Tools', 'Caches', 'Config', 'PATH', 'Modules')
             foreach ($cat in $expected) {
                 if (-not ($report | Where-Object Category -eq $cat)) { throw "Test-ProfileHealth missing category: $cat" }
             }
+            # A bare call must stay silent on the pipeline or the rendered table prints twice.
+            $bare = Test-ProfileHealth 6>$null
+            if ($bare) { throw 'Test-ProfileHealth emitted objects without -PassThru' }
         }
         Invoke-CommandProbe -Command 'psp-doctor' -Code {
             $alias = Get-Alias psp-doctor -ErrorAction SilentlyContinue

@@ -1276,8 +1276,11 @@ T 'duration' {
     if ([string]::IsNullOrWhiteSpace($out)) { throw 'duration produced no output' }
 }
 T 'Test-ProfileHealth' {
-    $report = Test-ProfileHealth
-    if (-not $report) { throw 'Test-ProfileHealth returned no rows' }
+    $report = Test-ProfileHealth -PassThru
+    if (-not $report) { throw 'Test-ProfileHealth -PassThru returned no rows' }
+    # A bare call must stay silent on the pipeline or the rendered table prints twice.
+    $bare = Test-ProfileHealth 6>$null
+    if ($bare) { throw 'Test-ProfileHealth emitted objects without -PassThru' }
 }
 T 'psp-doctor' {
     $alias = Get-Alias psp-doctor -ErrorAction SilentlyContinue

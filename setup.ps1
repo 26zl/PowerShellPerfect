@@ -216,14 +216,14 @@ $script:CuratedSchemes = @(
             brightBlack = '#002b36'; brightRed = '#cb4b16'; brightGreen = '#586e75'; brightYellow = '#657b83'; brightBlue = '#839496'; brightPurple = '#6c71c4'; brightCyan = '#93a1a1'; brightWhite = '#fdf6e3' } }
 )
 
-# Map curated Nerd Font release assets to their Windows display names.
+# Map curated Nerd Font release assets to their Windows display names; Name is the menu label Select-WizardItem renders and matches on.
 $script:CuratedFonts = @(
-    @{ Asset = 'CascadiaCode';   DisplayName = 'CaskaydiaCove NF';    Desc = 'Microsoft Cascadia + icons (default)' }
-    @{ Asset = 'JetBrainsMono';  DisplayName = 'JetBrainsMono NF';    Desc = 'JetBrains flagship, tight + readable' }
-    @{ Asset = 'FiraCode';       DisplayName = 'FiraCode NF';         Desc = 'Popular ligature font' }
-    @{ Asset = 'Meslo';          DisplayName = 'MesloLGM NF';         Desc = 'p10k default, excellent rendering' }
-    @{ Asset = 'Hack';           DisplayName = 'Hack NF';             Desc = 'Simple + workhorse' }
-    @{ Asset = 'Iosevka';        DisplayName = 'Iosevka NF';          Desc = 'Narrow monospace, space-efficient' }
+    @{ Name = 'CascadiaCode';   Asset = 'CascadiaCode';   DisplayName = 'CaskaydiaCove NF';    Desc = 'Microsoft Cascadia + icons (default)' }
+    @{ Name = 'JetBrainsMono';  Asset = 'JetBrainsMono';  DisplayName = 'JetBrainsMono NF';    Desc = 'JetBrains flagship, tight + readable' }
+    @{ Name = 'FiraCode';       Asset = 'FiraCode';       DisplayName = 'FiraCode NF';         Desc = 'Popular ligature font' }
+    @{ Name = 'Meslo';          Asset = 'Meslo';          DisplayName = 'MesloLGM NF';         Desc = 'p10k default, excellent rendering' }
+    @{ Name = 'Hack';           Asset = 'Hack';           DisplayName = 'Hack NF';             Desc = 'Simple + workhorse' }
+    @{ Name = 'Iosevka';        Asset = 'Iosevka';        DisplayName = 'Iosevka NF';          Desc = 'Narrow monospace, space-efficient' }
 )
 
 # Return one wizard choice from stdin, Out-GridView, or fzf.
@@ -232,10 +232,12 @@ function Select-WizardItem {
         [Parameter(Mandatory)][string]$Title,
         [Parameter(Mandatory)][array]$Items,      # array of hashtables with .Name and .Desc
         [string]$DefaultName,                      # pre-selected (Enter to accept)
+        [string]$Note,                             # explanation line printed under the title
         [switch]$AllowSkip                         # Enter with no default = skip
     )
     Write-Host ''
     Write-Host ("-- {0} --" -f $Title) -ForegroundColor Cyan
+    if ($Note) { Write-Host $Note }
     for ($i = 0; $i -lt $Items.Count; $i++) {
         $marker = if ($DefaultName -and $Items[$i].Name -eq $DefaultName) { '>' } else { ' ' }
         $desc = if ($Items[$i].Desc) { " - $($Items[$i].Desc)" } else { '' }
@@ -302,6 +304,12 @@ function Save-WizardChoices {
     }
     else { [PSCustomObject]@{} }
     if ($null -eq $s) { $s = [PSCustomObject]@{} }
+
+    # The wizard writes this file before the install steps lay down their template, which is then
+    # skipped as "already exists", so carry the header that explains what the file is for.
+    if (-not $s.PSObject.Properties['_comment']) {
+        $s | Add-Member -NotePropertyName '_comment' -NotePropertyValue 'User overrides for terminal, theme, and profile behavior. Only add keys you want to override.' -Force
+    }
 
     # theme (OMP)
     if ($Choices.Theme) {
@@ -544,9 +552,6 @@ function Start-InstallWizard {
 
     # STEP 4: tab-bar color
     if ('TabBar' -notin $choices.CompletedSteps) {
-        Write-Host ''
-        Write-Host '-- Tab bar color --' -ForegroundColor Cyan
-        Write-Host '  The strip at the top where tabs live. Default matches chosen color scheme background.'
         $schemeBg = if ($choices.Scheme) { $choices.Scheme.background } else { '#1a1b26' }
         $tabPresets = @(
             @{ Name = "Scheme match ($schemeBg)"; Desc = 'Seamless - tab bar same as terminal background'; Value = $schemeBg }
@@ -555,7 +560,8 @@ function Start-InstallWizard {
             @{ Name = 'Custom hex'; Desc = 'Type your own #rrggbb'; Value = 'custom' }
             @{ Name = 'Skip'; Desc = 'Leave WT default'; Value = $null }
         )
-        $pick = Select-WizardItem -Title 'Tab bar color' -Items $tabPresets -DefaultName "Scheme match ($schemeBg)"
+        $tabNote = '  The strip at the top where tabs live. Default matches chosen color scheme background.'
+        $pick = Select-WizardItem -Title 'Tab bar color' -Items $tabPresets -DefaultName "Scheme match ($schemeBg)" -Note $tabNote
         if ($pick -and $pick.Value -eq 'custom') {
             $hex = Read-Host '  Hex (e.g. #1e1e2e)'
             if ($hex -match '^#[0-9A-Fa-f]{6}$') { $choices.TabBar = $hex }
@@ -623,14 +629,12 @@ function Start-InstallWizard {
 
     # STEP 6: Keep, derive, or skip PSReadLine syntax colors.
     if ('PSReadLine' -notin $choices.CompletedSteps) {
-        Write-Host ''
-        Write-Host '-- PSReadLine syntax colors --' -ForegroundColor Cyan
         $rlOptions = @(
             @{ Name = 'theme.json default'; Desc = 'Keep the shipped palette'; Value = 'default' }
             @{ Name = 'Derive from color scheme'; Desc = 'Map scheme ANSI roles to syntax (Command, String, ...)'; Value = 'scheme' }
             @{ Name = 'Skip'; Desc = 'No override; edit user-settings.json later'; Value = $null }
         )
-        $pick = Select-WizardItem -Title 'PSReadLine colors' -Items $rlOptions -DefaultName 'theme.json default'
+        $pick = Select-WizardItem -Title 'PSReadLine syntax colors' -Items $rlOptions -DefaultName 'theme.json default'
         if ($pick -and $pick.Value) { $choices.PSReadLine = $pick.Value }
         $choices.CompletedSteps += 'PSReadLine'
         Save-State
@@ -758,7 +762,7 @@ if (-not $LocalRepo) {
 # Report restrictive execution policies without changing them.
 $currentUserPolicy = Get-ExecutionPolicy -Scope CurrentUser
 if ($currentUserPolicy -eq 'AllSigned') {
-    $canPromptPolicy = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
+    $canPromptPolicy = [Environment]::UserInteractive -and -not $isCiHost -and -not [bool]$env:AI_AGENT
     if ($canPromptPolicy) { try { $null = [Console]::KeyAvailable } catch { $canPromptPolicy = $false } }
     if ($canPromptPolicy) {
         Write-Host "CurrentUser execution policy is 'AllSigned' (stricter than RemoteSigned)." -ForegroundColor Yellow
@@ -1125,7 +1129,12 @@ catch {
 }
 
 # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
-function Merge-JsonObject($base, $override) {
+function Merge-JsonObject {
+    param(
+        $base,
+        $override
+    )
+
     if ($null -eq $override) { return }
     if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
     foreach ($prop in $override.PSObject.Properties) {
@@ -1354,7 +1363,7 @@ function Resolve-ConfiguredEditor {
 
 # Use the wizard's editor choice or collect one interactively.
 Write-Host "[2/10] Editor preference" -ForegroundColor Cyan
-$canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
+$canPromptEditor = [Environment]::UserInteractive -and -not $isCiHost -and -not [bool]$env:AI_AGENT
 if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
 if ($script:WizardEditor) {
     $chosenEditor = [string]$script:WizardEditor
@@ -1722,7 +1731,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
 }
 
 # Optional PowerShell telemetry opt-out (explicit consent, machine-wide env var, requires admin).
-$canPromptTelemetry = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
+$canPromptTelemetry = [Environment]::UserInteractive -and -not $isCiHost -and -not [bool]$env:AI_AGENT
 if ($canPromptTelemetry) { try { $null = [Console]::KeyAvailable } catch { $canPromptTelemetry = $false } }
 $isElevatedSetup = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($script:WizardTelemetryHandled) {
@@ -1762,8 +1771,8 @@ else {
     Write-Host "Setup complete!" -ForegroundColor Green
 }
 Write-Host ""
-# Skip the restart prompt in automated environments.
-$canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT
+# Skip the restart prompt in automated environments, including -CiMode runs driven by the test suite.
+$canPromptExit = [Environment]::UserInteractive -and -not $isCiHost -and -not [bool]$env:AI_AGENT
 if ($canPromptExit) { try { $null = [Console]::KeyAvailable } catch { $canPromptExit = $false } }
 # Restart local and piped installs in Windows Terminal, pwsh, or powershell.
 if ($canPromptExit) {

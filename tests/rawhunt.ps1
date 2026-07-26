@@ -40,6 +40,18 @@ function Test-Throws {
     if (-not $threw) { throw $Message }
 }
 
+# Set-Clipboard lands asynchronously on Windows, so poll briefly before reading it back.
+function Get-SettledClipboard {
+    param([Parameter(Mandatory)][int]$ExpectedLength)
+
+    for ($i = 0; $i -lt 20; $i++) {
+        $text = (Get-Clipboard) -join ''
+        if ($text.Length -eq $ExpectedLength) { return $text }
+        Start-Sleep -Milliseconds 50
+    }
+    return ((Get-Clipboard) -join '')
+}
+
 Write-Host "`n==================== RAW Bug Hunt ====================" -ForegroundColor Cyan
 
 # Resolve repoRoot as the parent of tests/.
@@ -292,14 +304,19 @@ T 'checksum (mismatch)' {
     checksum $tf "0000000000000000000000000000000000000000000000000000000000000000"
 }
 
+# genpass keeps the plaintext off the success stream on purpose, so verify via the clipboard.
 T 'genpass (default)' {
     $r = genpass
-    if (-not $r -or $r.Length -ne 20) { throw "invalid password length: $($r.Length)" }
+    if ($r) { throw 'genpass must not emit the password on the success stream' }
+    $clip = Get-SettledClipboard -ExpectedLength 20
+    if ($clip.Length -ne 20) { throw "invalid clipboard password length: $($clip.Length)" }
 }
 
 T 'genpass (custom length)' {
     $r = genpass 50
-    if (-not $r -or $r.Length -ne 50) { throw "invalid password length: $($r.Length)" }
+    if ($r) { throw 'genpass must not emit the password on the success stream' }
+    $clip = Get-SettledClipboard -ExpectedLength 50
+    if ($clip.Length -ne 50) { throw "invalid clipboard password length: $($clip.Length)" }
 }
 
 T 'b64 encode' {
@@ -1137,7 +1154,9 @@ T 'lazyg (no args)' {
 
 T 'genpass (min length)' {
     $r = genpass 1
-    if ($r.Length -ne 1) { throw "expected length 1, got $($r.Length)" }
+    if ($r) { throw 'genpass must not emit the password on the success stream' }
+    $clip = Get-SettledClipboard -ExpectedLength 1
+    if ($clip.Length -ne 1) { throw "expected clipboard length 1, got $($clip.Length)" }
 }
 
 T 'epoch (negative)' {

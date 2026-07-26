@@ -335,11 +335,11 @@ jobs:
           }
           Write-Host "OK: $($schemes.Count) curated schemes validated" -ForegroundColor Green
 
-          # Fonts: expect 6 entries, each with Asset, DisplayName, Desc
+          # Fonts: expect 6 entries, each with Name (wizard menu label), Asset, DisplayName, Desc
           $fonts = $found['CuratedFonts']
           if (-not $fonts) { Write-Host "FAIL: CuratedFonts not found" -ForegroundColor Red; exit 1 }
           if ($fonts.Count -ne 6) { Write-Host "FAIL: expected 6 curated fonts, got $($fonts.Count)" -ForegroundColor Red; $errors++ }
-          $fontReq = @('Asset','DisplayName','Desc')
+          $fontReq = @('Name','Asset','DisplayName','Desc')
           foreach ($f in $fonts) {
             foreach ($k in $fontReq) {
               if (-not $f.ContainsKey($k) -or [string]::IsNullOrWhiteSpace([string]$f[$k])) {
