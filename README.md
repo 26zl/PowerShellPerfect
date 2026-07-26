@@ -3,10 +3,10 @@
 [![CI](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml)
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Status](https://img.shields.io/badge/status-active%20development-orange)](https://github.com/26zl/PowerShellPerfect/commits/main)
+[![Status](https://img.shields.io/badge/status-actively%20maintained-brightgreen)](https://github.com/26zl/PowerShellPerfect/commits/main)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> ⚠️ **Under active development.** Interfaces, defaults, and wizard steps may change between commits. Pin a specific commit in `-ExpectedSha256` if you need reproducibility. Bug reports and PRs are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+> **Stability.** The command surface, install flow, and extension points are settled, and new work stays additive where it can. Every push and pull request runs PSScriptAnalyzer, a Windows PowerShell 5.1 + PowerShell 7 parse and load check, a sandboxed install/uninstall cycle, and a functional command suite. Pin `-ExpectedSha256` when you want byte-identical installs. Bug reports and PRs are welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 > A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles — then ships 145+ commands (Unix-style utilities plus git, network, security, sysadmin, WSL, and docker), a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
 ```powershell
