@@ -71,7 +71,7 @@ Reconfigure-Profile
 4. **Nerd Font** — Caskaydia, JetBrainsMono, FiraCode, Meslo, Hack, or Iosevka. Fetches latest release tag from [ryanoasis/nerd-fonts](https://github.com/ryanoasis/nerd-fonts/releases) automatically.
 5. **Tab bar color + window chrome** — presets (scheme-match, pure black, custom hex) + `applicationTheme` dark/light.
 6. **Terminal appearance** — opacity, `useAcrylic`, font size, cursor shape, padding, scrollbar state, history size. Each prompt keeps the current default on Enter.
-7. **PSReadLine colors** — default / derive from chosen scheme / skip.
+7. **PSReadLine colors** — derive from chosen scheme (default) / shipped palette / skip.
 8. **Background image** — optional path + opacity (0.05–0.50). Skipped by default.
 9. **Editor preference** — VS Code, Notepad++, Neovim, Vim, Notepad, or a custom exe. Used by `edit`, `ep`, `hosts`, etc.
 10. **Telemetry opt-out + feature toggles** — `psfzf`, `predictions`, `startupMessage`, `perDirProfiles`, `commandOverrides` — y/n per item with sensible defaults.
@@ -160,6 +160,7 @@ Four extension points survive updates. From simplest to most powerful:
 
 - **`user-settings.json`** (`%LOCALAPPDATA%\PowerShellProfile\`) - JSON overrides. Keys:
   - `theme`, `windowsTerminal`, `defaults`, `keybindings` - terminal and OMP theme
+  - `windowsTerminal.manage` - set to `false` when another tool owns Windows Terminal's `settings.json` (a dotfiles repo, for example). `setup.ps1`, `Update-Profile`, `Set-TerminalBackground` and `Uninstall-Profile` then leave that file alone, and `psp-doctor` reports who owns it. A symlinked `settings.json` is always written in place, so the link survives updates.
   - `defaults.backgroundImage` / `backgroundImageOpacity` / `backgroundImageStretchMode` / `backgroundImageAlignment` - Windows Terminal background image
   - `features` - toggle heavy/optional behavior: `psfzf`, `predictions`, `startupMessage`, `perDirProfiles` (all `true` by default), `transientPrompt` (collapses previous prompt on Enter; default `false`, customize via `$script:PSP.TransientPrompt = { ... }` in `profile_user.ps1`), `updateCheck` (notifies once a week when main has advanced past the applied commit; default `false` so `irm | iex` in scripts does not trigger a surprise network call)
   - `commandOverrides` - redefine any command without editing source: `{ "gs": "git status --short" }`. Opt-in: set `features.commandOverrides = true` in the same file. Default off because it compiles JSON strings into executable scriptblocks.
@@ -453,6 +454,7 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. (The recommended one-liner runs an in-memory scriptblock, which isn't subject to the script-file execution policy.) |
 | Prompt shows boxes / missing glyphs | The terminal font isn't a Nerd Font. Set your Windows Terminal profile font to the one setup installed (e.g. *CaskaydiaCove Nerd Font*) and restart WT. |
 | `oh-my-posh` not found right after install | Reopen the terminal (PATH refresh) or run `Update-SessionPathFromRegistry`; confirm with `psp-doctor`. |
+| Windows Terminal settings keep changing back | Another tool also writes `settings.json`. Pick one owner: set `windowsTerminal.manage` to `false` in `user-settings.json` to let the other tool have it, or stop the other tool. `psp-doctor` shows whether the file is a symlink and who manages it. |
 | Turned a feature off in the wizard but it still loads | Check the `features` block in `user-settings.json`, then restart PowerShell. |
 | Something feels off | Run `psp-doctor` (alias for `Test-ProfileHealth`): OK/WARN/FAIL per check across tools, caches, fonts, PATH, and modules. |
 

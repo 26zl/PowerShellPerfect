@@ -634,7 +634,7 @@ function Start-InstallWizard {
             @{ Name = 'Derive from color scheme'; Desc = 'Map scheme ANSI roles to syntax (Command, String, ...)'; Value = 'scheme' }
             @{ Name = 'Skip'; Desc = 'No override; edit user-settings.json later'; Value = $null }
         )
-        $pick = Select-WizardItem -Title 'PSReadLine syntax colors' -Items $rlOptions -DefaultName 'theme.json default'
+        $pick = Select-WizardItem -Title 'PSReadLine syntax colors' -Items $rlOptions -DefaultName 'Derive from color scheme'
         if ($pick -and $pick.Value) { $choices.PSReadLine = $pick.Value }
         $choices.CompletedSteps += 'PSReadLine'
         Save-State
@@ -1149,10 +1149,13 @@ function Merge-JsonObject {
 }
 
 # Apply user-settings.json overrides (never downloaded, never overwritten)
+$script:WtManaged = $true
 $userSettingsPath = Join-Path $configCachePath "user-settings.json"
 if (Test-Path $userSettingsPath) {
     try {
         $userSettings = Get-Content $userSettingsPath -Raw | ConvertFrom-Json
+        # windowsTerminal.manage = false hands settings.json to another tool, such as a dotfiles repo.
+        if ($userSettings.windowsTerminal -and $userSettings.windowsTerminal.PSObject.Properties['manage'] -and $userSettings.windowsTerminal.manage -eq $false) { $script:WtManaged = $false }
         if ($profileConfig -and $userSettings.theme) {
             if (-not $profileConfig.theme) {
                 $profileConfig | Add-Member -NotePropertyName "theme" -NotePropertyValue ([PSCustomObject]@{}) -Force
@@ -1272,7 +1275,8 @@ if (-not (Test-Path $userSettingsTemplate)) {
     "_comment": "User overrides for terminal, theme, and profile behavior. Only add keys you want to override.",
     "_examples": {
         "theme": { "name": "catppuccin", "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/catppuccin.omp.json" },
-        "windowsTerminal": { "colorScheme": "One Half Dark", "cursorColor": "#ffffff" },
+        "windowsTerminal": { "manage": true, "colorScheme": "One Half Dark", "cursorColor": "#ffffff" },
+        "_manage_note": "set windowsTerminal.manage to false when another tool (for example a dotfiles repo) owns Windows Terminal settings.json; the profile then leaves that file alone",
         "defaults": {
             "opacity": 90,
             "font": { "size": 14 },
@@ -1575,7 +1579,11 @@ else {
 # Merge font, theme, and appearance into every Windows Terminal variant.
 Write-Host "[10/10] Windows Terminal" -ForegroundColor Cyan
 $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
-if (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
+if (-not $script:WtManaged) {
+    Write-Host "  Skipped: user-settings.json sets windowsTerminal.manage = false, so settings.json is left to the tool that owns it." -ForegroundColor DarkGray
+    $wtSettingsPaths = @()
+}
+elseif (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
     Write-Host "  Windows Terminal settings not found (skipped)." -ForegroundColor Yellow
 }
 foreach ($wtSettingsPath in $wtSettingsPaths) {
