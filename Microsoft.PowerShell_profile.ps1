@@ -208,9 +208,14 @@ function Get-Utf8FileText {
     [System.IO.File]::ReadAllText($Path)
 }
 
-# Write UTF-8 without BOM through a sibling temp file before replacing the target.
+# Write UTF-8 without BOM through a sibling temp file before replacing the target; a symlink is written in place so the link survives.
 function Write-Utf8FileAtomic {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$Content)
+    $existing = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($existing -and $existing.LinkType) {
+        [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+        return
+    }
     $dir = Split-Path -Parent $Path
     if (-not $dir) { $dir = '.' }
     $tmp = Join-Path $dir ('.psp-tmp-' + [System.IO.Path]::GetRandomFileName())
@@ -951,12 +956,15 @@ function Update-Profile {
         }
 
         # Apply user-settings.json overrides (never downloaded, never overwritten)
+        $wtManaged = $true
         if (Test-Path $userSettingsPath) {
             try {
                 $userSettings = Get-Utf8FileText $userSettingsPath | ConvertFrom-Json
                 $userSettingsParsed = $true
                 $userThemeOverridePresent = $null -ne $userSettings.theme
                 $userWindowsTerminalOverridePresent = $null -ne $userSettings.windowsTerminal
+                # windowsTerminal.manage = false hands settings.json to another tool, such as a dotfiles repo.
+                if ($userSettings.windowsTerminal -and $userSettings.windowsTerminal.PSObject.Properties['manage'] -and $userSettings.windowsTerminal.manage -eq $false) { $wtManaged = $false }
                 $userTerminalDefaultsOverridePresent = $null -ne $userSettings.defaults
                 $userKeybindingsOverridePresent = $null -ne $userSettings.keybindings
                 if ($config -and $userSettings.theme) {
@@ -996,7 +1004,8 @@ function Update-Profile {
     "_comment": "User overrides for terminal, theme, and profile behavior. Only add keys you want to override.",
     "_examples": {
         "theme": { "name": "catppuccin", "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/catppuccin.omp.json" },
-        "windowsTerminal": { "colorScheme": "One Half Dark", "cursorColor": "#ffffff" },
+        "windowsTerminal": { "manage": true, "colorScheme": "One Half Dark", "cursorColor": "#ffffff" },
+        "_manage_note": "set windowsTerminal.manage to false when another tool (for example a dotfiles repo) owns Windows Terminal settings.json; the profile then leaves that file alone",
         "defaults": {
             "opacity": 90,
             "font": { "size": 14 },
@@ -1123,7 +1132,10 @@ function Update-Profile {
 
         # Phase 6: Synchronize every installed Windows Terminal variant.
         $terminalOverridesChanged = $userSettingsChanged -and ($userWindowsTerminalOverridePresent -or $userTerminalDefaultsOverridePresent -or $userKeybindingsOverridePresent)
-        if (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
+        if (-not $wtManaged) {
+            Write-Host "Windows Terminal settings left alone (windowsTerminal.manage = false in user-settings.json)." -ForegroundColor DarkGray
+        }
+        elseif (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
             $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
             foreach ($wtSettingsPath in $wtSettingsPaths) {
                 if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Update Windows Terminal settings")) {
@@ -2895,6 +2907,36 @@ function Test-ProfileHealth {
         $results += [pscustomobject]@{ Category = 'Config'; Check = 'user-settings.json'; Status = 'WARN'; Detail = 'missing (no overrides applied)' }
     }
 
+    # Windows Terminal settings.json ownership: a symlink or windowsTerminal.manage = false means another tool owns it.
+    $wtManagedHere = $true
+    if (Test-Path $us) {
+        try {
+            $usCfg = Get-Content $us -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($usCfg.windowsTerminal -and $usCfg.windowsTerminal.PSObject.Properties['manage'] -and $usCfg.windowsTerminal.manage -eq $false) { $wtManagedHere = $false }
+        }
+        catch { $null = $_ }
+    }
+    foreach ($wtPath in @(Get-WindowsTerminalSettingsPaths)) {
+        $wtItem = Get-Item -LiteralPath $wtPath -Force -ErrorAction SilentlyContinue
+        if (-not $wtItem) { continue }
+        $wtVariant = if ($wtPath -match 'WindowsTerminalPreview') { 'Preview' } elseif ($wtPath -match 'WindowsTerminalCanary') { 'Canary' } elseif ($wtPath -match 'Packages') { 'Stable' } else { 'Unpackaged' }
+        if ($wtItem.LinkType) {
+            $wtTarget = [string](@($wtItem.Target)[0])
+            if ($wtManagedHere) {
+                $results += [pscustomobject]@{ Category = 'Terminal'; Check = "settings.json ($wtVariant)"; Status = 'WARN'; Detail = "symlink to $wtTarget; set windowsTerminal.manage = false in user-settings.json if that tool owns it" }
+            }
+            else {
+                $results += [pscustomobject]@{ Category = 'Terminal'; Check = "settings.json ($wtVariant)"; Status = 'OK'; Detail = "symlink to $wtTarget, managed elsewhere" }
+            }
+        }
+        elseif ($wtManagedHere) {
+            $results += [pscustomobject]@{ Category = 'Terminal'; Check = "settings.json ($wtVariant)"; Status = 'OK'; Detail = 'managed by this profile' }
+        }
+        else {
+            $results += [pscustomobject]@{ Category = 'Terminal'; Check = "settings.json ($wtVariant)"; Status = 'OK'; Detail = 'not managed (windowsTerminal.manage = false)' }
+        }
+    }
+
     # Check the font this install actually uses: a wizard choice in user-settings.json
     # overrides the shipped terminal-config.json default.
     $fontName = $null
@@ -3160,7 +3202,11 @@ function Uninstall-Profile {
         $backups = Get-ChildItem -Path $wtLocalState -Filter 'settings.json.*.bak' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending
 
-        if ($HardResetWindowsTerminal) {
+        $wtItem = Get-Item -LiteralPath $wtSettingsPath -Force -ErrorAction SilentlyContinue
+        if ($wtItem -and $wtItem.LinkType) {
+            Write-Host "  $wtSettingsPath is a symlink managed elsewhere; Windows Terminal settings left in place." -ForegroundColor DarkGray
+        }
+        elseif ($HardResetWindowsTerminal) {
             if (Test-Path $wtSettingsPath) {
                 if ($PSCmdlet.ShouldProcess($wtSettingsPath, 'Delete WT settings for hard reset')) {
                     Remove-Item $wtSettingsPath -Force -ErrorAction SilentlyContinue
@@ -6089,6 +6135,10 @@ function Set-TerminalBackground {
     }
 
     # 2. Apply the background to every installed Windows Terminal variant.
+    if ($settings.PSObject.Properties['windowsTerminal'] -and $settings.windowsTerminal.PSObject.Properties['manage'] -and $settings.windowsTerminal.manage -eq $false) {
+        Write-Host 'Windows Terminal settings.json is managed elsewhere (windowsTerminal.manage = false). Background persisted to user-settings.json only.' -ForegroundColor DarkGray
+        return
+    }
     $wtSettingsPaths = Get-WindowsTerminalSettingsPaths
     if (-not $wtSettingsPaths -or $wtSettingsPaths.Count -eq 0) {
         Write-Host 'Windows Terminal settings.json not found (Store/Preview/Canary/unpackaged). Change persisted; will apply after next Update-Profile.' -ForegroundColor DarkGray
