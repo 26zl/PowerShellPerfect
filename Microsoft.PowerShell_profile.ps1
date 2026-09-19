@@ -4985,27 +4985,29 @@ function entropy {
 
 # Developer
 
-# Serve a directory through Python or npx.
+# Serve a directory through Python or npx. Loopback only by default: both servers
+# listen on every interface unless told otherwise. Use -Bind 0.0.0.0 to share on the LAN.
 function serve {
     param(
         [int]$Port = 8000,
-        [string]$Path = '.'
+        [string]$Path = '.',
+        [string]$Bind = '127.0.0.1'
     )
     $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "Path not found: $Path"; return }
     $oldTitle = Push-TabTitle "serve :$Port"
     try {
         if (Get-Command python -ErrorAction SilentlyContinue) {
-            Write-Host ("Serving {0} on http://127.0.0.1:{1} (Ctrl+C to stop)" -f $resolved.Path, $Port) -ForegroundColor Cyan
+            Write-Host ("Serving {0} on http://{1}:{2} (Ctrl+C to stop)" -f $resolved.Path, $Bind, $Port) -ForegroundColor Cyan
             Push-Location $resolved.Path
-            try { & python -m http.server $Port }
+            try { & python -m http.server $Port --bind $Bind }
             finally { Pop-Location }
             return
         }
         if (Get-Command npx -ErrorAction SilentlyContinue) {
-            Write-Host ("Serving {0} via npx http-server on http://127.0.0.1:{1}" -f $resolved.Path, $Port) -ForegroundColor Cyan
+            Write-Host ("Serving {0} via npx http-server on http://{1}:{2}" -f $resolved.Path, $Bind, $Port) -ForegroundColor Cyan
             Push-Location $resolved.Path
-            try { & npx --yes http-server -p $Port }
+            try { & npx --yes http-server -p $Port -a $Bind }
             finally { Pop-Location }
             return
         }
@@ -6353,7 +6355,7 @@ ${g}certcheck${r} <host> [port] - Full TLS probe: chain, SAN, SHA256 pin, cipher
 ${g}entropy${r} <file> - Shannon entropy (detect packed/encrypted payloads).
 
 ${c}Developer+${r}
-${g}serve${r} [port] [path] - One-line HTTP server (python or npx).
+${g}serve${r} [port] [path] [-Bind addr] - One-line HTTP server (python or npx; loopback only by default).
 ${g}gitignore${r} <lang...> - Generate .gitignore from gitignore.io.
 ${g}gcof${r} - Fuzzy git branch checkout (fzf).
 ${g}envload${r} [path] - Load .env file into current session.

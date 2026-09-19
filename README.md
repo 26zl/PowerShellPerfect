@@ -338,7 +338,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `timer { command }` | Measure execution time |
 | `watch { command } [-Interval n]` | Repeat command every n seconds (default 2; like Linux watch) |
 | `bak <file>` | Quick timestamped backup |
-| `serve [port] [path]` | One-line HTTP server (python or npx) |
+| `serve [port] [path] [-Bind addr]` | One-line HTTP server (python or npx). Loopback only by default; `-Bind 0.0.0.0` shares it on the LAN |
 | `gitignore <lang...>` | Generate .gitignore from gitignore.io |
 | `gcof` | Fuzzy git branch checkout (fzf) |
 | `envload [path]` | Load .env file into current session |
