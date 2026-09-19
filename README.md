@@ -122,12 +122,20 @@ When running locally you can override terminal defaults:
 .\setup.ps1 -SkipWizard -Opacity 85 -ColorScheme "One Half Dark" -FontSize 12
 ```
 
-> **Controlled Folder Access:** If Windows Defender blocks the setup, allow PowerShell through:
+> **Controlled Folder Access:** setup writes the profile to `Documents`, which CFA protects. The
+> symptom is a misleading `Could not find file` and a Defender event 1123. Allow the PowerShell
+> you are running **for the install only**, then take it out again. A permanent entry lets every
+> PowerShell script, ransomware included, write to your protected folders.
 >
 > ```powershell
-> Add-MpPreference -ControlledFolderAccessAllowedApplications "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-> Add-MpPreference -ControlledFolderAccessAllowedApplications "C:\Program Files\PowerShell\7\pwsh.exe"
+> $ps = (Get-Process -Id $PID).Path   # also right for the Store build, whose path changes per version
+> Add-MpPreference -ControlledFolderAccessAllowedApplications $ps
+> .\setup.ps1
+> Remove-MpPreference -ControlledFolderAccessAllowedApplications $ps
+> (Get-MpPreference).ControlledFolderAccessAllowedApplications   # check it is gone
 > ```
+>
+> Later profile and module updates write to the same folder and need the same two lines around them.
 
 ## Updates
 
@@ -338,7 +346,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `timer { command }` | Measure execution time |
 | `watch { command } [-Interval n]` | Repeat command every n seconds (default 2; like Linux watch) |
 | `bak <file>` | Quick timestamped backup |
-| `serve [port] [path]` | One-line HTTP server (python or npx) |
+| `serve [port] [path] [-Bind addr]` | One-line HTTP server (python or npx). Loopback only by default; `-Bind 0.0.0.0` shares it on the LAN |
 | `gitignore <lang...>` | Generate .gitignore from gitignore.io |
 | `gcof` | Fuzzy git branch checkout (fzf) |
 | `envload [path]` | Load .env file into current session |
@@ -450,7 +458,7 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 
 | Symptom | Fix |
 | --- | --- |
-| Setup blocked by Windows Defender (Controlled Folder Access) | Allow PowerShell through (see the command in [Install](#install-alternatives)), or run the clone from a non-protected folder. |
+| Setup blocked by Windows Defender (Controlled Folder Access), often shown as `Could not find file` | Allow PowerShell through for the duration of the install and remove it afterwards (see [Install](#install-alternatives)). Moving the clone does not help: it is the write to `Documents` that is blocked. |
 | `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. (The recommended one-liner runs an in-memory scriptblock, which isn't subject to the script-file execution policy.) |
 | Prompt shows boxes / missing glyphs | The terminal font isn't a Nerd Font. Set your Windows Terminal profile font to the one setup installed (e.g. *CaskaydiaCove Nerd Font*) and restart WT. |
 | `oh-my-posh` not found right after install | Reopen the terminal (PATH refresh) or run `Update-SessionPathFromRegistry`; confirm with `psp-doctor`. |
