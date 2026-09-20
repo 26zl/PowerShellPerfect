@@ -905,7 +905,7 @@ function Get-ExternalCommandPath {
         [string]$CommandName
     )
 
-    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    $cmd = Get-Command $CommandName -ErrorAction Ignore
     if (-not $cmd) { return $null }
 
     if ($cmd.CommandType -eq 'Alias' -and $cmd.Definition -and $cmd.Definition -ne $CommandName) {
@@ -1007,7 +1007,7 @@ function Select-PreferredEditor {
     for ($i = 0; $i -lt $EditorCandidates.Count; $i++) {
         $ed = $EditorCandidates[$i]
         $num = $i + 1
-        $installed = [bool](Get-Command $ed.Cmd -ErrorAction SilentlyContinue)
+        $installed = [bool](Get-Command $ed.Cmd -ErrorAction Ignore)
         if ($installed) {
             if ($null -eq $defaultChoice) { $defaultChoice = $i }
             Write-Host "   $num) $($ed.Display) ($($ed.Cmd)) " -NoNewline -ForegroundColor White
@@ -1033,7 +1033,7 @@ function Select-PreferredEditor {
         Write-Host "  Invalid choice, using default." -ForegroundColor Yellow
         return $EditorCandidates[$defaultChoice].Cmd
     }
-    if (-not (Get-Command $chosen.Cmd -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command $chosen.Cmd -ErrorAction Ignore)) {
         Write-Host "  '$($chosen.Cmd)' is not installed." -ForegroundColor Yellow
         $confirm = Read-Host "  Use anyway? [y/N]"
         if ($confirm -notmatch '^[Yy]') {
@@ -1188,7 +1188,7 @@ if (Test-Path $userSettingsPath) {
 }
 
 # Continue profile installation without optional winget-managed tools.
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command winget -ErrorAction Ignore)) {
     Write-Host "winget (App Installer) not found - skipping optional tool installs (eza, bat, fzf, zoxide, ripgrep, Oh My Posh)." -ForegroundColor Yellow
     Write-Host "  Install it later from the Microsoft Store or https://aka.ms/getwinget to add those tools." -ForegroundColor DarkYellow
 }
@@ -1339,12 +1339,12 @@ function Resolve-ConfiguredEditor {
     param([Parameter(Mandatory)][string]$RequestedEditor)
     $chosen = $EditorCandidates | Where-Object { $_.Cmd -eq $RequestedEditor } | Select-Object -First 1
     $resolvedEditor = $RequestedEditor
-    if ($chosen -and $chosen.WingetId -and -not (Get-Command $RequestedEditor -ErrorAction SilentlyContinue)) {
+    if ($chosen -and $chosen.WingetId -and -not (Get-Command $RequestedEditor -ErrorAction Ignore)) {
         if ($isCiHost) {
             Write-Host "  CI mode: skipping editor install for $($chosen.Display)." -ForegroundColor DarkGray
             $resolvedEditor = 'notepad'
         }
-        elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+        elseif (Get-Command winget -ErrorAction Ignore) {
             Write-Host "  Installing $($chosen.Display) via winget..." -ForegroundColor Cyan
             $null = winget install -e --id $chosen.WingetId --accept-source-agreements --accept-package-agreements 2>&1
             if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
@@ -1431,7 +1431,7 @@ function Install-WingetPackage {
         [Parameter(Mandatory)]
         [string]$Id
     )
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command winget -ErrorAction Ignore)) {
         Write-Host "  winget not found. Skipping $Name." -ForegroundColor Yellow
         return $false
     }
@@ -1793,7 +1793,7 @@ if ($canPromptExit) {
         $dir = [Environment]::GetFolderPath('UserProfile')
     }
     $shellName = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
-    if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
+    if (Get-Command wt.exe -ErrorAction Ignore) {
         Start-Process -FilePath "wt.exe" -ArgumentList "-w", "0", "-d", $dir, $shellName, "-NoExit"
     }
     else {

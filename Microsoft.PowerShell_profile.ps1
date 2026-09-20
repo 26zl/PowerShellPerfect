@@ -247,7 +247,7 @@ function Get-ExternalCommandPath {
         [string]$CommandName
     )
 
-    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    $cmd = Get-Command $CommandName -ErrorAction Ignore
     if (-not $cmd) { return $null }
 
     if ($cmd.CommandType -eq 'Alias' -and $cmd.Definition -and $cmd.Definition -ne $CommandName) {
@@ -1284,7 +1284,7 @@ function Update-Profile {
         }
 
         # Phase 7: Install missing tools
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
+        if (Get-Command winget -ErrorAction Ignore) {
             $missing = $script:ProfileTools | Where-Object { -not (Get-ProfileToolExecutablePath -Tool $_) }
             if ($missing) {
                 Write-Host "Installing missing tools..." -ForegroundColor Cyan
@@ -1307,7 +1307,7 @@ function Update-Profile {
                     Update-SessionPathFromRegistry
                 }
                 # PSFzf module (required for fzf integration)
-                if ((Get-Command fzf -ErrorAction SilentlyContinue) -and -not (Get-Module -ListAvailable -Name PSFzf)) {
+                if ((Get-Command fzf -ErrorAction Ignore) -and -not (Get-Module -ListAvailable -Name PSFzf)) {
                     if ($PSCmdlet.ShouldProcess('PSFzf', 'Install PowerShell module')) {
                         try {
                             Install-Module -Name PSFzf -Scope CurrentUser -Force -AllowClobber
@@ -1437,7 +1437,7 @@ function Update-PowerShell {
 function Update-Tools {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command winget -ErrorAction Ignore)) {
         Write-Warning "winget not found. Update-Tools only supports winget-managed upgrades."
         return
     }
@@ -1525,7 +1525,7 @@ function Restart-TerminalToApply {
     Start-Sleep -Seconds 2
     Write-Host "Press Enter to restart (or close this window to cancel)..." -ForegroundColor Yellow
     try { $null = Read-Host } catch { $null = $_ }
-    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    $wt = Get-Command wt.exe -ErrorAction Ignore
     if ($wt) {
         Start-Process -FilePath "wt.exe" -ArgumentList "-w", "0", "-d", $dir, $shellName, "-NoExit"
     }
@@ -1700,7 +1700,7 @@ $script:ResolvedEditorArgs = @()
 
 # Resolve preferred editor from EditorPriority or env EDITOR (used by edit/Edit-Profile)
 function Resolve-PreferredEditor {
-    if ($script:ResolvedEditor -and (Get-Command $script:ResolvedEditor -CommandType Application -ErrorAction SilentlyContinue)) {
+    if ($script:ResolvedEditor -and (Get-Command $script:ResolvedEditor -CommandType Application -ErrorAction Ignore)) {
         return $script:ResolvedEditor
     }
 
@@ -1712,12 +1712,12 @@ function Resolve-PreferredEditor {
         # Split editor flags from the executable when the full candidate is not a command.
         $exe = $candidate
         $extraArgs = @()
-        if (-not (Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue) -and $candidate -match '\s') {
+        if (-not (Get-Command $candidate -CommandType Application -ErrorAction Ignore) -and $candidate -match '\s') {
             $tok = $candidate -split '\s+'
             $exe = $tok[0]
             $extraArgs = @($tok | Select-Object -Skip 1)
         }
-        if (Get-Command $exe -CommandType Application -ErrorAction SilentlyContinue) {
+        if (Get-Command $exe -CommandType Application -ErrorAction Ignore) {
             $script:ResolvedEditor = $exe
             $script:ResolvedEditorArgs = $extraArgs
             return $script:ResolvedEditor
@@ -1847,7 +1847,7 @@ function harden {
 # Open an elevated Windows Terminal, pwsh, or powershell session.
 function admin {
     $shell = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
-    $hasWt = [bool](Get-Command wt -ErrorAction SilentlyContinue)
+    $hasWt = [bool](Get-Command wt -ErrorAction Ignore)
     if ($args.Count -gt 0) {
         $escaped = $args | ForEach-Object { if ($_ -match '\s') { "'$($_ -replace "'","''")'" } else { $_ } }
         $command = $escaped -join ' '
@@ -1925,11 +1925,11 @@ function extract {
             Write-Host "Extracted to $outFile" -ForegroundColor Green
         }
         '.7z' {
-            if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) { Write-Error "7z not found. Install with: winget install 7zip.7zip"; return }
+            if (-not (Get-Command 7z -ErrorAction Ignore)) { Write-Error "7z not found. Install with: winget install 7zip.7zip"; return }
             7z x "$path" -o"$pwd"
         }
         '.rar' {
-            if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) { Write-Error "7z not found. Install with: winget install 7zip.7zip"; return }
+            if (-not (Get-Command 7z -ErrorAction Ignore)) { Write-Error "7z not found. Install with: winget install 7zip.7zip"; return }
             7z x "$path" -o"$pwd"
         }
         default { Write-Error "Unsupported format: $ext" }
@@ -1966,7 +1966,7 @@ function grep {
     param([string]$regex, [string]$dir)
     if (-not $regex) { Write-Error "Usage: grep <regex> [dir] or <pipeline> | grep <regex>"; return }
     $hasInput = $MyInvocation.ExpectingInput
-    if (Get-Command rg -ErrorAction SilentlyContinue) {
+    if (Get-Command rg -ErrorAction Ignore) {
         if ($dir) { rg $regex $dir }
         elseif ($hasInput) { $input | rg $regex }
         else { rg $regex . }
@@ -2000,7 +2000,7 @@ function sed($file, $find, $replace) {
 # Show the full path of a command
 function which($name) {
     if (-not $name) { Write-Error "Usage: which <name>"; return }
-    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    $cmd = Get-Command $name -ErrorAction Ignore
     if ($cmd) { $cmd | Select-Object -ExpandProperty Definition; return }
     # Fall back to checking the current directory (like bash which for ./files)
     $local = Join-Path $pwd $name
@@ -2210,9 +2210,9 @@ function dtop {
 }
 
 # Enhanced Listing (eza - modern ls replacement with icons and git status)
-if (Get-Command eza -ErrorAction SilentlyContinue) {
+if (Get-Command eza -ErrorAction Ignore) {
     # Remove-Alias exists only in PS6+; PS5 needs Remove-Item on the Alias: drive
-    if (Get-Command Remove-Alias -ErrorAction SilentlyContinue) {
+    if (Get-Command Remove-Alias -ErrorAction Ignore) {
         Remove-Alias ls -Force -ErrorAction SilentlyContinue
     }
     else {
@@ -2235,8 +2235,8 @@ else {
 
 # Syntax-highlighted file viewer (bat - modern cat replacement)
 if (-not $env:BAT_THEME) { $env:BAT_THEME = "TwoDark" }
-if (Get-Command bat -ErrorAction SilentlyContinue) {
-    if (Get-Command Remove-Alias -ErrorAction SilentlyContinue) {
+if (Get-Command bat -ErrorAction Ignore) {
+    if (Get-Command Remove-Alias -ErrorAction Ignore) {
         Remove-Alias cat -Force -ErrorAction SilentlyContinue
     }
     else {
@@ -2256,7 +2256,7 @@ function gs { git status }
 function ga { git add .; if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed (exit $LASTEXITCODE)" } }
 
 # Remove built-in gc alias (Get-Content) so our function is reachable
-if (Get-Command Remove-Alias -ErrorAction SilentlyContinue) {
+if (Get-Command Remove-Alias -ErrorAction Ignore) {
     Remove-Alias gc -Force -ErrorAction SilentlyContinue
 }
 else {
@@ -2279,7 +2279,7 @@ function gpull { git pull }
 
 # Jump to github directory via zoxide
 function g {
-    if (Get-Command __zoxide_z -ErrorAction SilentlyContinue) {
+    if (Get-Command __zoxide_z -ErrorAction Ignore) {
         __zoxide_z github
     }
     else {
@@ -2583,7 +2583,7 @@ function vtscan {
     }
 }
 
-if (-not (Get-Command vt.exe -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command vt.exe -ErrorAction Ignore)) {
     # Fallback when vt-cli not installed: show install instructions
     function vt {
         Write-Host 'vt-cli is not installed. Install with:' -ForegroundColor Red
@@ -2593,7 +2593,7 @@ if (-not (Get-Command vt.exe -ErrorAction SilentlyContinue)) {
 }
 
 # Docker Shortcuts (conditional)
-if (Get-Command docker -ErrorAction SilentlyContinue) {
+if (Get-Command docker -ErrorAction Ignore) {
     # dps/dpa/dimg: list containers and images
     function dps { docker ps @args }
     function dpa { docker ps -a @args }
@@ -2623,7 +2623,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
 }
 
 # Define the WSL wrapper and helpers only when wsl.exe is available.
-if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+if (Get-Command wsl.exe -ErrorAction Ignore) {
     # Show the WSL distro in the tab title and invoke wsl.exe without recursion.
     function wsl {
         $distro = 'default'
@@ -2777,7 +2777,7 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
         )
         $unc = Resolve-WslUncPath -Distro $Distro -Path $Path
         if (-not $unc) { return }
-        if (Get-Command eza -ErrorAction SilentlyContinue) {
+        if (Get-Command eza -ErrorAction Ignore) {
             $ezaArgs = @('--tree', "--level=$Depth", '--icons=auto', '--git-ignore')
             if ($All) { $ezaArgs += '-a' }
             & eza @ezaArgs $unc
@@ -3148,7 +3148,7 @@ function Invoke-ProfileWizard {
             Write-Host "  Re-run with -BundleExpectedSha256 '<hash>' or -SkipHashCheck to apply the wizard." -ForegroundColor Yellow
         }
 
-        $pwshExe = if ((Get-Command pwsh -ErrorAction SilentlyContinue)) { 'pwsh' } else { 'powershell' }
+        $pwshExe = if ((Get-Command pwsh -ErrorAction Ignore)) { 'pwsh' } else { 'powershell' }
         $exitCode = 1
 
         if ($isAdmin -or $NoElevate) {
@@ -3314,12 +3314,12 @@ function Uninstall-Profile {
             if (-not $uninstalled) {
                 # Retry uninstall from a background shell to release the module.
                 $psExe = $null
-                $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+                $cmd = Get-Command pwsh -ErrorAction Ignore
                 if ($cmd) {
                     $psExe = $cmd.Source
                 }
                 else {
-                    $cmd = Get-Command powershell -ErrorAction SilentlyContinue
+                    $cmd = Get-Command powershell -ErrorAction Ignore
                     if ($cmd) { $psExe = $cmd.Source }
                 }
 
@@ -3694,7 +3694,7 @@ function wifipass {
 function hosts {
     $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $editor = Resolve-PreferredEditor
-    $cmdInfo = Get-Command $editor -ErrorAction SilentlyContinue
+    $cmdInfo = Get-Command $editor -ErrorAction Ignore
     $editorPath = if ($cmdInfo -and $cmdInfo.Source) { $cmdInfo.Source } else { $editor }
     if ($cmdInfo -and $cmdInfo.CommandType -eq 'Application' -and $editorPath -match '\.(cmd|bat)$') {
         Start-Process -FilePath cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList (ConvertTo-NativeArgumentLine (@('/c', $editorPath) + @($script:ResolvedEditorArgs) + @($hostsPath)))
@@ -3751,7 +3751,7 @@ function eventlog {
 }
 
 # SSH & Remote
-if (Get-Command ssh -ErrorAction SilentlyContinue) {
+if (Get-Command ssh -ErrorAction Ignore) {
     # Add short SSH timeout and keepalive defaults without overriding user options.
     function ssh {
         # Match both spaced and compact OpenSSH -o option forms.
@@ -3854,7 +3854,7 @@ function Stop-ListeningPort {
         }
     }
     $selected = @()
-    if (Get-Command fzf -ErrorAction SilentlyContinue) {
+    if (Get-Command fzf -ErrorAction Ignore) {
         # Format each row into a single fzf line; parse selection back to PID via last column.
         $lines = $rows | ForEach-Object {
             ('{0,-7} {1,-20} {2,-8} {3}' -f $_.Port, $_.Address, $_.PID, $_.Process)
@@ -4550,7 +4550,7 @@ Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName Al
 Register-ArgumentCompleter -CommandName Enter-WslHere, ConvertTo-WslPath, ConvertTo-WindowsPath, Stop-Wsl, Get-WslIp, Get-WslFile, Show-WslTree, Open-WslExplorer -ParameterName Distro -ScriptBlock {
     param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
     $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
-    if (-not (Get-Command Get-WslDistro -ErrorAction SilentlyContinue)) { return }
+    if (-not (Get-Command Get-WslDistro -ErrorAction Ignore)) { return }
     try {
         Get-WslDistro | Where-Object { $_.Name -like "$wordToComplete*" } |
         ForEach-Object {
@@ -4666,7 +4666,7 @@ function lsblk {
 function htop {
     foreach ($c in @('btop', 'ntop', 'htop')) {
         # -CommandType Application so 'htop' resolves to a real binary, not this function (which would self-shadow and skip the svc fallback).
-        $cmd = Get-Command $c -CommandType Application -ErrorAction SilentlyContinue
+        $cmd = Get-Command $c -CommandType Application -ErrorAction Ignore
         if ($cmd) { & $cmd.Source; return }
     }
     Write-Host 'No TUI process viewer installed. Tip: winget install aristocratos.btop4win' -ForegroundColor Yellow
@@ -4765,7 +4765,7 @@ function nscan {
         [string]$Mode = 'Quick',
         [int[]]$Ports
     )
-    if (-not (Get-Command nmap -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command nmap -ErrorAction Ignore)) {
         Write-Error 'nmap is not installed. Install with: winget install Insecure.Nmap'
         return
     }
@@ -4846,7 +4846,7 @@ function defscan {
         [Parameter(Position = 0)][string]$Path,
         [ValidateSet('Quick', 'Full')][string]$Mode = 'Quick'
     )
-    if (-not (Get-Command Start-MpScan -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Start-MpScan -ErrorAction Ignore)) {
         Write-Error 'Windows Defender cmdlets not available on this system.'
         return
     }
@@ -4997,14 +4997,14 @@ function serve {
     if (-not $resolved) { Write-Error "Path not found: $Path"; return }
     $oldTitle = Push-TabTitle "serve :$Port"
     try {
-        if (Get-Command python -ErrorAction SilentlyContinue) {
+        if (Get-Command python -ErrorAction Ignore) {
             Write-Host ("Serving {0} on http://{1}:{2} (Ctrl+C to stop)" -f $resolved.Path, $Bind, $Port) -ForegroundColor Cyan
             Push-Location $resolved.Path
             try { & python -m http.server $Port --bind $Bind }
             finally { Pop-Location }
             return
         }
-        if (Get-Command npx -ErrorAction SilentlyContinue) {
+        if (Get-Command npx -ErrorAction Ignore) {
             Write-Host ("Serving {0} via npx http-server on http://{1}:{2}" -f $resolved.Path, $Bind, $Port) -ForegroundColor Cyan
             Push-Location $resolved.Path
             try { & npx --yes http-server -p $Port -a $Bind }
@@ -5040,8 +5040,8 @@ function gitignore {
 
 # Check out local or remote Git branches through fzf.
 function gcof {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Error 'git is not installed'; return }
-    if (-not (Get-Command fzf -ErrorAction SilentlyContinue)) { Write-Error 'fzf is not installed (winget install junegunn.fzf)'; return }
+    if (-not (Get-Command git -ErrorAction Ignore)) { Write-Error 'git is not installed'; return }
+    if (-not (Get-Command fzf -ErrorAction Ignore)) { Write-Error 'fzf is not installed (winget install junegunn.fzf)'; return }
     $branches = git branch --all --format='%(refname:short)' 2>$null | Where-Object { $_ -and $_ -notmatch '^origin/HEAD' }
     if (-not $branches) { Write-Error 'No branches found'; return }
     $selected = $branches | fzf --height 40% --reverse --prompt 'checkout> '
@@ -5073,7 +5073,7 @@ function envload {
 
 # Look up command examples through an installed tldr client or tldr-pages.
 function tldr {
-    if (Get-Command tldr.exe -ErrorAction SilentlyContinue) { & tldr.exe @args; return }
+    if (Get-Command tldr.exe -ErrorAction Ignore) { & tldr.exe @args; return }
     if (-not $args) { Write-Error 'Usage: tldr <command>'; return }
     $cmd = ($args[0]).ToString().ToLower()
     foreach ($platform in @('common', 'windows', 'linux', 'osx')) {
@@ -5132,8 +5132,8 @@ function mkvenv {
         [string]$PythonPath
     )
     $python = if ($PythonPath) { $PythonPath }
-    elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
-    elseif (Get-Command py -ErrorAction SilentlyContinue) { 'py' }
+    elseif (Get-Command python -ErrorAction Ignore) { 'python' }
+    elseif (Get-Command py -ErrorAction Ignore) { 'py' }
     else { $null }
     if (-not $python) { Write-Error 'python not found on PATH (winget install Python.Python.3.12)'; return }
     Write-Host ("Creating venv at ./{0}..." -f $Name) -ForegroundColor Cyan
@@ -5341,7 +5341,7 @@ function Test-Profile {
     Write-Host ''
     Write-Host 'Managed Tools:' -ForegroundColor Cyan
     foreach ($tool in $script:ProfileTools) {
-        $found = Get-Command $tool.Cmd -ErrorAction SilentlyContinue
+        $found = Get-Command $tool.Cmd -ErrorAction Ignore
         $status = if ($found) { 'OK' } else { 'MISSING' }
         $color = if ($found) { 'Green' } else { 'Yellow' }
         Write-Host ("  {0,-14} {1}" -f $tool.Cmd, $status) -ForegroundColor $color
@@ -5366,7 +5366,7 @@ function Get-PwshVersions {
         catch { $null = $_ }
     }
     $candidates = @()
-    $candidates += (Get-Command pwsh -ErrorAction SilentlyContinue -All | ForEach-Object { $_.Source })
+    $candidates += (Get-Command pwsh -ErrorAction Ignore -All | ForEach-Object { $_.Source })
     $candidates += (Get-ChildItem (Join-Path $env:ProgramFiles 'PowerShell') -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'pwsh.exe' })
     $candidates += (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WindowsApps" -Filter 'pwsh*.exe' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
     $candidates = $candidates | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
@@ -5603,8 +5603,8 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     }
 
     # Enable PSFzf history and file search unless disabled in user-settings.json.
-    if ($script:PSP.Features.psfzf -and (Get-Command fzf -ErrorAction SilentlyContinue)) {
-        if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -ErrorAction SilentlyContinue)) {
+    if ($script:PSP.Features.psfzf -and (Get-Command fzf -ErrorAction Ignore)) {
+        if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -ErrorAction Ignore)) {
             $env:FZF_DEFAULT_COMMAND = 'rg --files --hidden --glob "!.git"'
         }
         if (-not $env:FZF_DEFAULT_OPTS) {
@@ -5631,7 +5631,7 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
         @{ Cmd = 'docker';  Cache = 'docker-completion.ps1';  Args = @('completion', 'powershell') }
     )
     foreach ($_nc in $_nativeCompleters) {
-        if (-not (Get-Command $_nc.Cmd -ErrorAction SilentlyContinue)) { continue }
+        if (-not (Get-Command $_nc.Cmd -ErrorAction Ignore)) { continue }
         $_ncCachePath = Join-Path $cacheDir $_nc.Cache
         $_ncReady = (Test-Path $_ncCachePath) -and ((Get-Item $_ncCachePath -ErrorAction SilentlyContinue).Length -gt 0)
         if (-not $_ncReady) {
@@ -5706,7 +5706,7 @@ $scriptblock = {
 Register-ArgumentCompleter -Native -CommandName git, npm, deno -ScriptBlock $scriptblock
 
 # dotnet completion (only if dotnet is installed)
-if (Get-Command dotnet -ErrorAction SilentlyContinue) {
+if (Get-Command dotnet -ErrorAction Ignore) {
     $dotnetScriptblock = {
         param($wordToComplete, $commandAst, $cursorPosition)
         dotnet complete --position $cursorPosition $commandAst.ToString() |
@@ -5926,7 +5926,7 @@ function Get-ProfileCommand {
     if ($Category) { $cmds = $cmds | Where-Object { $_.Category -like "*$Category*" } }
     if ($Name) { $cmds = $cmds | Where-Object { $_.Name -like "*$Name*" } }
     # Hide registered commands that are unavailable on the current host.
-    $cmds = $cmds | Where-Object { Get-Command $_.Name -ErrorAction SilentlyContinue }
+    $cmds = $cmds | Where-Object { Get-Command $_.Name -ErrorAction Ignore }
     $cmds | Sort-Object Category, Name
 }
 
@@ -5934,7 +5934,7 @@ function Get-ProfileCommand {
 function Start-ProfileTour {
     if (-not [Environment]::UserInteractive) { Write-Warning 'Tour requires an interactive session.'; return }
     # Skip seeded commands that aren't defined on this host (WSL/SSH helpers without their binary).
-    $available = $script:PSP.Commands | Where-Object { Get-Command $_.Name -ErrorAction SilentlyContinue }
+    $available = $script:PSP.Commands | Where-Object { Get-Command $_.Name -ErrorAction Ignore }
     $categories = @($available | Group-Object Category | Sort-Object Name)
     if ($categories.Count -eq 0) { Write-Warning 'Command registry is empty. Is the profile loaded?'; return }
     $oldTitle = Push-TabTitle 'profile tour'
