@@ -14,7 +14,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
@@ -248,7 +248,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
@@ -489,7 +489,7 @@ jobs:
     needs: [lint, install-flow]
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
 
