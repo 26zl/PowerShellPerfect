@@ -1315,7 +1315,7 @@ T 'nslook'    { nslook "google.com" }
 T 'env'       { env "PATH" }
 T 'svc'       { svc "idle" -Count 1 }
 T 'eventlog'  { eventlog 1 }
-T 'weather'   { weather "Oslo" }
+T 'weather'   { weather "London" }
 T 'speedtest' $null 'takes 30s+ download'
 T 'wifipass'  $null 'requires admin/netsh'
 T 'hosts'     $null 'opens elevated editor'

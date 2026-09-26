@@ -752,7 +752,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'env' -Code { env 'PATH' | Out-Null }
         Invoke-CommandProbe -Command 'svc' -Code { svc -Count 1 | Out-Null }
         Invoke-CommandProbe -Command 'eventlog' -Code { eventlog 1 | Out-Null }
-        Invoke-CommandProbe -Command 'weather' -Code { weather 'Oslo' | Out-Null }
+        Invoke-CommandProbe -Command 'weather' -Code { weather 'London' | Out-Null }
         Invoke-CommandProbe -Command 'speedtest' -SkipReason 'Long-running network benchmark'
         Invoke-CommandProbe -Command 'wifipass' -SkipReason 'Requires WLAN profile context and often elevation'
         Invoke-CommandProbe -Command 'hosts' -SkipReason 'Opens elevated editor UI'
