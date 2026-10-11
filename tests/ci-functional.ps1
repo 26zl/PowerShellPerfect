@@ -584,6 +584,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'll' -Code { ll $workspace | Out-Null }
         Invoke-CommandProbe -Command 'lt' -Code { lt $workspace | Out-Null }
         Invoke-CommandProbe -Command 'cat' -Code { cat $textFile | Out-Null }
+        # bcat is only defined when bat is installed; exercise it when present, otherwise record a skip.
+        if (Get-Command bat -ErrorAction Ignore) {
+            Invoke-CommandProbe -Command 'bcat' -Code { bcat $textFile | Out-Null }
+        }
+        else {
+            Invoke-CommandProbe -Command 'bcat' -SkipReason 'Requires bat (not installed in CI)'
+        }
         Invoke-CommandProbe -Command 'ff' -Code {
             $before = Get-Location
             try {
