@@ -228,7 +228,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | --- | --- |
 | `gs` | git status |
 | `ga` | git add . |
-| `gc <msg>` | git commit -m |
+| `gcmsg <msg>` | git commit -m |
 | `gpush` / `gpull` | git push / pull |
 | `gcl <repo>` | git clone |
 | `gcom <msg>` | git add . + commit |
@@ -239,8 +239,8 @@ Run `Show-Help` in your terminal for a colored version of this list.
 
 | Command | Description |
 | --- | --- |
-| `ls` / `la` / `ll` / `lt` | eza listings (icons, hidden, long+git, tree) |
-| `cat <file>` | Syntax-highlighted viewer (bat) |
+| `la` / `ll` / `lt` | eza listings (hidden, long+git, tree); `ls` stays the built-in Get-ChildItem |
+| `bcat <file>` | Syntax-highlighted viewer (bat); `cat` stays the built-in Get-Content |
 | `ff <name>` | Find files recursively |
 | `nf <name>` | Create new file |
 | `mkcd <dir>` | Create directory and cd into it |

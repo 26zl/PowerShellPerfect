@@ -649,7 +649,7 @@ try {
     'killport','http','prettyjson','hb','timer','watch','bak',
     'hosts','weather','speedtest','wifipass','eventlog','path','env',
     'svc','rdp','cpy','pst','Invoke-Clipboard',
-    'gs','ga','gc','gpush','gpull','g','gcl','gcom','lazyg',
+    'gs','ga','gcmsg','gpush','gpull','g','gcl','gcom','lazyg',
     'ls','la','ll','lt','cat','docs','dtop','admin','reload',
     'ep','su'
 )
@@ -1219,7 +1219,7 @@ T 'Reconfigure-Profile' {
 # ===== GIT =====
 T 'gs'    { gs }
 T 'ga'    { [System.IO.File]::WriteAllText((Join-Path $gr 'new.txt'), 'x', [System.Text.UTF8Encoding]::new($false)); ga }
-T 'gc'    { gc "test commit" }
+T 'gcmsg' { gcmsg "test commit" }
 T 'gcom'  { [System.IO.File]::WriteAllText((Join-Path $gr 'new2.txt'), 'y', [System.Text.UTF8Encoding]::new($false)); gcom "test gcom" }
 T 'gpush' $null 'no remote configured'
 T 'gpull' $null 'no remote configured'

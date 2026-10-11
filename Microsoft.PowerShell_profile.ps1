@@ -2211,16 +2211,9 @@ function dtop {
 
 # Enhanced Listing (eza - modern ls replacement with icons and git status)
 if (Get-Command eza -ErrorAction Ignore) {
-    # Remove-Alias exists only in PS6+; PS5 needs Remove-Item on the Alias: drive
-    if (Get-Command Remove-Alias -ErrorAction Ignore) {
-        Remove-Alias ls -Force -ErrorAction SilentlyContinue
-    }
-    else {
-        Remove-Item Alias:\ls -Force -ErrorAction SilentlyContinue
-    }
-    # ls/la/ll/lt: directory listing via eza (icons, git status, tree). Pass the icon setting as
+    # la/ll/lt expose eza under distinct names; the built-in ls alias (Get-ChildItem) is left intact
+    # so scripts run later in this session keep the standard listing. Pass the icon setting as
     # --icons=WHEN: eza takes an optional value there, so a bare --icons swallows a following path.
-    function ls { eza --icons=auto @args }
     function la { eza -a --icons=auto @args }
     function ll { eza -la --icons=auto --git @args }
     function lt { eza --tree --icons=auto --level=2 @args }
@@ -2236,14 +2229,9 @@ else {
 # Syntax-highlighted file viewer (bat - modern cat replacement)
 if (-not $env:BAT_THEME) { $env:BAT_THEME = "TwoDark" }
 if (Get-Command bat -ErrorAction Ignore) {
-    if (Get-Command Remove-Alias -ErrorAction Ignore) {
-        Remove-Alias cat -Force -ErrorAction SilentlyContinue
-    }
-    else {
-        Remove-Item Alias:\cat -Force -ErrorAction SilentlyContinue
-    }
-    # cat: syntax-highlighted output via bat (no paging)
-    function cat { bat --paging=never @args }
+    # bcat exposes bat under a distinct name; the built-in cat alias (Get-Content) is left intact so
+    # scripts run later in this session keep reading raw file contents.
+    function bcat { bat --paging=never @args }
 }
 else {
     if ($isInteractive) { Write-Warning "bat not found. Install it with: winget install -e --id sharkdp.bat" }
@@ -2255,26 +2243,20 @@ function gs { git status }
 # Git add all
 function ga { git add .; if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed (exit $LASTEXITCODE)" } }
 
-# Remove built-in gc alias (Get-Content) so our function is reachable
-if (Get-Command Remove-Alias -ErrorAction Ignore) {
-    Remove-Alias gc -Force -ErrorAction SilentlyContinue
-}
-else {
-    Remove-Item Alias:\gc -Force -ErrorAction SilentlyContinue
-}
-# Git commit with message
-function gc {
-    if (-not $args) { Write-Error "Usage: gc <message> [git-flags]"; return }
+# Git commit with message. Named gcmsg, not gc, so the built-in gc alias (Get-Content) stays intact
+# for scripts run later in this session.
+function gcmsg {
+    if (-not $args) { Write-Error "Usage: gcmsg <message> [git-flags]"; return }
     $msg = $args[0]
     $rest = @($args | Select-Object -Skip 1)
     git commit -m $msg @rest
     if ($LASTEXITCODE -ne 0) { Write-Warning "git commit failed (exit $LASTEXITCODE)" }
 }
 
-# Remove built-in gp alias (Get-Process) so our function is reachable
+# Git push (gp is a built-in alias, so this is named gpush)
 function gpush { git push }
 
-# Remove built-in gl alias (Get-ChildItem) so our function is reachable
+# Git pull (gl is a built-in alias, so this is named gpull)
 function gpull { git pull }
 
 # Jump to github directory via zoxide
@@ -3756,11 +3738,7 @@ if (Get-Command ssh -ErrorAction Ignore) {
     function ssh {
         # Match both spaced and compact OpenSSH -o option forms.
         $argText = ($args -join ' ')
-        $extra = @()
-        if ($argText -notmatch '-o\s*ConnectTimeout') { $extra += '-o'; $extra += 'ConnectTimeout=10' }
-        if ($argText -notmatch '-o\s*ServerAliveInterval') { $extra += '-o'; $extra += 'ServerAliveInterval=30' }
-        if ($argText -notmatch '-o\s*ServerAliveCountMax') { $extra += '-o'; $extra += 'ServerAliveCountMax=3' }
-        # Use the first positional SSH argument as the tab title.
+        # Use the first positional SSH argument as the tab title and as the host for config lookup.
         $target = $null
         $skipNext = $false
         $flagsWithValue = @('-p', '-i', '-l', '-o', '-F', '-L', '-R', '-D', '-W', '-B', '-b', '-c', '-E', '-e', '-I', '-J', '-m', '-O', '-Q', '-S', '-w')
@@ -3773,6 +3751,33 @@ if (Get-Command ssh -ErrorAction Ignore) {
             $target = [string]$a
             break
         }
+
+        # Add timeout/keepalive defaults only where neither the command line nor the host's effective
+        # config already set them, so the user's ~/.ssh/config is never overridden. ssh -G reports an
+        # unset ConnectTimeout as "none" and an unset ServerAliveInterval as "0".
+        $effective = @{}
+        if ($target) {
+            try {
+                foreach ($line in (& ssh.exe -G $target 2>$null)) {
+                    if ($line -match '^\s*(\S+)\s+(.+?)\s*$') { $effective[$matches[1].ToLowerInvariant()] = $matches[2] }
+                }
+            }
+            catch { $null = $_ }
+        }
+        $extra = @()
+        if ($argText -notmatch '-o\s*ConnectTimeout' -and
+            (-not $effective.ContainsKey('connecttimeout') -or $effective['connecttimeout'] -eq 'none')) {
+            $extra += '-o'; $extra += 'ConnectTimeout=10'
+        }
+        if ($argText -notmatch '-o\s*ServerAliveInterval' -and
+            (-not $effective.ContainsKey('serveraliveinterval') -or $effective['serveraliveinterval'] -eq '0')) {
+            $extra += '-o'; $extra += 'ServerAliveInterval=30'
+        }
+        if ($argText -notmatch '-o\s*ServerAliveCountMax' -and
+            (-not $effective.ContainsKey('serveralivecountmax') -or $effective['serveralivecountmax'] -eq '3')) {
+            $extra += '-o'; $extra += 'ServerAliveCountMax=3'
+        }
+
         $oldTitle = if ($target) { Push-TabTitle "ssh $target" } else { $null }
         try {
             if ($MyInvocation.ExpectingInput) { $input | & ssh.exe @extra @args }
@@ -6242,14 +6247,14 @@ ${g}Test-ProfileHealth${r} [-PassThru] / ${g}psp-doctor${r} - Diagnose install: 
 ${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults, -Force to uninstall PSFzf/tools even under CI/agent env vars.
 
 ${c}Git${r}
-${g}gs${r} - git status.  ${g}ga${r} - git add .  ${g}gc${r} <msg> - git commit -m.
+${g}gs${r} - git status.  ${g}ga${r} - git add .  ${g}gcmsg${r} <msg> - git commit -m.
 ${g}gpush${r} / ${g}gpull${r} - git push / pull.  ${g}gcl${r} <repo> - git clone.
 ${g}gcom${r} <msg> - add + commit.  ${g}lazyg${r} <msg> - add + commit + push.
 ${g}g${r} - zoxide jump to github dir.
 
 ${c}Files & Navigation${r}
-${g}ls${r} / ${g}la${r} / ${g}ll${r} / ${g}lt${r} - eza listings (icons, hidden, long+git, tree).
-${g}cat${r} <file> - Syntax-highlighted viewer (bat).
+${g}la${r} / ${g}ll${r} / ${g}lt${r} - eza listings (hidden, long+git, tree). ${g}ls${r} stays Get-ChildItem.
+${g}bcat${r} <file> - Syntax-highlighted viewer (bat). ${g}cat${r} stays Get-Content.
 ${g}ff${r} <name> - Find files recursively.  ${g}nf${r} <name> - Create new file.
 ${g}mkcd${r} <dir> - Create dir and cd into it.
 ${g}touch${r} <file> - Create file or update timestamp.
@@ -6426,7 +6431,7 @@ $script:_seedCommands = @(
     @{ Name = 'Test-Profile'; Category = 'Profile'; Synopsis = 'Profile diagnostics' }
     @{ Name = 'gs'; Category = 'Git'; Synopsis = 'git status' }
     @{ Name = 'ga'; Category = 'Git'; Synopsis = 'git add .' }
-    @{ Name = 'gc'; Category = 'Git'; Synopsis = 'git commit -m' }
+    @{ Name = 'gcmsg'; Category = 'Git'; Synopsis = 'git commit -m' }
     @{ Name = 'gpush'; Category = 'Git'; Synopsis = 'git push' }
     @{ Name = 'gpull'; Category = 'Git'; Synopsis = 'git pull' }
     @{ Name = 'gcl'; Category = 'Git'; Synopsis = 'git clone' }
@@ -6435,11 +6440,10 @@ $script:_seedCommands = @(
     @{ Name = 'g'; Category = 'Git'; Synopsis = 'zoxide jump to github dir' }
     @{ Name = 'gcof'; Category = 'Git'; Synopsis = 'Fuzzy git branch checkout (fzf)' }
     @{ Name = 'gitignore'; Category = 'Git'; Synopsis = 'Generate .gitignore from gitignore.io' }
-    @{ Name = 'ls'; Category = 'Files'; Synopsis = 'eza listing' }
     @{ Name = 'la'; Category = 'Files'; Synopsis = 'eza listing with hidden' }
     @{ Name = 'll'; Category = 'Files'; Synopsis = 'eza long + git listing' }
     @{ Name = 'lt'; Category = 'Files'; Synopsis = 'eza tree listing' }
-    @{ Name = 'cat'; Category = 'Files'; Synopsis = 'Syntax-highlighted viewer (bat)' }
+    @{ Name = 'bcat'; Category = 'Files'; Synopsis = 'Syntax-highlighted viewer (bat)' }
     @{ Name = 'ff'; Category = 'Files'; Synopsis = 'Find files recursively' }
     @{ Name = 'nf'; Category = 'Files'; Synopsis = 'Create new file' }
     @{ Name = 'touch'; Category = 'Files'; Synopsis = 'Create file or update timestamp' }

@@ -551,13 +551,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             }
             finally { Set-Location $before }
         }
-        Invoke-CommandProbe -Command 'gc' -Code {
+        Invoke-CommandProbe -Command 'gcmsg' -Code {
             $before = Get-Location
             try {
                 Set-Location $gitRepo
-                gc 'ci gc commit'
+                gcmsg 'ci gcmsg commit'
                 $last = (git log -1 --pretty=%s | Out-String).Trim()
-                if ($last -ne 'ci gc commit') { throw "gc commit mismatch: $last" }
+                if ($last -ne 'ci gcmsg commit') { throw "gcmsg commit mismatch: $last" }
             }
             finally { Set-Location $before }
         }
