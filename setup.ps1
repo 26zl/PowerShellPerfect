@@ -299,7 +299,7 @@ function Save-WizardChoices {
     )
     $utf8 = [System.Text.UTF8Encoding]::new($false)
     $s = if (Test-Path $UserSettingsPath) {
-        try { (Get-Content $UserSettingsPath -Raw | ConvertFrom-Json -ErrorAction Stop) }
+        try { (Get-Content $UserSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop) }
         catch { [PSCustomObject]@{} }
     }
     else { [PSCustomObject]@{} }
@@ -426,7 +426,7 @@ function Start-InstallWizard {
     # Resume from state file if caller passed one that exists
     if ($StatePath -and (Test-Path $StatePath)) {
         try {
-            $prev = Get-Content $StatePath -Raw | ConvertFrom-Json
+            $prev = Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
             $prevSchema = if ($prev.PSObject.Properties['schemaVersion']) { [int]$prev.schemaVersion } else { 1 }
             if ($prevSchema -ne $WIZARD_STATE_SCHEMA) {
                 Write-Host ''
@@ -1107,7 +1107,7 @@ if ($wantWizard) {
 try {
     $configTmp = Join-Path $env:TEMP ("psp-theme-" + [System.IO.Path]::GetRandomFileName() + ".json")
     Copy-Item (Resolve-SetupSourcePath -Kind 'theme') $configTmp -Force -ErrorAction Stop
-    $profileConfig = Get-Content $configTmp -Raw | ConvertFrom-Json
+    $profileConfig = Get-Content $configTmp -Raw -Encoding UTF8 | ConvertFrom-Json
     Copy-Item $configTmp (Join-Path $configCachePath "theme.json") -Force
     Remove-Item $configTmp -ErrorAction SilentlyContinue
 }
@@ -1120,7 +1120,7 @@ $terminalConfig = $null
 try {
     $terminalConfigTmp = Join-Path $env:TEMP ("psp-terminal-" + [System.IO.Path]::GetRandomFileName() + ".json")
     Copy-Item (Resolve-SetupSourcePath -Kind 'terminal') $terminalConfigTmp -Force -ErrorAction Stop
-    $terminalConfig = Get-Content $terminalConfigTmp -Raw | ConvertFrom-Json
+    $terminalConfig = Get-Content $terminalConfigTmp -Raw -Encoding UTF8 | ConvertFrom-Json
     Copy-Item $terminalConfigTmp (Join-Path $configCachePath "terminal-config.json") -Force
     Remove-Item $terminalConfigTmp -ErrorAction SilentlyContinue
 }
@@ -1153,7 +1153,7 @@ $script:WtManaged = $true
 $userSettingsPath = Join-Path $configCachePath "user-settings.json"
 if (Test-Path $userSettingsPath) {
     try {
-        $userSettings = Get-Content $userSettingsPath -Raw | ConvertFrom-Json
+        $userSettings = Get-Content $userSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
         # windowsTerminal.manage = false hands settings.json to another tool, such as a dotfiles repo.
         if ($userSettings.windowsTerminal -and $userSettings.windowsTerminal.PSObject.Properties['manage'] -and $userSettings.windowsTerminal.manage -eq $false) { $script:WtManaged = $false }
         if ($profileConfig -and $userSettings.theme) {
@@ -1217,6 +1217,13 @@ foreach ($dir in $profileDirs) {
         $tempDownload = Join-Path $env:TEMP ("psp-profile_download_" + (Split-Path $dir -Leaf) + "_" + [System.IO.Path]::GetRandomFileName() + ".ps1")
         Copy-Item (Resolve-SetupSourcePath -Kind 'profile') $tempDownload -Force -ErrorAction Stop
         if (Test-Path -Path $targetProfile -PathType Leaf) {
+            # Preserve the pre-install profile once as an immutable copy that rotation never deletes
+            # and Uninstall-Profile restores; oldprofile* rotation below never matches this name.
+            $originalBackup = Join-Path $dir 'profile.original.ps1'
+            if (-not (Test-Path -Path $originalBackup)) {
+                Copy-Item -Path $targetProfile -Destination $originalBackup -Force
+                Write-Host "  Original profile saved to [$originalBackup]" -ForegroundColor DarkGray
+            }
             # Keep the latest five timestamped profile backups.
             $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
             $backupPath = Join-Path $dir ("oldprofile.$backupStamp.ps1")
@@ -1402,13 +1409,13 @@ function Install-OhMyPoshTheme {
         $alreadyValid = $false
         if (Test-Path -LiteralPath $themeFilePath -PathType Leaf) {
             try {
-                $null = Get-Content $themeFilePath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $null = Get-Content $themeFilePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
                 $alreadyValid = $true
             } catch { $null = $_ }
         }
         if (-not $alreadyValid) {
             Invoke-DownloadWithRetry -Uri $ThemeUrl -OutFile $themeFilePath
-            $null = Get-Content $themeFilePath -Raw | ConvertFrom-Json
+            $null = Get-Content $themeFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
             Write-Host "  Theme '$ThemeName' downloaded." -ForegroundColor Green
         }
         else {
@@ -1606,7 +1613,7 @@ foreach ($wtSettingsPath in $wtSettingsPaths) {
         $wt = $null
         for ($wtAttempt = 1; $wtAttempt -le 2; $wtAttempt++) {
             try {
-                $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
+                $wtRaw = (Get-Content $wtSettingsPath -Raw -Encoding UTF8) -replace $jsoncCommentPattern, ''
                 $wt = $wtRaw | ConvertFrom-Json
                 break
             }

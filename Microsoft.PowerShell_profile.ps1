@@ -900,6 +900,18 @@ function Update-Profile {
                 foreach ($dir in $profileDirs) {
                     $target = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
                     if (Test-Path $dir) {
+                        # Back up the current profile before overwriting it, keeping the latest five
+                        # (profile.original.ps1 is never matched, so the first-install copy survives).
+                        if (Test-Path -Path $target -PathType Leaf) {
+                            try {
+                                $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+                                Copy-Item -Path $target -Destination (Join-Path $dir "oldprofile.$backupStamp.ps1") -Force -ErrorAction Stop
+                                Get-ChildItem -Path $dir -Filter 'oldprofile*.ps1' -ErrorAction SilentlyContinue |
+                                    Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+                                    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                            }
+                            catch { Write-Warning "Could not back up $target before update: $_" }
+                        }
                         try {
                             Copy-Item -Path $tempProfile -Destination $target -Force -ErrorAction Stop
                             $copySuccess++
@@ -1991,10 +2003,14 @@ function sed($file, $find, $replace) {
     }
     if ($null -eq $find -or $find -eq '') { Write-Error "Usage: sed <file> <find> <replace>"; return }
     if ($null -eq $replace) { $replace = '' }
-    $content = Get-Content -LiteralPath $file -Raw
+    $resolved = (Resolve-Path -LiteralPath $file).Path
+    # Read as UTF-8 (BOM-aware) so non-ASCII content survives the rewrite on Windows PowerShell 5.1.
+    $content = Get-Utf8FileText $resolved
     if ($null -eq $content -or $content.Length -eq 0) { Write-Warning "File is empty: $file"; return }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $file).Path, $content.replace("$find", $replace), $utf8NoBom)
+    # Keep a single .bak of the pre-edit content, like sed -i.bak.
+    Copy-Item -LiteralPath $resolved -Destination "$resolved.bak" -Force -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($resolved, $content.replace("$find", $replace), $utf8NoBom)
 }
 
 # Show the full path of a command
@@ -3575,7 +3591,16 @@ function Uninstall-Profile {
     )
     foreach ($dir in $profileDirs) {
         $mainProfile = Join-Path $dir 'Microsoft.PowerShell_profile.ps1'
-        if (Test-Path $mainProfile) {
+        $originalBackup = Join-Path $dir 'profile.original.ps1'
+        if (Test-Path $originalBackup) {
+            # Restore the pre-install profile saved on first install instead of leaving none behind.
+            if ($PSCmdlet.ShouldProcess($mainProfile, 'Restore original profile saved before first install')) {
+                Copy-Item -Path $originalBackup -Destination $mainProfile -Force -ErrorAction SilentlyContinue
+                Remove-Item $originalBackup -Force -ErrorAction SilentlyContinue
+                Write-Host "  Restored original profile to $mainProfile" -ForegroundColor Green
+            }
+        }
+        elseif (Test-Path $mainProfile) {
             if ($PSCmdlet.ShouldProcess($mainProfile, 'Remove profile file')) {
                 Remove-Item $mainProfile -Force -ErrorAction SilentlyContinue
                 Write-Host "  Removed $mainProfile" -ForegroundColor DarkGray
