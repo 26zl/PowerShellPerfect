@@ -551,13 +551,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             }
             finally { Set-Location $before }
         }
-        Invoke-CommandProbe -Command 'gc' -Code {
+        Invoke-CommandProbe -Command 'gcmsg' -Code {
             $before = Get-Location
             try {
                 Set-Location $gitRepo
-                gc 'ci gc commit'
+                gcmsg 'ci gcmsg commit'
                 $last = (git log -1 --pretty=%s | Out-String).Trim()
-                if ($last -ne 'ci gc commit') { throw "gc commit mismatch: $last" }
+                if ($last -ne 'ci gcmsg commit') { throw "gcmsg commit mismatch: $last" }
             }
             finally { Set-Location $before }
         }
@@ -584,6 +584,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'll' -Code { ll $workspace | Out-Null }
         Invoke-CommandProbe -Command 'lt' -Code { lt $workspace | Out-Null }
         Invoke-CommandProbe -Command 'cat' -Code { cat $textFile | Out-Null }
+        # bcat is only defined when bat is installed; exercise it when present, otherwise record a skip.
+        if (Get-Command bat -ErrorAction Ignore) {
+            Invoke-CommandProbe -Command 'bcat' -Code { bcat $textFile | Out-Null }
+        }
+        else {
+            Invoke-CommandProbe -Command 'bcat' -SkipReason 'Requires bat (not installed in CI)'
+        }
         Invoke-CommandProbe -Command 'ff' -Code {
             $before = Get-Location
             try {
