@@ -49,8 +49,15 @@ The **install wizard runs by default** — pick theme / scheme / font / features
 Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k configure`. **Runs automatically on every interactive install** — it's the default experience, not an opt-in. Non-interactive environments skip it.
 
 ```powershell
-# Default trusted-download flow — wizard runs as part of installation
+# Recommended (review first): run with no hash flag. setup.ps1 downloads the bundle,
+# prints its SHA-256 hashes, and stops WITHOUT installing. Review them (ideally against
+# the commit list at https://github.com/26zl/PowerShellPerfect/commits/main), then re-run
+# pinning the combined hash for a verified install (the wizard runs during install):
 $setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
+& ([scriptblock]::Create($setup))                                    # prints hashes, then stops
+& ([scriptblock]::Create($setup)) -ExpectedSha256 '<combined-hash>'  # verified install
+
+# Unverified fallback: skip the integrity check and install whatever was just downloaded.
 & ([scriptblock]::Create($setup)) -SkipHashCheck
 
 # Bypass the wizard and apply repo defaults (Tokyo Night + CascadiaCode):
@@ -62,6 +69,8 @@ $setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
 # Re-run the wizard any time after install (downloads latest setup.ps1 + elevates):
 Reconfigure-Profile
 ```
+
+> Same guarantee as the Quick Install above: the printed hash proves download integrity, not upstream authenticity (see the note there). A signed-release or tag-pinning model would add authenticity and is left as a maintainer follow-up.
 
 **Steps** (all accept Enter to keep the default / skip):
 
