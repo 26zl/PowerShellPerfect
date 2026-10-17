@@ -1,11 +1,18 @@
-# Run CI-equivalent and local profile checks with optional -SkipPS5.
+# Run CI-equivalent and local profile checks. Every step that loads the profile or runs setup.ps1 does so inside a
+# disposable sandbox (LOCALAPPDATA, TEMP and $PROFILE redirected, machine-changing commands blocked).
+#   pwsh -NoProfile -File tests/test.ps1               # from a normal (non-elevated) shell
+#   pwsh -NoProfile -File tests/test.ps1 -SkipPS5      # without Windows PowerShell 5.1
 param(
-    [switch]$SkipPS5  # Skip PS5 parse check if powershell.exe is unavailable
+    [switch]$SkipPS5,  # Skip PS5 parse check if powershell.exe is unavailable
+    # Elevated runs are refused because a test mistake could then change machine-wide state; use only in a disposable VM.
+    [switch]$AllowElevated
 )
 
 $ErrorActionPreference = 'Stop'
 # Use the platform temp directory when TEMP is unavailable.
 if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
+. (Join-Path $PSScriptRoot 'lib\Sandbox.ps1')
+Assert-PspTestSafety -AllowElevated:$AllowElevated -ScriptName 'tests/test.ps1'
 # Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $passed = 0
@@ -14,13 +21,10 @@ $skipped = 0
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Clean test sandboxes on terminating errors and normal script exit.
-$script:TestArtifactPatterns = @(
-    'psp-install-*', 'psp-sandbox-*', 'psp-sandbox-all-*', 'psp-lifecycle-*',
-    'psp-setprofile-*', 'psp-exec-*', 'psp-dltest-*', 'psp-omp-*', 'fresh-install-*'
-)
+$script:TestArtifactPatterns = @('psp-test-*', 'psp-child-*')
 $script:SweepTestArtifacts = {
     foreach ($pat in $script:TestArtifactPatterns) {
-        Get-ChildItem -LiteralPath $env:TEMP -Filter $pat -Force -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Filter $pat -Force -ErrorAction SilentlyContinue |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -28,7 +32,7 @@ Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $script:SweepT
 trap {
     Write-Host ''
     Write-Host ('Aborted: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
-    Write-Host 'Sweeping sandbox artifacts in $env:TEMP ...' -ForegroundColor Yellow
+    Write-Host 'Sweeping sandbox artifacts ...' -ForegroundColor Yellow
     & $script:SweepTestArtifacts
     break
 }
@@ -53,6 +57,42 @@ function Write-Result {
     }
 }
 
+# Run a script body in a child process whose first lines enter a fresh sandbox; returns its output lines and exit code.
+# The body sees $RepoRoot, $ProfileSource and $Sandbox and runs with the profile not yet loaded.
+function Invoke-SandboxChild {
+    param([Parameter(Mandatory)][string]$Body, [string]$Exe = 'pwsh', [string[]]$ExtraArgs = @())
+    $childScript = Join-Path ([System.IO.Path]::GetTempPath()) ("psp-child-{0}.ps1" -f [System.IO.Path]::GetRandomFileName())
+    $prelude = @'
+param([string]$RepoRoot)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $RepoRoot 'tests\lib\Sandbox.ps1')
+$ProfileSource = Join-Path $RepoRoot 'Microsoft.PowerShell_profile.ps1'
+$Sandbox = New-PspSandbox -Name 'child'
+Enter-PspSandbox -Sandbox $Sandbox
+try {
+'@
+    $postlude = @'
+
+}
+finally { Exit-PspSandbox -Sandbox $Sandbox }
+'@
+    [System.IO.File]::WriteAllText($childScript, ($prelude + "`r`n" + $Body + "`r`n" + $postlude), [System.Text.UTF8Encoding]::new($false))
+    try {
+        $output = & $Exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childScript -RepoRoot $repoRoot @ExtraArgs 2>&1
+        [PSCustomObject]@{ Output = @($output | ForEach-Object { "$_" }); ExitCode = $LASTEXITCODE }
+    }
+    finally { Remove-Item -LiteralPath $childScript -Force -ErrorAction SilentlyContinue }
+}
+
+# Print child output with colors matched to its status prefixes.
+function Show-ChildOutput {
+    param([string[]]$Lines)
+    foreach ($line in $Lines) {
+        $color = if ($line -match '^\s+(OK|PASS)') { 'Green' } elseif ($line -match 'ASSERT:|^\s+FAIL') { 'Red' } elseif ($line -match '^\s+(WARN|NET)') { 'Yellow' } elseif ($line -match '^\s+SKIP') { 'DarkGray' } else { 'White' }
+        Write-Host "        $line" -ForegroundColor $color
+    }
+}
+
 Write-Host ''
 Write-Host '========== PowerShellPerfect Full Test Suite ==========' -ForegroundColor Cyan
 Write-Host ''
@@ -65,6 +105,7 @@ $srcAll = Get-ChildItem -Path $repoRoot -Recurse -Include *.ps1,*.json,*.md,*.ym
 
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
 $setupPath = Join-Path $repoRoot 'setup.ps1'
+$hasPs5 = -not $SkipPS5 -and [bool](Get-Command powershell.exe -ErrorAction SilentlyContinue)
 
 # =====================================================================
 #  INSTALL: fresh install sandbox
@@ -73,163 +114,40 @@ Write-Host '--- Install: fresh setup sandbox ---' -ForegroundColor Magenta
 Write-Host ''
 
 # -------------------------------------------------------
-# 1. Fresh install sandbox (simulates setup.ps1 on clean system)
+# 1. Fresh install sandbox (setup.ps1 -LocalRepo -CiMode against a disposable sandbox, no network)
 # -------------------------------------------------------
-Write-Host '[1/26] Fresh install sandbox' -ForegroundColor Cyan
+Write-Host '[1/27] Fresh install sandbox' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "fresh-install-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($RepoRoot)
-$ErrorActionPreference = 'Stop'
-
-# Parse setup.ps1 AST to extract functions without running install flow
-$setupFile = Join-Path $RepoRoot 'setup.ps1'
-$tokens = $null; $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count -gt 0) { throw "setup.ps1 has $($parseErrors.Count) parse error(s)" }
-
-$fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
-foreach ($fn in $fnDefs) { Invoke-Expression $fn.Extent.Text }
-Write-Host "  Extracted $($fnDefs.Count) functions from setup.ps1"
-
-# Extract $EditorCandidates
-$varDefs = $ast.FindAll({
-    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -eq '$EditorCandidates'
-}, $true)
-if ($varDefs.Count -gt 0) { Invoke-Expression $varDefs[0].Extent.Text }
-
-# ===== Create sandbox =====
-$sb = Join-Path $env:TEMP "psp-install-$([System.IO.Path]::GetRandomFileName())"
-$cacheDir = Join-Path $sb 'Local\PowerShellProfile'
-$ps7Dir   = Join-Path $sb 'Documents\PowerShell'
-$ps5Dir   = Join-Path $sb 'Documents\WindowsPowerShell'
-$wtLocal  = Join-Path $sb 'Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState'
-New-Item -ItemType Directory -Path $cacheDir, $ps7Dir, $ps5Dir, $wtLocal -Force | Out-Null
-$configCachePath = $cacheDir
-
-# Minimal WT settings.json
-[System.IO.File]::WriteAllText(
-    (Join-Path $wtLocal 'settings.json'),
-    '{"profiles":{"defaults":{"font":{"face":"Consolas"}},"list":[]},"schemes":[],"actions":[]}',
-    [System.Text.UTF8Encoding]::new($false)
-)
-
-$origLocal   = $env:LOCALAPPDATA
-$origProfile = $PROFILE
-$env:LOCALAPPDATA = Join-Path $sb 'Local'
-$global:PROFILE   = Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'
-
+    $r = Invoke-SandboxChild -Body @'
 $errors = @()
-try {
-    # --- Phase 1: Profile copy (simulates setprofile.ps1) ---
-    $profileSrc = Join-Path $RepoRoot 'Microsoft.PowerShell_profile.ps1'
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        Copy-Item $profileSrc (Join-Path $d 'Microsoft.PowerShell_profile.ps1')
-    }
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        $pf = Join-Path $d 'Microsoft.PowerShell_profile.ps1'
-        if (-not (Test-Path $pf)) { $errors += "Profile not copied to $d" }
-    }
-    Write-Host '  OK    Phase 1: profile copy'
-
-    # --- Phase 2: Config download (theme.json, terminal-config.json) ---
-    $themeUrl = 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/theme.json'
-    $tcUrl    = 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/terminal-config.json'
-    Invoke-DownloadWithRetry -Uri $themeUrl -OutFile (Join-Path $cacheDir 'theme.json')
-    Invoke-DownloadWithRetry -Uri $tcUrl    -OutFile (Join-Path $cacheDir 'terminal-config.json')
-    foreach ($cf in @('theme.json', 'terminal-config.json')) {
-        $cfPath = Join-Path $cacheDir $cf
-        if (-not (Test-Path $cfPath) -or (Get-Item $cfPath).Length -eq 0) { $errors += "$cf download failed" }
-        else { $null = Get-Content $cfPath -Raw | ConvertFrom-Json }
-    }
-    Write-Host '  OK    Phase 2: config download'
-
-    # --- Phase 3: OMP theme download ---
-    $themeJson = Get-Content (Join-Path $cacheDir 'theme.json') -Raw | ConvertFrom-Json
-    $themeName = $themeJson.theme.name
-    $themeFileUrl = $themeJson.theme.url
-    Invoke-DownloadWithRetry -Uri $themeFileUrl -OutFile (Join-Path $cacheDir "$themeName.omp.json")
-    $ompFile = Join-Path $cacheDir "$themeName.omp.json"
-    if (-not (Test-Path $ompFile) -or (Get-Item $ompFile).Length -eq 0) { $errors += 'OMP theme download failed' }
-    else { Write-Host "  OK    Phase 3: OMP theme ($themeName)" }
-
-    # --- Phase 4: user-settings.json template ---
-    $usPath = Join-Path $cacheDir 'user-settings.json'
-    $usTemplate = '{"_comment": "User overrides. Keys mirror theme.json / terminal-config.json.", "windowsTerminal": {}}'
-    [System.IO.File]::WriteAllText($usPath, $usTemplate, [System.Text.UTF8Encoding]::new($false))
-    if (-not (Test-Path $usPath)) { $errors += 'user-settings.json not created' }
-    else { Write-Host '  OK    Phase 4: user-settings.json' }
-
-    # --- Phase 5: profile_user.ps1 template ---
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        $upPath = Join-Path $d 'profile_user.ps1'
-        [System.IO.File]::WriteAllText($upPath, '# Personal overrides', [System.Text.UTF8Encoding]::new($false))
-        if (-not (Test-Path $upPath)) { $errors += "profile_user.ps1 not created in $d" }
-    }
-    Write-Host '  OK    Phase 5: profile_user.ps1'
-
-    # --- Phase 6: WT settings merge ---
-    $tcJson = Get-Content (Join-Path $cacheDir 'terminal-config.json') -Raw | ConvertFrom-Json
-    $wtPath = Join-Path $wtLocal 'settings.json'
-    $wt = Get-Content $wtPath -Raw | ConvertFrom-Json
-    $wtDefaults = $wt.profiles.defaults
-    $tcJson.defaults.PSObject.Properties | ForEach-Object {
-        $wtDefaults | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force
-    }
-    if ($themeJson.windowsTerminal.colorScheme) {
-        $wtDefaults | Add-Member -NotePropertyName 'colorScheme' -NotePropertyValue $themeJson.windowsTerminal.colorScheme -Force
-    }
-    [System.IO.File]::WriteAllText($wtPath, ($wt | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
-    $wtCheck = Get-Content $wtPath -Raw | ConvertFrom-Json
-    if (-not $wtCheck.profiles.defaults.font.face) { $errors += 'WT merge: missing font.face' }
-    if ($tcJson.defaults.opacity -and $wtCheck.profiles.defaults.opacity -ne $tcJson.defaults.opacity) { $errors += 'WT merge: opacity mismatch' }
-    Write-Host '  OK    Phase 6: WT settings merge'
-
-    # --- Phase 7: Verify profile loads in sandbox ---
-    $env:CI = 'true'
-    . (Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1')
-    if (-not (Get-Command 'Show-Help' -ErrorAction SilentlyContinue)) { $errors += 'Profile did not load (Show-Help missing)' }
-    if (-not (Get-Command 'Update-Profile' -ErrorAction SilentlyContinue)) { $errors += 'Profile did not load (Update-Profile missing)' }
-    Write-Host '  OK    Phase 7: profile loads in sandbox'
-
-    # --- Phase 8: Nerd Font detection ---
-    try {
-        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Drawing')
-        $fc = New-Object System.Drawing.Text.InstalledFontCollection
-        $nfMatch = @($fc.Families | Where-Object { $_.Name -match 'Caskaydia|NF|Nerd' })
-        $fc.Dispose()
-        if ($nfMatch.Count -gt 0) { Write-Host "  OK    Phase 8: Nerd Font found ($($nfMatch[0].Name))" }
-        else { Write-Host '  WARN  Phase 8: No Nerd Font detected (optional)' }
-    }
-    catch { Write-Host "  WARN  Phase 8: Font check skipped ($_)" }
+New-Item -ItemType Directory -Path $Sandbox.WtDir -Force | Out-Null
+$wtPath = Join-Path $Sandbox.WtDir 'settings.json'
+[System.IO.File]::WriteAllText($wtPath, '{"profiles":{"defaults":{"font":{"face":"Consolas"}},"list":[]},"schemes":[],"actions":[]}', [System.Text.UTF8Encoding]::new($false))
+# No network: downloads fail as if offline (the Oh My Posh theme download is optional).
+function global:Invoke-RestMethod { param([string]$Uri) throw "offline (test sandbox): $Uri" }
+& (Join-Path $RepoRoot 'setup.ps1') -LocalRepo $RepoRoot -CiMode -SkipWizard *> $null
+Remove-Item -Path function:global:Invoke-RestMethod -ErrorAction SilentlyContinue
+if ($LASTEXITCODE -ne 0) { $errors += "setup.ps1 exit code $LASTEXITCODE" }
+foreach ($p in (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1'), (Join-Path $Sandbox.Ps5Dir 'Microsoft.PowerShell_profile.ps1'), (Join-Path $Sandbox.Ps7Dir 'profile_user.ps1')) {
+    if (-not (Test-Path -LiteralPath $p)) { $errors += "missing $p" }
 }
-finally {
-    $env:LOCALAPPDATA = $origLocal
-    $global:PROFILE   = $origProfile
-    Remove-Item $sb -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($f in 'theme.json', 'terminal-config.json', 'user-settings.json', 'installed.json', 'wt-changes.json') {
+    if (-not (Test-Path -LiteralPath (Join-Path $Sandbox.Cache $f))) { $errors += "cache is missing $f" }
 }
-
-if ($errors) {
-    $errors | ForEach-Object { Write-Host "ASSERT: $_" -ForegroundColor Red }
-    exit 1
-}
-Write-Host 'Fresh install sandbox passed'
+$wt = Get-Content -LiteralPath $wtPath -Raw | ConvertFrom-Json
+if ($wt.profiles.defaults.font.face -ne 'CaskaydiaCove NF') { $errors += 'Windows Terminal defaults not applied' }
+Write-Host '  OK    setup.ps1 installed into the sandbox'
+. (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1')
+. $PspPostLoadStubs
+if (-not (Get-Command Show-Help -ErrorAction SilentlyContinue)) { $errors += 'installed profile did not load' }
+else { Write-Host '  OK    installed profile loads' }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $instOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -RepoRoot $repoRoot 2>&1
-    foreach ($line in $instOutput) {
-        $color = if ($line -match '^\s+OK') { 'Green' } elseif ($line -match 'ASSERT:|FAIL') { 'Red' } elseif ($line -match 'WARN') { 'Yellow' } else { 'White' }
-        Write-Host "        $line" -ForegroundColor $color
-    }
-    $assertLines = @($instOutput | Where-Object { $_ -match 'ASSERT:' })
-    if ($assertLines) { $assertLines | ForEach-Object { Write-Host "        $_" -ForegroundColor Yellow } }
-    if ($LASTEXITCODE -ne 0) { throw 'Fresh install sandbox failed' }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'Fresh install sandbox failed' }
     Write-Result 'Fresh install sandbox' 'PASS'
 }
 catch { Write-Result 'Fresh install sandbox' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # =====================================================================
 #  CI JOB 1: lint
@@ -239,76 +157,51 @@ Write-Host '--- CI: lint ---' -ForegroundColor Magenta
 Write-Host ''
 
 # -------------------------------------------------------
-# 2. PSScriptAnalyzer
+# 2. PSScriptAnalyzer (same version and settings as CI)
 # -------------------------------------------------------
-Write-Host '[2/26] PSScriptAnalyzer' -ForegroundColor Cyan
+Write-Host '[2/27] PSScriptAnalyzer' -ForegroundColor Cyan
 try {
-    if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
-        Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+    # The gate never installs modules; without the pinned analyzer the step is skipped with the install command.
+    $lintOutput = & pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'lint.ps1') -NoInstall 2>&1
+    if ($LASTEXITCODE -ne 0 -and (($lintOutput | Out-String) -match 'PSScriptAnalyzer [\d.]+ is not installed')) {
+        Write-Result 'PSScriptAnalyzer' 'SKIP' 'PSScriptAnalyzer 1.25.0 is not installed: Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser (or run tests/lint.ps1, which installs it)'
     }
-    $results = Invoke-ScriptAnalyzer -Path $repoRoot -Recurse -ExcludeRule @(
-        'PSAvoidUsingWriteHost'
-        'PSAvoidUsingWMICmdlet'
-        'PSUseShouldProcessForStateChangingFunctions'
-        'PSUseBOMForUnicodeEncodedFile'
-        'PSReviewUnusedParameter'
-        'PSUseSingularNouns'
-    )
-    $issues = $results | Where-Object Severity -in 'Error','Warning'
-    if ($issues) {
-        $issues | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
-        Write-Result 'PSScriptAnalyzer' 'FAIL' "$($issues.Count) warning(s)/error(s)"
+    elseif ($LASTEXITCODE -ne 0) {
+        $lintOutput | ForEach-Object { Write-Host "        $_" }
+        Write-Result 'PSScriptAnalyzer' 'FAIL' 'warnings or errors (see above)'
     }
     else { Write-Result 'PSScriptAnalyzer' 'PASS' }
 }
 catch { Write-Result 'PSScriptAnalyzer' 'FAIL' $_.Exception.Message }
 
 # -------------------------------------------------------
-# 3. Smoke test (pwsh, non-interactive)
+# 3./4. Smoke test (non-interactive load in a sandbox, both editions)
 # -------------------------------------------------------
-Write-Host '[3/26] Smoke test (pwsh)' -ForegroundColor Cyan
-if ($env:OS -ne 'Windows_NT') {
-    # Run the Windows-targeted profile smoke test only on Windows.
-    Write-Result 'Smoke test (pwsh)' 'SKIP' 'non-Windows host (profile is Windows-targeted)'
-}
-else {
+$smokeBody = @'
+$Error.Clear()
+$WarningPreference = 'SilentlyContinue'
+. $ProfileSource
+if ($Error.Count -gt 0) { $Error | ForEach-Object { Write-Host "ASSERT: load error: $_" }; exit 1 }
+Write-Host ("  OK    loaded in {0} ms" -f $script:PSP.LoadTimeMs)
+'@
+foreach ($edition in @(@{ Step = '[3/27]'; Name = 'Smoke test (pwsh)'; Exe = 'pwsh' }, @{ Step = '[4/27]'; Name = 'Smoke test (PS5)'; Exe = 'powershell.exe' })) {
+    Write-Host "$($edition.Step) $($edition.Name)" -ForegroundColor Cyan
+    if ($env:OS -ne 'Windows_NT') { Write-Result $edition.Name 'SKIP' 'non-Windows host (profile is Windows-targeted)'; continue }
+    if ($edition.Exe -eq 'powershell.exe' -and -not $hasPs5) { Write-Result $edition.Name 'SKIP' 'powershell.exe not available or -SkipPS5'; continue }
     try {
-        $env:CI = 'true'
-        # Scan non-terminating errors in addition to the smoke-test exit code.
-        $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '$profilePath'" 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
-        $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-        if ($smokeErrors.Count -gt 0) { throw "$($smokeErrors.Count) error(s) during load: $($smokeErrors[0])" }
-        Write-Result 'Smoke test (pwsh)' 'PASS'
+        $r = Invoke-SandboxChild -Body $smokeBody -Exe $edition.Exe
+        Show-ChildOutput $r.Output
+        if ($r.ExitCode -ne 0) { throw "load reported errors (exit $($r.ExitCode))" }
+        Write-Result $edition.Name 'PASS'
     }
-    catch { Write-Result 'Smoke test (pwsh)' 'FAIL' $_.Exception.Message }
-    finally { $env:CI = $null }
-}
-
-# -------------------------------------------------------
-# 4. Smoke test (PS5, non-interactive)
-# -------------------------------------------------------
-Write-Host '[4/26] Smoke test (PS5)' -ForegroundColor Cyan
-if ($SkipPS5 -or -not (Get-Command powershell.exe -ErrorAction SilentlyContinue)) {
-    Write-Result 'Smoke test (PS5)' 'SKIP' 'powershell.exe not available or -SkipPS5'
-}
-else {
-    try {
-        $escaped = $profilePath -replace "'", "''"
-        $ps5Smoke = powershell.exe -NoProfile -Command "`$env:CI = 'true'; `$WarningPreference = 'SilentlyContinue'; . '$escaped'" 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
-        $ps5Errors = @($ps5Smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-        if ($ps5Errors.Count -gt 0) { throw "$($ps5Errors.Count) error(s) during load: $($ps5Errors[0])" }
-        Write-Result 'Smoke test (PS5)' 'PASS'
-    }
-    catch { Write-Result 'Smoke test (PS5)' 'FAIL' $_.Exception.Message }
+    catch { Write-Result $edition.Name 'FAIL' $_.Exception.Message }
 }
 
 # -------------------------------------------------------
 # 5. PS5 parse check (all .ps1 files)
 # -------------------------------------------------------
-Write-Host '[5/26] PS5 parse check' -ForegroundColor Cyan
-if ($SkipPS5 -or -not (Get-Command powershell.exe -ErrorAction SilentlyContinue)) {
+Write-Host '[5/27] PS5 parse check' -ForegroundColor Cyan
+if (-not $hasPs5) {
     Write-Result 'PS5 parse check' 'SKIP' 'powershell.exe not available or -SkipPS5'
 }
 else {
@@ -330,7 +223,7 @@ else {
 # -------------------------------------------------------
 # 6. Hardcoded user paths
 # -------------------------------------------------------
-Write-Host '[6/26] Hardcoded paths' -ForegroundColor Cyan
+Write-Host '[6/27] Hardcoded paths' -ForegroundColor Cyan
 $pathPatterns = @('C:\\Users\\', 'C:/Users/', '/home/', '\\\\Users\\\\')
 $pathFinds = @()
 foreach ($file in $srcPs1) {
@@ -352,7 +245,7 @@ else { Write-Result 'Hardcoded paths' 'PASS' }
 # -------------------------------------------------------
 # 7. Non-ASCII characters
 # -------------------------------------------------------
-Write-Host '[7/26] Non-ASCII characters' -ForegroundColor Cyan
+Write-Host '[7/27] Non-ASCII characters' -ForegroundColor Cyan
 $asciiFinds = @()
 foreach ($file in $srcPs1) {
     $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
@@ -371,9 +264,9 @@ else { Write-Result 'Non-ASCII characters' 'PASS' }
 # -------------------------------------------------------
 # 8. UTF-8 BOM
 # -------------------------------------------------------
-Write-Host '[8/26] UTF-8 BOM' -ForegroundColor Cyan
+Write-Host '[8/27] UTF-8 BOM' -ForegroundColor Cyan
 $bomFinds = @()
-$bomFiles = Get-ChildItem -Path $repoRoot -Recurse -Include *.ps1,*.json |
+$bomFiles = Get-ChildItem -Path $repoRoot -Recurse -Include *.ps1,*.psd1,*.json |
     Where-Object { $_.FullName -notlike '*\.git\*' -and $_.Name -ne $selfExclude }
 foreach ($file in $bomFiles) {
     $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
@@ -390,7 +283,7 @@ else { Write-Result 'UTF-8 BOM' 'PASS' }
 # -------------------------------------------------------
 # 9. Set-Content -Encoding UTF8 (produces BOM on PS5)
 # -------------------------------------------------------
-Write-Host '[9/26] Set-Content Encoding check' -ForegroundColor Cyan
+Write-Host '[9/27] Set-Content Encoding check' -ForegroundColor Cyan
 $scFinds = @()
 foreach ($file in $srcPs1) {
     $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
@@ -409,7 +302,7 @@ else { Write-Result 'Set-Content UTF8' 'PASS' }
 # -------------------------------------------------------
 # 10. Secrets scan
 # -------------------------------------------------------
-Write-Host '[10/26] Secrets scan' -ForegroundColor Cyan
+Write-Host '[10/27] Secrets scan' -ForegroundColor Cyan
 $secretPatterns = @(
     '(?i)(api[_-]?key|apikey)\s*[:=]\s*[''"][A-Za-z0-9+/=]{16,}[''"]'
     '(?i)(secret|token|password)\s*[:=]\s*[''"][^''"]{8,}[''"]'
@@ -446,7 +339,7 @@ Write-Host ''
 # -------------------------------------------------------
 # 11. JSON config validation
 # -------------------------------------------------------
-Write-Host '[11/26] JSON config validation' -ForegroundColor Cyan
+Write-Host '[11/27] JSON config validation' -ForegroundColor Cyan
 $jsonErrors = 0
 foreach ($jf in @('theme.json', 'terminal-config.json')) {
     $jfPath = Join-Path $repoRoot $jf
@@ -459,19 +352,22 @@ if ($jsonErrors -gt 0) { Write-Result 'JSON configs' 'FAIL' "$jsonErrors file(s)
 else { Write-Result 'JSON configs' 'PASS' }
 
 # -------------------------------------------------------
-# 12. Config schema (required keys)
+# 12. Config schema (required keys and pins)
 # -------------------------------------------------------
-Write-Host '[12/26] Config schema' -ForegroundColor Cyan
+Write-Host '[12/27] Config schema' -ForegroundColor Cyan
 $theme = Get-Content (Join-Path $repoRoot 'theme.json') -Raw | ConvertFrom-Json
 $terminal = Get-Content (Join-Path $repoRoot 'terminal-config.json') -Raw | ConvertFrom-Json
 $schemaErrors = @()
 if (-not $theme.theme.name) { $schemaErrors += 'theme.json: missing theme.name' }
 if (-not $theme.theme.url) { $schemaErrors += 'theme.json: missing theme.url' }
+if ($theme.theme.url -match '/main/') { $schemaErrors += 'theme.json: theme.url follows a branch instead of a release tag' }
+if ($theme.theme.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { $schemaErrors += 'theme.json: theme.sha256 missing or malformed' }
 if (-not $terminal.defaults) { $schemaErrors += 'terminal-config.json: missing defaults' }
 if (-not $terminal.fontInstall) { $schemaErrors += 'terminal-config.json: missing fontInstall' }
 if (-not $terminal.fontInstall.name) { $schemaErrors += 'terminal-config.json: missing fontInstall.name' }
 if (-not $terminal.fontInstall.displayName) { $schemaErrors += 'terminal-config.json: missing fontInstall.displayName' }
-if (-not $terminal.fontInstall.version) { $schemaErrors += 'terminal-config.json: missing fontInstall.version' }
+if ($terminal.fontInstall.version -notmatch '^\d+\.\d+\.\d+$') { $schemaErrors += 'terminal-config.json: fontInstall.version missing or not x.y.z' }
+if ($terminal.fontInstall.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { $schemaErrors += 'terminal-config.json: fontInstall.sha256 missing or malformed' }
 if ($schemaErrors) {
     $schemaErrors | ForEach-Object { Write-Host "        $_" -ForegroundColor Red }
     Write-Result 'Config schema' 'FAIL' "$($schemaErrors.Count) issue(s)"
@@ -479,57 +375,44 @@ if ($schemaErrors) {
 else { Write-Result 'Config schema' 'PASS' }
 
 # -------------------------------------------------------
-# 13. setup.ps1 dry-run (required function definitions)
+# 13. setup.ps1 structure (functions, copies identical to the profile, verification before changes)
 # -------------------------------------------------------
-Write-Host '[13/26] setup.ps1 function definitions' -ForegroundColor Cyan
+Write-Host '[13/27] setup.ps1 structure' -ForegroundColor Cyan
 try {
+    $problems = @()
     $setupContent = Get-Content $setupPath -Raw
-    $requiredFunctions = @(
-        'Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme',
-        'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor',
-        'Invoke-DownloadWithRetry', 'Remove-SafeTempDirectory',
-        'Update-SessionPathFromRegistry'
-    )
-    $missingFns = @()
-    foreach ($fn in $requiredFunctions) {
-        if ($setupContent -notmatch "function\s+$fn\b") { $missingFns += $fn }
+    foreach ($fn in 'Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Select-PreferredEditor',
+        'Remove-SafeTempDirectory', 'Initialize-InstallBundle', 'Save-WizardChoices', 'Resolve-WizardState', 'Invoke-SetupInstall') {
+        if ($setupContent -notmatch "function\s+$fn\b") { $problems += "missing function $fn" }
     }
-    $remotePreflightStart = Select-String -Path $setupPath -Pattern 'For remote installs, verify/download' | Select-Object -First 1
-    $remotePreflight = Select-String -Path $setupPath -Pattern '^\s*Initialize-RemoteInstallBundle\s*$' |
-        Where-Object { $remotePreflightStart -and $_.LineNumber -gt $remotePreflightStart.LineNumber } |
-        Select-Object -First 1
-    $policyMutation = Select-String -Path $setupPath -Pattern 'Set-ExecutionPolicy RemoteSigned' | Select-Object -First 1
-    if (-not $remotePreflight) { $missingFns += 'remote bundle preflight call' }
-    elseif ($policyMutation -and $remotePreflight.LineNumber -gt $policyMutation.LineNumber) {
-        $missingFns += 'remote bundle preflight before mutations'
+    # Helpers setup.ps1 needs before the bundle is verified are copies; they must match the profile exactly.
+    foreach ($fn in 'Write-PspHost', 'Invoke-DownloadWithRetry', 'Get-CombinedSha256', 'Resolve-PspCommitSha', 'Get-PspReleaseChecksums') {
+        $a = (Get-PspFunctionSource -Path $setupPath -Name $fn) -replace "`r`n", "`n"
+        $b = (Get-PspFunctionSource -Path $profilePath -Name $fn) -replace "`r`n", "`n"
+        if ($a -cne $b) { $problems += "$fn in setup.ps1 differs from the profile" }
     }
-    if ($setupContent -match [regex]::Escape('$env:PATH = [System.Environment]::GetEnvironmentVariable(''PATH'', ''Machine'') + '';'' + [System.Environment]::GetEnvironmentVariable(''PATH'', ''User'')')) {
-        $missingFns += 'safe PATH registry refresh'
+    # Everything else setup.ps1 loads from the verified profile must exist there.
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupPath -Variable '$script:SharedFunctionNames')))
+    try { $null = Get-PspFunctionSource -Path $profilePath -Name $script:SharedFunctionNames }
+    catch { $problems += $_.Exception.Message }
+    # The main flow verifies the bundle before it installs anything.
+    $verifyAt = $setupContent.IndexOf('$script:Bundle = Initialize-InstallBundle')
+    $installAt = $setupContent.IndexOf('$installed = Invoke-SetupInstall')
+    if ($verifyAt -lt 0 -or $installAt -lt 0 -or $verifyAt -gt $installAt) { $problems += 'bundle verification does not come before installation' }
+    if ($problems) {
+        $problems | ForEach-Object { Write-Host "        $_" -ForegroundColor Red }
+        Write-Result 'setup.ps1 structure' 'FAIL' "$($problems.Count) problem(s)"
     }
-    if ($missingFns) {
-        $missingFns | ForEach-Object { Write-Host "        Missing: $_" -ForegroundColor Red }
-        Write-Result 'setup.ps1 functions' 'FAIL' "$($missingFns.Count) missing"
-    }
-    else { Write-Result 'setup.ps1 functions' 'PASS' }
+    else { Write-Result 'setup.ps1 structure' 'PASS' }
 }
-catch { Write-Result 'setup.ps1 functions' 'FAIL' $_.Exception.Message }
+catch { Write-Result 'setup.ps1 structure' 'FAIL' $_.Exception.Message }
 
 # -------------------------------------------------------
-# 14. Merge-JsonObject unit tests
+# 14. Merge-JsonObject tests (the profile's own function)
 # -------------------------------------------------------
-Write-Host '[14/26] Merge-JsonObject tests' -ForegroundColor Cyan
+Write-Host '[14/27] Merge-JsonObject tests' -ForegroundColor Cyan
 try {
-    function Merge-JsonObject($base, $override) {
-        foreach ($prop in $override.PSObject.Properties) {
-            $baseVal = $base.PSObject.Properties[$prop.Name]
-            if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
-                Merge-JsonObject $baseVal.Value $prop.Value
-            }
-            else {
-                $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
-            }
-        }
-    }
+    . ([scriptblock]::Create((Get-PspFunctionSource -Path $profilePath -Name 'Merge-JsonObject')))
 
     # Flat merge
     $b = [PSCustomObject]@{ a = 1; b = 2 }
@@ -546,54 +429,31 @@ try {
     Merge-JsonObject $b ([PSCustomObject]@{ theme = [PSCustomObject]@{ name = 'pure' } })
     if ($b.theme.name -ne 'pure') { throw 'Object replacement failed' }
 
+    # A null base is a caller bug and must not be ignored.
+    $threw = $false
+    try { Merge-JsonObject $null ([PSCustomObject]@{ a = 1 }) } catch { $threw = $true }
+    if (-not $threw) { throw 'Null base accepted' }
+
     Write-Result 'Merge-JsonObject tests' 'PASS'
 }
 catch { Write-Result 'Merge-JsonObject tests' 'FAIL' $_.Exception.Message }
 
 # -------------------------------------------------------
-# 15. WT settings merge mock (defaults + scheme + keybindings + JSON roundtrip)
+# 15. Regression tests (tests/unit.ps1, both editions)
 # -------------------------------------------------------
-Write-Host '[15/26] WT settings merge mock' -ForegroundColor Cyan
-try {
-    $mockWt = [PSCustomObject]@{
-        profiles = [PSCustomObject]@{
-            defaults = [PSCustomObject]@{ font = [PSCustomObject]@{ face = 'Consolas'; size = 10 } }
-            list = @()
-        }
-        schemes = @(); actions = @()
+Write-Host '[15/27] Regression tests (tests/unit.ps1)' -ForegroundColor Cyan
+$unitArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'unit.ps1'))
+if ($AllowElevated) { $unitArgs += '-AllowElevated' }
+foreach ($exe in @('pwsh') + @(if ($hasPs5) { 'powershell.exe' })) {
+    try {
+        $unitOutput = & $exe @unitArgs 2>&1 | ForEach-Object { "$_" }
+        $unitExit = $LASTEXITCODE
+        Show-ChildOutput @($unitOutput | Where-Object { $_ -match '^\s+(PASS|FAIL)|passed|^\s{8}' })
+        if ($unitExit -ne 0) { throw "tests/unit.ps1 failed under $exe" }
+        Write-Result "Regression tests ($exe)" 'PASS'
     }
-    $defaults = $mockWt.profiles.defaults
-
-    # Apply terminal-config defaults
-    $terminal.defaults.PSObject.Properties | ForEach-Object {
-        $defaults | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force
-    }
-    if ($theme.windowsTerminal.colorScheme) {
-        $defaults | Add-Member -NotePropertyName 'colorScheme' -NotePropertyValue $theme.windowsTerminal.colorScheme -Force
-    }
-    if ($defaults.opacity -ne $terminal.defaults.opacity) { throw "opacity mismatch" }
-    if ($defaults.colorScheme -ne $theme.windowsTerminal.colorScheme) { throw "colorScheme mismatch" }
-    if ($defaults.font.face -ne $terminal.defaults.font.face) { throw "font.face mismatch" }
-
-    # Scheme upsert
-    $schemeDef = $theme.windowsTerminal.scheme
-    $mockWt.schemes = @(@($mockWt.schemes | Where-Object { $_ -and $_.name -ne $schemeDef.name }) + ([PSCustomObject]$schemeDef))
-    if ($mockWt.schemes.Count -ne 1 -or $mockWt.schemes[0].name -ne $schemeDef.name) { throw 'Scheme upsert failed' }
-
-    # Keybinding upsert
-    foreach ($kb in $terminal.keybindings) {
-        $mockWt.actions = @($mockWt.actions) + ([PSCustomObject]@{ keys = $kb.keys; command = $kb.command })
-    }
-    $firstKb = @($terminal.keybindings)[0]
-    $found = $mockWt.actions | Where-Object { $_.keys -eq $firstKb.keys }
-    if (-not $found -or $found.command -ne $firstKb.command) { throw 'Keybinding upsert failed' }
-
-    # JSON roundtrip (depth matches production profile/setup writes)
-    $null = ($mockWt | ConvertTo-Json -Depth 100) | ConvertFrom-Json -ErrorAction Stop
-
-    Write-Result 'WT merge mock' 'PASS'
+    catch { Write-Result "Regression tests ($exe)" 'FAIL' $_.Exception.Message }
 }
-catch { Write-Result 'WT merge mock' 'FAIL' $_.Exception.Message }
 
 # =====================================================================
 #  LOCAL-ONLY: profile-level validation
@@ -605,37 +465,39 @@ Write-Host ''
 # -------------------------------------------------------
 # 16. ProfileTools metadata (every entry has required fields)
 # -------------------------------------------------------
-Write-Host '[16/26] ProfileTools metadata' -ForegroundColor Cyan
+Write-Host '[16/27] ProfileTools metadata' -ForegroundColor Cyan
 try {
-    $env:CI = 'true'
-    $output = pwsh -NonInteractive -NoProfile -Command @"
-. '$profilePath'
-`$requiredKeys = @('Name','Id','Cmd','Cache','VerCmd')
-`$errors = @()
-foreach (`$tool in `$script:ProfileTools) {
-    foreach (`$k in `$requiredKeys) {
-        if (-not `$tool.ContainsKey(`$k)) { `$errors += "`$(`$tool.Name): missing `$k" }
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
+. $ProfileSource
+. $PspPostLoadStubs
+$requiredKeys = @('Name', 'Id', 'Cmd', 'Cache', 'VerCmd')
+$errors = @()
+foreach ($tool in $script:ProfileTools) {
+    foreach ($k in $requiredKeys) {
+        if (-not $tool.ContainsKey($k)) { $errors += "$($tool.Name): missing $k" }
     }
-    if (`$tool.Id -and `$tool.Id -notmatch '^[A-Za-z0-9._-]+$') { `$errors += "`$(`$tool.Name): invalid Id format" }
+    if ($tool.Id -and $tool.Id -notmatch '^[A-Za-z0-9._-]+$') { $errors += "$($tool.Name): invalid Id format" }
 }
-if (`$errors) { `$errors | ForEach-Object { Write-Host `$_ }; exit 1 }
-Write-Host "OK: `$(`$script:ProfileTools.Count) tools validated"
-"@
-    if ($LASTEXITCODE -ne 0) { throw "Validation errors (see above)" }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
+Write-Host "  OK    $($script:ProfileTools.Count) tools validated"
+'@
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw "Validation errors (see above)" }
     Write-Result 'ProfileTools metadata' 'PASS'
 }
 catch { Write-Result 'ProfileTools metadata' 'FAIL' $_.Exception.Message }
-finally { $env:CI = $null }
 
 # -------------------------------------------------------
 # 17. Key functions exist after profile load
 # -------------------------------------------------------
-Write-Host '[17/26] Key functions exist' -ForegroundColor Cyan
+Write-Host '[17/27] Key functions exist' -ForegroundColor Cyan
 try {
-    $env:CI = 'true'
-    $output = pwsh -NonInteractive -NoProfile -Command @"
-. '$profilePath'
-`$expected = @(
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
+. $ProfileSource
+. $PspPostLoadStubs
+$expected = @(
     'Update-Profile','Update-PowerShell','Update-Tools','Uninstall-Profile',
     'Clear-ProfileCache','Clear-Cache','Show-Help','Resolve-PreferredEditor',
     'edit','Edit-Profile','Invoke-DownloadWithRetry',
@@ -654,482 +516,260 @@ try {
     'ep','su'
 )
 if (Get-Command ssh -ErrorAction SilentlyContinue) {
-    `$expected += @('Copy-SshKey','keygen','ssh-copy-key')
+    $expected += @('Copy-SshKey','keygen','ssh-copy-key')
 }
 if (Get-Command docker -ErrorAction SilentlyContinue) {
-    `$expected += @('dps','dpa','dimg','dlogs','dex','dstop','dprune')
+    $expected += @('dps','dpa','dimg','dlogs','dex','dstop','dprune')
 }
-`$missing = @()
-foreach (`$fn in `$expected) {
-    if (-not (Get-Command `$fn -ErrorAction SilentlyContinue)) { `$missing += `$fn }
+$missing = @()
+foreach ($fn in $expected) {
+    if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { $missing += $fn }
 }
-if (`$missing) {
-    `$missing | ForEach-Object { Write-Host "Missing: `$_" }
+if ($missing) {
+    $missing | ForEach-Object { Write-Host "ASSERT: missing $_" }
     exit 1
 }
-Write-Host "OK: `$(`$expected.Count) functions verified"
-"@
-    if ($LASTEXITCODE -ne 0) { throw "Missing functions (see above)" }
+Write-Host "  OK    $($expected.Count) functions verified"
+'@
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw "Missing functions (see above)" }
     Write-Result 'Key functions exist' 'PASS'
 }
 catch { Write-Result 'Key functions exist' 'FAIL' $_.Exception.Message }
-finally { $env:CI = $null }
 
 # -------------------------------------------------------
-# 18. Uninstall-Profile -WhatIf (all phases produce output)
+# 18. Uninstall-Profile -All -WhatIf (all phases produce output, nothing changes)
 # -------------------------------------------------------
-Write-Host '[18/26] Uninstall-Profile -WhatIf' -ForegroundColor Cyan
+Write-Host '[18/27] Uninstall-Profile -WhatIf' -ForegroundColor Cyan
 try {
-    $env:CI = 'true'
-    $output = pwsh -NonInteractive -NoProfile -Command ". '$profilePath'; Uninstall-Profile -All -WhatIf *>&1" 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Exit code: $LASTEXITCODE" }
-    $whatifLines = @($output | Where-Object { $_ -match 'What if' })
-    if ($whatifLines.Count -eq 0) { throw 'No WhatIf output produced' }
-    # Require core cleanup output while allowing Windows Terminal restoration to be absent.
-    $requiredPhases = @('Remove cache', 'Remove profile file')
-    $missingPhases = @()
-    foreach ($ph in $requiredPhases) {
-        if (-not ($whatifLines | Where-Object { $_ -match $ph })) { $missingPhases += $ph }
-    }
-    if ($missingPhases) {
-        $missingPhases | ForEach-Object { Write-Host "        Missing phase: $_" -ForegroundColor Yellow }
-        throw "$($missingPhases.Count) phase(s) missing from WhatIf output"
-    }
-    Write-Result 'Uninstall-Profile -WhatIf' 'PASS' "$($whatifLines.Count) action(s), all phases OK"
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
+. $ProfileSource
+. $PspPostLoadStubs
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+New-Item -ItemType Directory -Path $Sandbox.Cache -Force | Out-Null
+foreach ($f in 'theme.json', 'omp-init.ps1') { [System.IO.File]::WriteAllText((Join-Path $Sandbox.Cache $f), '{}', $utf8) }
+[System.IO.File]::WriteAllText((Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1'), '# profile', $utf8)
+# WhatIf messages go straight to the host, so capture them through a transcript.
+$log = Join-Path $Sandbox.Work 'whatif.log'
+Start-Transcript -LiteralPath $log | Out-Null
+Uninstall-Profile -All -WhatIf
+Stop-Transcript | Out-Null
+$whatIf = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'What if' })
+$errors = @()
+if ($whatIf.Count -eq 0) { $errors += 'no WhatIf output' }
+foreach ($phase in 'Remove cache', 'Remove profile file') { if (-not ($whatIf | Where-Object { $_ -match $phase })) { $errors += "missing phase: $phase" } }
+foreach ($p in (Join-Path $Sandbox.Cache 'theme.json'), (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1')) { if (-not (Test-Path -LiteralPath $p)) { $errors += "WhatIf removed $p" } }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
+Write-Host "  OK    $($whatIf.Count) planned action(s), nothing changed"
+'@
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'WhatIf assertions failed' }
+    Write-Result 'Uninstall-Profile -WhatIf' 'PASS'
 }
 catch { Write-Result 'Uninstall-Profile -WhatIf' 'FAIL' $_.Exception.Message }
-finally { $env:CI = $null }
 
 # -------------------------------------------------------
-# 19. Uninstall-Profile sandbox: core (real file deletion)
+# 19. Uninstall-Profile sandbox: core (real file deletion inside the sandbox)
 # -------------------------------------------------------
-Write-Host '[19/26] Uninstall sandbox: core' -ForegroundColor Cyan
+Write-Host '[19/27] Uninstall sandbox: core' -ForegroundColor Cyan
 try {
-    $env:CI = 'true'
-    # Build sandbox test as a temp script (avoids escaping hell)
-    $sandboxScript = Join-Path $env:TEMP "uninstall-sandbox-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($ProfileSource)
-$ErrorActionPreference = 'Stop'
-
-# 2. Load profile with real env to get function definitions
-$env:CI = 'true'
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
 . $ProfileSource
-
-# 3. Create sandbox directory tree
-$sb = Join-Path $env:TEMP "psp-sandbox-$([System.IO.Path]::GetRandomFileName())"
-
-$wtLocal  = Join-Path $sb 'Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState'
-$cacheDir = Join-Path $sb 'Local\PowerShellProfile'
-$ps7Dir   = Join-Path $sb 'Documents\PowerShell'
-$ps5Dir   = Join-Path $sb 'Documents\WindowsPowerShell'
-
-New-Item -ItemType Directory -Path $wtLocal, $cacheDir, $ps7Dir, $ps5Dir -Force | Out-Null
-
-# WT: original settings + 2 backups with different content
-[System.IO.File]::WriteAllText((Join-Path $wtLocal 'settings.json'), '{"modified": true}', [System.Text.UTF8Encoding]::new($false))
-$bakOld = Join-Path $wtLocal 'settings.json.20240101-100000.bak'
-$bakNew = Join-Path $wtLocal 'settings.json.20240601-120000.bak'
-[System.IO.File]::WriteAllText($bakOld, '{"original": "old"}', [System.Text.UTF8Encoding]::new($false))
-Start-Sleep -Milliseconds 50
-[System.IO.File]::WriteAllText($bakNew, '{"original": "newest"}', [System.Text.UTF8Encoding]::new($false))
-
-# Cache files
-foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json')) {
-    [System.IO.File]::WriteAllText((Join-Path $cacheDir $f), "# $f placeholder", [System.Text.UTF8Encoding]::new($false))
-}
-
-# User plugins dir: must survive a plain uninstall (user-authored, auto-loaded scripts); only -RemoveUserData removes it.
-$pluginsDir = Join-Path $cacheDir 'plugins'
-New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
-[System.IO.File]::WriteAllText((Join-Path $pluginsDir 'myplugin.ps1'), '# user plugin', [System.Text.UTF8Encoding]::new($false))
-
-# Profile files in both dirs
-foreach ($d in @($ps7Dir, $ps5Dir)) {
-    [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user overrides', [System.Text.UTF8Encoding]::new($false))
-}
-
-# 4. Override environment to point at sandbox
-$origLocal   = $env:LOCALAPPDATA
-$origProfile = $PROFILE
-$env:LOCALAPPDATA = Join-Path $sb 'Local'
-$global:PROFILE   = Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'
-
+. $PspPostLoadStubs
+$utf8 = [System.Text.UTF8Encoding]::new($false)
 $errors = @()
-try {
-    # ===== TEST A: Core uninstall (no switches) =====
-    Uninstall-Profile -Confirm:$false
-
-    # WT settings.json should have backup content
-    $wtContent = [System.IO.File]::ReadAllText((Join-Path $wtLocal 'settings.json'))
-    if ($wtContent -ne '{"original": "newest"}') { $errors += "WT restore: expected backup content, got: $wtContent" }
-
-    # All backups should be gone
-    $remainingBaks = Get-ChildItem $wtLocal -Filter '*.bak' -ErrorAction SilentlyContinue
-    if ($remainingBaks) { $errors += "WT backups: $($remainingBaks.Count) backup(s) still exist" }
-
-    # Cache: omp-init, zoxide-init, theme.json, terminal-config.json should be gone
-    foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json')) {
-        if (Test-Path (Join-Path $cacheDir $f)) { $errors += "Cache: $f still exists" }
-    }
-
-    # Cache: user-settings.json should be PRESERVED (no -RemoveUserData)
-    if (-not (Test-Path (Join-Path $cacheDir 'user-settings.json'))) { $errors += 'Cache: user-settings.json was deleted (should be preserved)' }
-
-    # Cache: plugins/ (user-authored scripts) should be PRESERVED (no -RemoveUserData)
-    if (-not (Test-Path (Join-Path $pluginsDir 'myplugin.ps1'))) { $errors += 'Cache: plugins/myplugin.ps1 was deleted (should be preserved without -RemoveUserData)' }
-
-    # Profile files should be gone from both dirs
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        $pf = Join-Path $d 'Microsoft.PowerShell_profile.ps1'
-        if (Test-Path $pf) { $errors += "Profile: $pf still exists" }
-    }
-
-    # profile_user.ps1 should be PRESERVED (no -RemoveUserData)
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        $uf = Join-Path $d 'profile_user.ps1'
-        if (-not (Test-Path $uf)) { $errors += "User profile: $uf was deleted (should be preserved)" }
-    }
-
-    # ===== TEST B: Recreate deleted files and test -RemoveUserData =====
-    [System.IO.File]::WriteAllText((Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $ps5Dir 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
-
-    Uninstall-Profile -RemoveUserData -Confirm:$false
-
-    # user-settings.json should now be gone
-    if (Test-Path (Join-Path $cacheDir 'user-settings.json')) { $errors += 'RemoveUserData: user-settings.json still exists' }
-
-    # plugins/ should now be gone with -RemoveUserData
-    if (Test-Path $pluginsDir) { $errors += 'RemoveUserData: plugins/ still exists' }
-
-    # profile_user.ps1 should now be gone from both dirs
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        $uf = Join-Path $d 'profile_user.ps1'
-        if (Test-Path $uf) { $errors += "RemoveUserData: $uf still exists" }
-    }
-
-    # Cache dir itself should be gone (empty after full removal)
-    if ((Test-Path $cacheDir) -and (Get-ChildItem $cacheDir -ErrorAction SilentlyContinue)) {
-        $leftover = (Get-ChildItem $cacheDir).Name -join ', '
-        $errors += "Cache dir not empty: $leftover"
-    }
+New-Item -ItemType Directory -Path $Sandbox.WtDir, $Sandbox.Cache, $Sandbox.Ps5Dir -Force | Out-Null
+# A settings file from an older profile version: no change record, two timestamped backups.
+$wtPath = Join-Path $Sandbox.WtDir 'settings.json'
+[System.IO.File]::WriteAllText($wtPath, '{"modified": true}', $utf8)
+[System.IO.File]::WriteAllText("$wtPath.20240101-100000.bak", '{"original": "old"}', $utf8)
+(Get-Item -LiteralPath "$wtPath.20240101-100000.bak").LastWriteTime = (Get-Date).AddDays(-30)
+[System.IO.File]::WriteAllText("$wtPath.20240601-120000.bak", '{"original": "newest"}', $utf8)
+foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json') {
+    [System.IO.File]::WriteAllText((Join-Path $Sandbox.Cache $f), '{}', $utf8)
 }
-finally {
-    # 4. Restore real env
-    $env:LOCALAPPDATA = $origLocal
-    $global:PROFILE   = $origProfile
-    # Cleanup sandbox
-    Remove-Item $sb -Recurse -Force -ErrorAction SilentlyContinue
+$pluginsDir = Join-Path $Sandbox.Cache 'plugins'
+New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $pluginsDir 'myplugin.ps1'), '# user plugin', $utf8)
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) {
+    [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', $utf8)
+    [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user overrides', $utf8)
 }
 
-if ($errors) {
-    $errors | ForEach-Object { Write-Host "ASSERT: $_" -ForegroundColor Red }
-    exit 1
+Uninstall-Profile -Confirm:$false 6>$null
+# The oldest backup is the closest record of the pre-install file; the current file is kept next to it.
+$wtContent = [System.IO.File]::ReadAllText($wtPath)
+if ($wtContent -ne '{"original": "old"}') { $errors += "WT restore: expected the oldest backup, got: $wtContent" }
+if (Get-ChildItem -LiteralPath $Sandbox.WtDir -Filter '*.bak') { $errors += 'WT backups left after a successful restore' }
+if (-not (Get-ChildItem -LiteralPath $Sandbox.WtDir -Filter 'settings.json.pre-uninstall-*.json')) { $errors += 'current WT settings not kept' }
+foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json') {
+    if (Test-Path -LiteralPath (Join-Path $Sandbox.Cache $f)) { $errors += "Cache: $f still exists" }
 }
-Write-Host 'All sandbox assertions passed'
+if (-not (Test-Path -LiteralPath (Join-Path $Sandbox.Cache 'user-settings.json'))) { $errors += 'user-settings.json deleted without -RemoveUserData' }
+if (-not (Test-Path -LiteralPath (Join-Path $pluginsDir 'myplugin.ps1'))) { $errors += 'plugins deleted without -RemoveUserData' }
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) {
+    if (Test-Path -LiteralPath (Join-Path $d 'Microsoft.PowerShell_profile.ps1')) { $errors += "profile still in $d" }
+    if (-not (Test-Path -LiteralPath (Join-Path $d 'profile_user.ps1'))) { $errors += "profile_user.ps1 deleted in $d" }
+}
+
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) { [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', $utf8) }
+Uninstall-Profile -RemoveUserData -Confirm:$false 6>$null
+if (Test-Path -LiteralPath (Join-Path $Sandbox.Cache 'user-settings.json')) { $errors += 'RemoveUserData: user-settings.json still exists' }
+if (Test-Path -LiteralPath $pluginsDir) { $errors += 'RemoveUserData: plugins/ still exists' }
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) {
+    if (Test-Path -LiteralPath (Join-Path $d 'profile_user.ps1')) { $errors += "RemoveUserData: profile_user.ps1 still in $d" }
+}
+if ((Test-Path -LiteralPath $Sandbox.Cache) -and (Get-ChildItem -LiteralPath $Sandbox.Cache -Force)) { $errors += "cache not empty: $((Get-ChildItem -LiteralPath $Sandbox.Cache -Force).Name -join ', ')" }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
+Write-Host '  OK    core uninstall and -RemoveUserData'
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $sandboxOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -ProfileSource $profilePath 2>&1
-    $sandboxExit = $LASTEXITCODE
-    # Show any assertion failures from subprocess
-    $assertLines = @($sandboxOutput | Where-Object { $_ -match 'ASSERT:' })
-    if ($assertLines) { $assertLines | ForEach-Object { Write-Host "        $_" -ForegroundColor Yellow } }
-    if ($sandboxExit -ne 0) { throw "Sandbox assertions failed" }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'Sandbox assertions failed' }
     Write-Result 'Uninstall sandbox: core' 'PASS'
 }
 catch { Write-Result 'Uninstall sandbox: core' 'FAIL' $_.Exception.Message }
-finally {
-    $env:CI = $null
-    Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue
-}
 
 # -------------------------------------------------------
-# 20. Uninstall-Profile sandbox: -All (everything removed)
+# 20. Uninstall-Profile sandbox: -All (font removal limited to the sandbox)
 # -------------------------------------------------------
-Write-Host '[20/26] Uninstall sandbox: -All' -ForegroundColor Cyan
+Write-Host '[20/27] Uninstall sandbox: -All' -ForegroundColor Cyan
 try {
-    $env:CI = 'true'
-    $sandboxScript = Join-Path $env:TEMP "uninstall-all-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($ProfileSource)
-$ErrorActionPreference = 'Stop'
-
-$env:CI = 'true'
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
 . $ProfileSource
-
-$sb = Join-Path $env:TEMP "psp-sandbox-all-$([System.IO.Path]::GetRandomFileName())"
-
-$wtLocal  = Join-Path $sb 'Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState'
-$cacheDir = Join-Path $sb 'Local\PowerShellProfile'
-$ps7Dir   = Join-Path $sb 'Documents\PowerShell'
-$ps5Dir   = Join-Path $sb 'Documents\WindowsPowerShell'
-
-New-Item -ItemType Directory -Path $wtLocal, $cacheDir, $ps7Dir, $ps5Dir -Force | Out-Null
-
-[System.IO.File]::WriteAllText((Join-Path $wtLocal 'settings.json'), '{"modified": true}', [System.Text.UTF8Encoding]::new($false))
-[System.IO.File]::WriteAllText((Join-Path $wtLocal 'settings.json.20240601-120000.bak'), '{"original": true}', [System.Text.UTF8Encoding]::new($false))
-
-foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json')) {
-    [System.IO.File]::WriteAllText((Join-Path $cacheDir $f), "# $f", [System.Text.UTF8Encoding]::new($false))
-}
-
-foreach ($d in @($ps7Dir, $ps5Dir)) {
-    [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user', [System.Text.UTF8Encoding]::new($false))
-}
-
-$origLocal   = $env:LOCALAPPDATA
-$origProfile = $PROFILE
-$env:LOCALAPPDATA = Join-Path $sb 'Local'
-$global:PROFILE   = Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'
-
+. $PspPostLoadStubs
+$utf8 = [System.Text.UTF8Encoding]::new($false)
 $errors = @()
-try {
-    # -All removes everything (except tools/fonts which need winget/admin)
-    Uninstall-Profile -All -Confirm:$false
+New-Item -ItemType Directory -Path $Sandbox.WtDir, $Sandbox.Cache, $Sandbox.Ps5Dir -Force | Out-Null
+$wtPath = Join-Path $Sandbox.WtDir 'settings.json'
+[System.IO.File]::WriteAllText($wtPath, '{"modified": true}', $utf8)
+[System.IO.File]::WriteAllText("$wtPath.20240601-120000.bak", '{"original": true}', $utf8)
+foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json') {
+    [System.IO.File]::WriteAllText((Join-Path $Sandbox.Cache $f), '{}', $utf8)
+}
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) {
+    [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), '# profile', $utf8)
+    [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user', $utf8)
+}
+$fonts = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'
+New-Item -ItemType Directory -Path $fonts -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $fonts 'CaskaydiaCoveNerdFont-Regular.ttf'), 'x', $utf8)
+$script:PSP.TestFontScopes = @(@{ Name = 'per-user'; Dir = $fonts; Reg = 'HKCU:\SOFTWARE\PowerShellPerfectTest\Fonts-NotPresent'; NeedsAdmin = $false })
 
-    # WT restored
-    $wtContent = [System.IO.File]::ReadAllText((Join-Path $wtLocal 'settings.json'))
-    if ($wtContent -ne '{"original": true}') { $errors += "WT restore failed: $wtContent" }
-
-    # No backups
-    if (Get-ChildItem $wtLocal -Filter '*.bak' -ErrorAction SilentlyContinue) { $errors += 'Backups remain' }
-
-    # ALL cache files gone (including user-settings.json)
-    foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json')) {
-        if (Test-Path (Join-Path $cacheDir $f)) { $errors += "Cache: $f still exists" }
+# CI is set inside the sandbox, so -All skips the winget and module removals.
+Uninstall-Profile -All -Confirm:$false 6>$null
+if ([System.IO.File]::ReadAllText($wtPath) -ne '{"original": true}') { $errors += 'WT restore failed' }
+if (Get-ChildItem -LiteralPath $Sandbox.WtDir -Filter '*.bak') { $errors += 'Backups remain' }
+foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json') {
+    if (Test-Path -LiteralPath (Join-Path $Sandbox.Cache $f)) { $errors += "Cache: $f still exists" }
+}
+foreach ($d in $Sandbox.Ps7Dir, $Sandbox.Ps5Dir) {
+    foreach ($f in 'Microsoft.PowerShell_profile.ps1', 'profile_user.ps1') {
+        if (Test-Path -LiteralPath (Join-Path $d $f)) { $errors += "$f still in $d" }
     }
-
-    # ALL profile files gone (including profile_user.ps1)
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'profile_user.ps1')) {
-            if (Test-Path (Join-Path $d $f)) { $errors += "$f still in $d" }
-        }
-    }
 }
-finally {
-    $env:LOCALAPPDATA = $origLocal
-    $global:PROFILE   = $origProfile
-    Remove-Item $sb -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-if ($errors) {
-    $errors | ForEach-Object { Write-Host "ASSERT: $_" -ForegroundColor Red }
-    exit 1
-}
-Write-Host 'All -All sandbox assertions passed'
+if (Test-Path -LiteralPath (Join-Path $fonts 'CaskaydiaCoveNerdFont-Regular.ttf')) { $errors += 'sandbox Nerd Font not removed' }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
+Write-Host '  OK    -All removed everything inside the sandbox'
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $sandboxOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -ProfileSource $profilePath 2>&1
-    $sandboxExit = $LASTEXITCODE
-    $assertLines = @($sandboxOutput | Where-Object { $_ -match 'ASSERT:' })
-    if ($assertLines) { $assertLines | ForEach-Object { Write-Host "        $_" -ForegroundColor Yellow } }
-    if ($sandboxExit -ne 0) { throw "Sandbox assertions failed" }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'Sandbox assertions failed' }
     Write-Result 'Uninstall sandbox: -All' 'PASS'
 }
 catch { Write-Result 'Uninstall sandbox: -All' 'FAIL' $_.Exception.Message }
-finally {
-    $env:CI = $null
-    Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue
-}
 
 # -------------------------------------------------------
-# 21. Lifecycle: install -> uninstall -> reinstall
+# 21. Lifecycle: install -> uninstall -> reinstall (setup.ps1 -LocalRepo, no network)
 # -------------------------------------------------------
-Write-Host '[21/26] Lifecycle: install -> uninstall -> reinstall' -ForegroundColor Cyan
+Write-Host '[21/27] Lifecycle: install -> uninstall -> reinstall' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "lifecycle-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($RepoRoot)
-$ErrorActionPreference = 'Stop'
-
-# Parse setup.ps1 AST to extract functions
-$setupFile = Join-Path $RepoRoot 'setup.ps1'
-$tokens = $null; $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count -gt 0) { throw "setup.ps1 parse errors: $($parseErrors.Count)" }
-$fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
-foreach ($fn in $fnDefs) { Invoke-Expression $fn.Extent.Text }
-
-# ===== Create sandbox =====
-$sb = Join-Path $env:TEMP "psp-lifecycle-$([System.IO.Path]::GetRandomFileName())"
-$cacheDir = Join-Path $sb 'Local\PowerShellProfile'
-$ps7Dir   = Join-Path $sb 'Documents\PowerShell'
-$ps5Dir   = Join-Path $sb 'Documents\WindowsPowerShell'
-$wtLocal  = Join-Path $sb 'Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState'
-New-Item -ItemType Directory -Path $cacheDir, $ps7Dir, $ps5Dir, $wtLocal -Force | Out-Null
-$configCachePath = $cacheDir
-
-# Minimal WT settings.json
-$wtOriginal = '{"profiles":{"defaults":{"font":{"face":"Consolas"}},"list":[]},"schemes":[],"actions":[]}'
-[System.IO.File]::WriteAllText((Join-Path $wtLocal 'settings.json'), $wtOriginal, [System.Text.UTF8Encoding]::new($false))
-
-$origLocal   = $env:LOCALAPPDATA
-$origProfile = $PROFILE
-$env:LOCALAPPDATA = Join-Path $sb 'Local'
-$global:PROFILE   = Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'
-
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
+$utf8 = [System.Text.UTF8Encoding]::new($false)
 $errors = @()
-try {
-    # ===== PHASE 1: INSTALL =====
-    Write-Host '  --- Phase 1: Install ---'
-    $profileSrc = Join-Path $RepoRoot 'Microsoft.PowerShell_profile.ps1'
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        Copy-Item $profileSrc (Join-Path $d 'Microsoft.PowerShell_profile.ps1')
-    }
+New-Item -ItemType Directory -Path $Sandbox.WtDir -Force | Out-Null
+$wtPath = Join-Path $Sandbox.WtDir 'settings.json'
+$wtOriginal = '{"profiles":{"defaults":{"font":{"face":"Consolas"}},"list":[]},"schemes":[],"actions":[]}'
+[System.IO.File]::WriteAllText($wtPath, $wtOriginal, $utf8)
+$installed = @(
+    (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1'), (Join-Path $Sandbox.Ps5Dir 'Microsoft.PowerShell_profile.ps1'),
+    (Join-Path $Sandbox.Cache 'theme.json'), (Join-Path $Sandbox.Cache 'terminal-config.json'), (Join-Path $Sandbox.Cache 'user-settings.json'),
+    (Join-Path $Sandbox.Ps7Dir 'profile_user.ps1'), (Join-Path $Sandbox.Ps5Dir 'profile_user.ps1')
+)
 
-    # Download configs
-    Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/theme.json' -OutFile (Join-Path $cacheDir 'theme.json')
-    Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/terminal-config.json' -OutFile (Join-Path $cacheDir 'terminal-config.json')
+Write-Host '  --- Phase 1: Install ---'
+& (Join-Path $RepoRoot 'setup.ps1') -LocalRepo $RepoRoot -CiMode -SkipWizard *> $null
+$missing = @($installed | Where-Object { -not (Test-Path -LiteralPath $_) })
+if ($missing) { $errors += "Install missing: $($missing -join ', ')" } else { Write-Host '  OK    Install: all files created' }
+. (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1')
+. $PspPostLoadStubs
+if (-not (Get-Command 'Uninstall-Profile' -ErrorAction SilentlyContinue)) { throw 'Uninstall-Profile not available after install' }
 
-    # OMP theme
-    $themeJson = Get-Content (Join-Path $cacheDir 'theme.json') -Raw | ConvertFrom-Json
-    Invoke-DownloadWithRetry -Uri $themeJson.theme.url -OutFile (Join-Path $cacheDir "$($themeJson.theme.name).omp.json")
+Write-Host '  --- Phase 2: Uninstall -All ---'
+Uninstall-Profile -All -Confirm:$false 6>$null
+$left = @($installed | Where-Object { Test-Path -LiteralPath $_ })
+if ($left) { $errors += "After uninstall: $($left -join ', ')" }
+$restored = Get-Content -LiteralPath $wtPath -Raw | ConvertFrom-Json
+if ((ConvertTo-PspCanonicalJson $restored) -ne (ConvertTo-PspCanonicalJson ($wtOriginal | ConvertFrom-Json))) { $errors += 'WT settings not restored to the pre-install values' }
+if (Get-WtProfileBackups -Path $wtPath) { $errors += 'WT backups remain after uninstall' }
+Write-Host '  OK    Uninstall: removed and restored'
 
-    # user-settings.json + profile_user.ps1
-    [System.IO.File]::WriteAllText((Join-Path $cacheDir 'user-settings.json'), '{}', [System.Text.UTF8Encoding]::new($false))
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user', [System.Text.UTF8Encoding]::new($false))
-    }
-
-    # WT backup (simulates what Update-Profile does)
-    $bakFile = Join-Path $wtLocal 'settings.json.20240601-120000.bak'
-    Copy-Item (Join-Path $wtLocal 'settings.json') $bakFile
-
-    # Verify install
-    $installFiles = @(
-        (Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'),
-        (Join-Path $ps5Dir 'Microsoft.PowerShell_profile.ps1'),
-        (Join-Path $cacheDir 'theme.json'),
-        (Join-Path $cacheDir 'terminal-config.json'),
-        (Join-Path $cacheDir 'user-settings.json'),
-        (Join-Path $ps7Dir 'profile_user.ps1'),
-        (Join-Path $ps5Dir 'profile_user.ps1')
-    )
-    $missingInstall = @($installFiles | Where-Object { -not (Test-Path $_) })
-    if ($missingInstall) { $errors += "Install missing: $($missingInstall -join ', ')" }
-    else { Write-Host '  OK    Install: all files created' }
-
-    # Load profile to get Uninstall-Profile
-    $env:CI = 'true'
-    . (Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1')
-    if (-not (Get-Command 'Uninstall-Profile' -ErrorAction SilentlyContinue)) { throw 'Uninstall-Profile not available after install' }
-    Write-Host '  OK    Install: profile loaded, Uninstall-Profile available'
-
-    # ===== PHASE 2: UNINSTALL (-All) =====
-    Write-Host '  --- Phase 2: Uninstall -All ---'
-    Uninstall-Profile -All -Confirm:$false
-
-    # Verify everything removed
-    foreach ($f in @('omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'user-settings.json')) {
-        if (Test-Path (Join-Path $cacheDir $f)) { $errors += "After uninstall: $f still in cache" }
-    }
-    # OMP theme file should be gone
-    $ompFiles = Get-ChildItem $cacheDir -Filter '*.omp.json' -ErrorAction SilentlyContinue
-    if ($ompFiles) { $errors += "After uninstall: OMP theme still in cache" }
-
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'profile_user.ps1')) {
-            if (Test-Path (Join-Path $d $f)) { $errors += "After uninstall: $f still in $d" }
-        }
-    }
-
-    # WT should be restored (backup content)
-    $wtContent = [System.IO.File]::ReadAllText((Join-Path $wtLocal 'settings.json'))
-    if ($wtContent -ne $wtOriginal) { Write-Host "  WARN  WT content differs (backup was modified copy, not original)" }
-
-    # No backups should remain
-    $baks = Get-ChildItem $wtLocal -Filter '*.bak' -ErrorAction SilentlyContinue
-    if ($baks) { $errors += "After uninstall: $($baks.Count) backup(s) remain" }
-
-    Write-Host '  OK    Uninstall: all files removed'
-
-    # ===== PHASE 3: REINSTALL =====
-    Write-Host '  --- Phase 3: Reinstall ---'
-    # Recreate cache dir (uninstall may have cleaned it)
-    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-    $configCachePath = $cacheDir
-
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        New-Item -ItemType Directory -Path $d -Force | Out-Null
-        Copy-Item $profileSrc (Join-Path $d 'Microsoft.PowerShell_profile.ps1')
-    }
-
-    Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/theme.json' -OutFile (Join-Path $cacheDir 'theme.json')
-    Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/terminal-config.json' -OutFile (Join-Path $cacheDir 'terminal-config.json')
-    $themeJson = Get-Content (Join-Path $cacheDir 'theme.json') -Raw | ConvertFrom-Json
-    Invoke-DownloadWithRetry -Uri $themeJson.theme.url -OutFile (Join-Path $cacheDir "$($themeJson.theme.name).omp.json")
-    [System.IO.File]::WriteAllText((Join-Path $cacheDir 'user-settings.json'), '{}', [System.Text.UTF8Encoding]::new($false))
-    foreach ($d in @($ps7Dir, $ps5Dir)) {
-        [System.IO.File]::WriteAllText((Join-Path $d 'profile_user.ps1'), '# user', [System.Text.UTF8Encoding]::new($false))
-    }
-
-    # Verify reinstall
-    $missingReinstall = @($installFiles | Where-Object { -not (Test-Path $_) })
-    if ($missingReinstall) { $errors += "Reinstall missing: $($missingReinstall -join ', ')" }
-    else { Write-Host '  OK    Reinstall: all files recreated' }
-
-    # Reload profile and verify it works
-    . (Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1')
-    if (-not (Get-Command 'Show-Help' -ErrorAction SilentlyContinue)) { $errors += 'Reinstall: profile failed to load' }
-    if (-not (Get-Command 'Uninstall-Profile' -ErrorAction SilentlyContinue)) { $errors += 'Reinstall: Uninstall-Profile missing' }
-    Write-Host '  OK    Reinstall: profile loads correctly'
-}
-finally {
-    $env:LOCALAPPDATA = $origLocal
-    $global:PROFILE   = $origProfile
-    Remove-Item $sb -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-if ($errors) {
-    $errors | ForEach-Object { Write-Host "ASSERT: $_" -ForegroundColor Red }
-    exit 1
-}
-Write-Host 'Lifecycle test passed (install -> uninstall -> reinstall)'
+Write-Host '  --- Phase 3: Reinstall ---'
+& (Join-Path $RepoRoot 'setup.ps1') -LocalRepo $RepoRoot -CiMode -SkipWizard *> $null
+$missing = @($installed | Where-Object { -not (Test-Path -LiteralPath $_) })
+if ($missing) { $errors += "Reinstall missing: $($missing -join ', ')" } else { Write-Host '  OK    Reinstall: all files recreated' }
+. (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1')
+. $PspPostLoadStubs
+if (-not (Get-Command 'Show-Help' -ErrorAction SilentlyContinue)) { $errors += 'Reinstall: profile failed to load' }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $lcOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -RepoRoot $repoRoot 2>&1
-    foreach ($line in $lcOutput) {
-        $color = if ($line -match '^\s+OK') { 'Green' } elseif ($line -match 'ASSERT:|FAIL') { 'Red' } elseif ($line -match 'WARN') { 'Yellow' } else { 'White' }
-        Write-Host "        $line" -ForegroundColor $color
-    }
-    $assertLines = @($lcOutput | Where-Object { $_ -match 'ASSERT:' })
-    if ($assertLines) { $assertLines | ForEach-Object { Write-Host "        $_" -ForegroundColor Yellow } }
-    if ($LASTEXITCODE -ne 0) { throw 'Lifecycle test failed' }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'Lifecycle test failed' }
     Write-Result 'Lifecycle: install -> uninstall -> reinstall' 'PASS'
 }
 catch { Write-Result 'Lifecycle: install -> uninstall -> reinstall' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # -------------------------------------------------------
 # 22. Execute every command (sandbox)
 # -------------------------------------------------------
-Write-Host '[22/26] Execute every command' -ForegroundColor Cyan
+Write-Host '[22/27] Execute every command' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "fn-exec-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($ProfileSource)
+    $online = $false
+    try { $online = (Invoke-WebRequest -Uri 'https://github.com' -Method Head -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop).StatusCode -eq 200 } catch { $online = $false }
+    # The child reads the result through the environment (its param block takes only -RepoRoot).
+    $env:PSP_TEST_ONLINE = [string]$online
+    $r = Invoke-SandboxChild -Body @'
 $ErrorActionPreference = 'Continue'
-$env:CI = 'true'
+$WarningPreference = 'SilentlyContinue'
 . $ProfileSource
+. $PspPostLoadStubs
+$Online = $env:PSP_TEST_ONLINE -eq 'True'
 
 $ok = 0; $fail = 0; $skip = 0; $netFail = 0
+# Return $true when an exception chain contains a transport failure (DNS, TCP, TLS handshake, timeout), judged by type, not message text.
+function Test-TransportFailure {
+    param([System.Exception]$Exception)
+    # Compared by name: System.Net.Http is not always loaded in Windows PowerShell 5.1.
+    $transportTypes = @('System.Net.Http.HttpRequestException', 'System.Net.WebException', 'System.Net.Sockets.SocketException', 'System.TimeoutException', 'System.Threading.Tasks.TaskCanceledException', 'System.Security.Authentication.AuthenticationException')
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        for ($t = $e.GetType(); $t; $t = $t.BaseType) { if ($transportTypes -contains $t.FullName) { return $true } }
+    }
+    return $false
+}
+# Run one command. -Net marks commands that need the internet: they are skipped offline, and only a transport exception counts as a network failure.
 function T {
-    param([string]$N, [scriptblock]$C, [string]$S)
+    param([string]$N, [scriptblock]$C, [string]$S, [switch]$Net)
     if ($S) { Write-Host "  SKIP  $N  ($S)"; $script:skip++; return }
+    if ($Net -and -not $Online) { Write-Host "  SKIP  $N  (offline)"; $script:skip++; return }
     try {
         $null = & { $ErrorActionPreference = 'Stop'; & $C } 2>&1
         Write-Host "  OK    $N"; $script:ok++
     }
     catch {
         $msg = $_.Exception.Message
-        if ($msg -match 'Timeout|timed out|HttpClient|Unable to connect') {
+        if ($Net -and (Test-TransportFailure $_.Exception)) {
             Write-Host "  NET   $N  ($msg)"; $script:netFail++
         } else {
             Write-Host "  FAIL  $N  ($msg)"; $script:fail++
@@ -1138,8 +778,7 @@ function T {
 }
 
 # --- Temp workspace ---
-$ws = Join-Path $env:TEMP "psp-exec-$([System.IO.Path]::GetRandomFileName())"
-New-Item -ItemType Directory $ws -Force | Out-Null
+$ws = $Sandbox.Work
 $tf  = Join-Path $ws 'sample.txt'
 $tf2 = Join-Path $ws 'sample2.txt'
 $jf  = Join-Path $ws 'sample.json'
@@ -1173,7 +812,7 @@ T 'ep'                $null 'opens editor UI'
 T 'edit'              $null 'opens editor UI'
 T 'Update-Profile'    {
     $cmd = Get-Command Update-Profile
-    foreach ($p in @('Force', 'SkipHashCheck', 'ExpectedSha256', 'WhatIf')) {
+    foreach ($p in @('Force', 'SkipHashCheck', 'ExpectedSha256', 'Ref', 'InstallMissingTools', 'WhatIf')) {
         if (-not $cmd.Parameters.ContainsKey($p)) { throw "Update-Profile missing parameter: $p" }
     }
     # -WhatIf must prevent Phase 1 downloads via the ShouldProcess gate.
@@ -1186,27 +825,36 @@ T 'Update-Profile'    {
 T 'Update-PowerShell' {
     # -WhatIf: a live run spawns a winget MSI upgrade that replaces the running pwsh.
     Update-PowerShell -WhatIf *> $null
-}
+} -Net
 T 'Update-Tools'      {
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        # winget present - would mutate installs; just verify command exists
-        if (-not (Get-Command Update-Tools)) { throw 'Update-Tools missing' }
-    }
-    else {
-        Update-Tools *> $null
-    }
+    # winget is replaced by a recorder and one tool is reported as installed, so the upgrade path runs without changing anything.
+    $script:wingetCalls = @()
+    function winget { $script:wingetCalls += ($args -join ' '); $global:LASTEXITCODE = -1978335189 }
+    function Get-ProfileToolExecutablePath { param($Tool) if ($Tool.Name -eq 'bat') { 'C:\psp-test\bat.exe' } }
+    function Get-ProfileToolVersionText { param($Tool, $ExecutablePath) '1.0.0' }
+    Update-Tools -Confirm:$false *> $null
+    if (@($script:wingetCalls | Where-Object { $_ -match '^upgrade --id sharkdp\.bat\b' }).Count -ne 1) { throw "unexpected winget calls: $($script:wingetCalls -join ' | ')" }
 }
-T 'Clear-ProfileCache' $null 'destructive to real cache'
-T 'Clear-Cache'       $null 'destructive to real cache'
-T 'Uninstall-Profile' $null 'tested in sandbox 19/20'
+T 'Clear-ProfileCache' {
+    [System.IO.File]::WriteAllText((Join-Path (Get-PspCacheDir) 'omp-init.ps1'), '# cache', [System.Text.UTF8Encoding]::new($false))
+    Clear-ProfileCache -Confirm:$false *> $null
+    if (Test-Path -LiteralPath (Join-Path (Get-PspCacheDir) 'omp-init.ps1')) { throw 'cache file not removed' }
+}
+T 'Clear-Cache'       {
+    $junk = Join-Path $env:TEMP 'psp-clear-cache-probe.tmp'
+    [System.IO.File]::WriteAllText($junk, 'x', [System.Text.UTF8Encoding]::new($false))
+    Clear-Cache -Confirm:$false *> $null
+    if (Test-Path -LiteralPath $junk) { throw 'sandbox temp file not removed' }
+}
+T 'Uninstall-Profile' $null 'tested in sandbox 19/20/21'
 T 'Invoke-ProfileWizard' {
     # -WhatIf must prevent the network download via the ShouldProcess gate.
-    $pre = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+    $pre = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*' -ErrorAction SilentlyContinue)
     Invoke-ProfileWizard -WhatIf -Confirm:$false | Out-Null
-    $post = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+    $post = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*' -ErrorAction SilentlyContinue)
     if ($post.Count -gt $pre.Count) { throw "Invoke-ProfileWizard -WhatIf leaked temp files" }
     $cmd = Get-Command Invoke-ProfileWizard
-    foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'BundleExpectedSha256', 'SkipHashCheck', 'WhatIf')) {
+    foreach ($p in @('Resume', 'NoElevate', 'ExpectedSha256', 'BundleExpectedSha256', 'SkipHashCheck', 'Ref', 'WhatIf')) {
         if (-not $cmd.Parameters.ContainsKey($p)) { throw "Invoke-ProfileWizard missing parameter: $p" }
     }
 }
@@ -1234,6 +882,8 @@ T 'la'      { la $ws }
 T 'll'      { ll $ws }
 T 'lt'      { lt $ws }
 T 'cat'     { cat $tf }
+$batSkip = if (Get-Command bcat -ErrorAction SilentlyContinue) { $null } else { 'bat not installed (bcat is defined only with bat)' }
+T 'bcat'    { bcat $tf } $batSkip
 T 'ff'      { Push-Location $ws; ff "sample.txt"; Pop-Location }
 T 'touch'   { touch (Join-Path $ws 'touched.txt') }
 T 'nf'      { touch (Join-Path $ws 'newfile.txt') }
@@ -1242,7 +892,8 @@ T 'head'    { head $tf 3 }
 T 'tail'    { tail $tf 3 }
 T 'file'    { file $tf }
 T 'sizeof'  { sizeof $ws }
-T 'trash'   { $t = Join-Path $ws 'trashme.txt'; [System.IO.File]::WriteAllText($t, 'bye', [System.Text.UTF8Encoding]::new($false)); trash $t }
+# -WhatIf: a real run moves the file into this user's Recycle Bin.
+T 'trash'   { $t = Join-Path $ws 'trashme.txt'; [System.IO.File]::WriteAllText($t, 'bye', [System.Text.UTF8Encoding]::new($false)); trash $t -WhatIf; if (-not (Test-Path -LiteralPath $t)) { throw 'trash -WhatIf removed the file' } }
 T 'extract' { $ed = Join-Path $ws 'extracted'; New-Item -ItemType Directory $ed -Force | Out-Null; Push-Location $ed; extract $zf; Pop-Location }
 T 'docs'    { docs }
 T 'dtop'    { dtop }
@@ -1293,69 +944,68 @@ T 'grep'    { grep "line" $ws }
 T 'sed'     { $sf = Join-Path $ws 'sedtest.txt'; [System.IO.File]::WriteAllText($sf, 'foo bar foo', [System.Text.UTF8Encoding]::new($false)); sed $sf "foo" "baz" }
 T 'which'   { which pwsh }
 T 'pgrep'   { pgrep "pwsh" }
-T 'pkill'   $null 'destructive - kills processes'
+T 'pkill'   { pkill 'psp-no-such-process' 3>$null }
 T 'export'  { export "PSP_TEST_VAR" "testvalue" }
 
 # ===== SYSTEM & NETWORK =====
 T 'admin'     $null 'opens elevated terminal'
 T 'su'        $null 'opens elevated terminal'
-T 'pubip'     { pubip }
+T 'pubip'     { pubip } -Net
 T 'localip'   { localip }
 T 'uptime'    { uptime }
 T 'sysinfo'   { sysinfo }
 T 'df'        { df }
 T 'flushdns'  $null 'requires admin'
 T 'ports'     { ports }
-T 'checkport' { checkport "dns.google" 443 }
-T 'portscan'  { portscan "dns.google" -Ports @(53, 443) }
-T 'tlscert'   { tlscert "google.com" }
-T 'ipinfo'    { ipinfo "8.8.8.8" }
-T 'whois'     { whois "example.com" }
-T 'nslook'    { nslook "google.com" }
+T 'checkport' { checkport "dns.google" 443 } -Net
+T 'portscan'  { portscan "dns.google" -Ports @(53, 443) } -Net
+T 'tlscert'   { tlscert "google.com" } -Net
+T 'ipinfo'    { ipinfo "8.8.8.8" } -Net
+T 'whois'     { whois "example.com" } -Net
+T 'nslook'    { nslook "google.com" } -Net
 T 'env'       { env "PATH" }
 T 'svc'       { svc "idle" -Count 1 }
 T 'eventlog'  { eventlog 1 }
-T 'weather'   { weather "London" }
+T 'weather'   { weather "London" } -Net
 T 'speedtest' $null 'takes 30s+ download'
 T 'wifipass'  $null 'requires admin/netsh'
 T 'hosts'     $null 'opens elevated editor'
 T 'winutil' {
     $marker = Join-Path $ws 'winutil-ran.txt'
-    $expectedHash = ('AB' * 32)
+    $markerLiteral = $marker -replace "'", "''"
+    $scriptBody = "[System.IO.File]::WriteAllText('$markerLiteral', 'ran', [System.Text.UTF8Encoding]::new(`$false))"
+    $script:winutilBytes = [System.Text.Encoding]::UTF8.GetBytes($scriptBody)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $expectedHash = [BitConverter]::ToString($sha.ComputeHash($script:winutilBytes)).Replace('-', '') } finally { $sha.Dispose() }
+    $savedAdmin = $script:PSP.IsAdmin
     try {
-        function Invoke-RestMethod {
-            param(
-                [string]$Uri,
-                [string]$OutFile,
-                [int]$TimeoutSec,
-                [switch]$UseBasicParsing,
-                $ErrorAction
-            )
-            $utf8 = [System.Text.UTF8Encoding]::new($false)
-            $markerLiteral = $marker -replace "'", "''"
-            $scriptBody = "[System.IO.File]::WriteAllText('$markerLiteral', 'ran', [System.Text.UTF8Encoding]::new(`$false))"
-            [System.IO.File]::WriteAllText($OutFile, $scriptBody, $utf8)
-        }
-        function Get-FileHash {
-            param(
-                [string]$LiteralPath,
-                [string]$Algorithm
-            )
-            [PSCustomObject]@{ Hash = $expectedHash }
+        # winutil hashes and runs the downloaded bytes in memory; serve a local script instead of the real one.
+        function Invoke-WebRequest {
+            param([string]$Uri, [int]$TimeoutSec, [switch]$UseBasicParsing, $ErrorAction)
+            [PSCustomObject]@{ RawContentStream = [System.IO.MemoryStream]::new($script:winutilBytes) }
         }
 
-        winutil
+        winutil 6>$null
         if (Test-Path $marker) { throw 'winutil executed without explicit opt-in' }
 
-        winutil -Force -WhatIf
+        winutil -Force -WhatIf 6>$null
         if (Test-Path $marker) { throw 'winutil executed under -WhatIf' }
 
-        winutil -ExpectedSha256 $expectedHash -Confirm:$false
+        # Unelevated, WinUtil would relaunch itself from its latest release, so a pinned run needs an elevated shell.
+        $script:PSP.IsAdmin = $false
+        winutil -ExpectedSha256 $expectedHash -Confirm:$false -ErrorAction SilentlyContinue 6>$null
+        if (Test-Path $marker) { throw 'winutil executed unelevated' }
+        $script:PSP.IsAdmin = $true
+
+        winutil -ExpectedSha256 ('0' * 64) -Confirm:$false -ErrorAction SilentlyContinue 6>$null
+        if (Test-Path $marker) { throw 'winutil executed after a hash mismatch' }
+
+        winutil -ExpectedSha256 $expectedHash -Confirm:$false 6>$null
         if (-not (Test-Path $marker)) { throw 'winutil did not execute after hash match + explicit confirmation bypass' }
     }
     finally {
-        Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
-        Remove-Item Function:\Get-FileHash -ErrorAction SilentlyContinue
+        $script:PSP.IsAdmin = $savedAdmin
+        Remove-Item Function:\Invoke-WebRequest -ErrorAction SilentlyContinue
         Remove-Item $marker -Force -ErrorAction SilentlyContinue
     }
 }
@@ -1385,12 +1035,15 @@ T 'harden' {
     }
 }
 
+# Commands that write to the clipboard run only on CI runners: locally they would overwrite the developer's clipboard.
+$clipSkip = if ($env:GITHUB_ACTIONS) { $null } else { 'would overwrite your clipboard (runs on CI only)' }
+
 # ===== SECURITY & CRYPTO =====
 $hashOut = $null
 T 'hash'      { $script:hashOut = hash $tf; $script:hashOut }
 T 'hash MD5'  { hash $tf -Algorithm MD5 }
 T 'checksum'  { if ($script:hashOut) { $h = ($script:hashOut | Out-String).Trim().Split(' ')[-1]; checksum $tf $h } else { throw 'no hash' } }
-T 'genpass'   { genpass 16 }
+T 'genpass'   { genpass 16 } $clipSkip
 T 'b64'       { b64 "hello world" }
 T 'b64d'      { b64d "aGVsbG8gd29ybGQ=" }
 T 'jwtd'      { jwtd "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c" }
@@ -1410,7 +1063,7 @@ T 'Test-ProfileHistorySafeLine' {
         if (-not (Test-ProfileHistorySafeLine $safe)) { throw "safe command blocked from history: $safe" }
     }
 }
-T 'uuid'      { uuid }
+T 'uuid'      { uuid } $clipSkip
 T 'epoch'     { epoch }
 T 'epoch 0'   { epoch 0 }
 T 'urlencode' { urlencode "hello world" }
@@ -1422,7 +1075,7 @@ T 'vt'        {
 }
 
 # ===== DEVELOPER =====
-T 'killport'            $null 'destructive - kills process'
+T 'killport'            { killport 1 -WhatIf 3>$null 6>$null }
 T 'Stop-ListeningPort'  $null 'interactive fzf picker'
 T 'killports'           $null 'alias to Stop-ListeningPort'
 T 'Find-FileLocker'   {
@@ -1435,11 +1088,10 @@ T 'Find-FileLocker'   {
     } finally { $s.Close(); $s.Dispose() }
 }
 T 'Stop-StuckProcess' $null 'destructive - kills processes'
-T 'Remove-LockedItem' $null 'destructive - kills + deletes'
-T 'http'       { http "https://httpbin.org/get" }
+T 'Remove-LockedItem' { $li = Join-Path $ws 'locked-probe.txt'; [System.IO.File]::WriteAllText($li, 'x', [System.Text.UTF8Encoding]::new($false)); Remove-LockedItem $li -WhatIf 6>$null; if (-not (Test-Path -LiteralPath $li)) { throw 'Remove-LockedItem -WhatIf deleted the file' } }
+T 'http'       { http "https://httpbin.org/get" } -Net
 T 'prettyjson' { prettyjson $jf }
 # -WhatIf stops at the ShouldProcess gate; a live call publishes $tf to a PUBLIC paste.
-# ci-functional.ps1 and rawhunt.ps1 cover the real upload on purpose.
 T 'hb'         { if (hb $tf -WhatIf) { throw 'hb published under -WhatIf' } }
 T 'timer'      { timer { Start-Sleep -Milliseconds 10 } }
 T 'watch'      $null 'infinite loop'
@@ -1459,14 +1111,14 @@ T 'dprune' $null 'destructive'
 
 # ===== SSH & REMOTE =====
 $hasSsh = [bool](Get-Command ssh -ErrorAction SilentlyContinue)
-T 'Copy-SshKey' $null 'needs remote host'
+T 'Copy-SshKey' $null 'needs remote host (remote script covered by tests/unit.ps1)'
 T 'ssh-copy-key' $null 'needs remote host'
 T 'keygen'      $null 'creates keys on disk'
 T 'rdp'         $null 'opens RDP UI'
 
 # ===== CLIPBOARD =====
-T 'cpy'  { cpy "psp-test-clip" }
-T 'pst'  { $r = pst; if ($r -ne "psp-test-clip") { throw "expected psp-test-clip, got: $r" } }
+T 'cpy'  { cpy "psp-test-clip" } $clipSkip
+T 'pst'  { $r = pst; if ($r -ne "psp-test-clip") { throw "expected psp-test-clip, got: $r" } } $clipSkip
 T 'icb'           $null 'PSReadLine handler only'
 T 'Invoke-Clipboard' $null 'PSReadLine handler only'
 
@@ -1492,8 +1144,8 @@ T 'lsblk'         { lsblk }
 T 'htop'          $null 'launches TUI'
 T 'mtr'           $null 'long traceroute+ping loop'
 T 'fwallow' {
-    $origIsAdmin = $script:isAdmin
-    $script:isAdmin = $true
+    $origIsAdmin = $script:PSP.IsAdmin
+    $script:PSP.IsAdmin = $true
     $script:fwCalls = @()
     try {
         function New-NetFirewallRule {
@@ -1521,14 +1173,14 @@ T 'fwallow' {
         if ($script:fwCalls[0].Action -ne 'Allow') { throw "fwallow recorded wrong action: $($script:fwCalls[0].Action)" }
     }
     finally {
-        $script:isAdmin = $origIsAdmin
+        $script:PSP.IsAdmin = $origIsAdmin
         Remove-Item Function:\New-NetFirewallRule -ErrorAction SilentlyContinue
         Remove-Variable -Name fwCalls -Scope Script -ErrorAction SilentlyContinue
     }
 }
 T 'fwblock' {
-    $origIsAdmin = $script:isAdmin
-    $script:isAdmin = $true
+    $origIsAdmin = $script:PSP.IsAdmin
+    $script:PSP.IsAdmin = $true
     $script:fwCalls = @()
     try {
         function New-NetFirewallRule {
@@ -1556,7 +1208,7 @@ T 'fwblock' {
         if ($script:fwCalls[0].Action -ne 'Block') { throw "fwblock recorded wrong action: $($script:fwCalls[0].Action)" }
     }
     finally {
-        $script:isAdmin = $origIsAdmin
+        $script:PSP.IsAdmin = $origIsAdmin
         Remove-Item Function:\New-NetFirewallRule -ErrorAction SilentlyContinue
         Remove-Variable -Name fwCalls -Scope Script -ErrorAction SilentlyContinue
     }
@@ -1567,16 +1219,16 @@ T 'nscan'         $null 'requires nmap'
 T 'sigcheck'      { sigcheck (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') }
 T 'ads'           { $a = Join-Path $ws 'ads.txt'; [System.IO.File]::WriteAllText($a, 'x', [System.Text.UTF8Encoding]::new($false)); Set-Content -LiteralPath $a -Stream 'zone' -Value 'marker'; ads $a }
 T 'defscan'       $null 'triggers Defender scan'
-T 'pwnd'          { pwnd 'password' }
-T 'certcheck'     { certcheck 'example.com' }
+T 'pwnd'          { pwnd 'password' 3>$null } -Net
+T 'certcheck'     { certcheck 'example.com' } -Net
 T 'entropy'       { entropy $tf }
 
 # ===== DEVELOPER+ =====
 T 'serve'         $null 'long-running HTTP server'
-T 'gitignore'     { Push-Location $ws; try { gitignore 'python' } finally { Pop-Location } }
+T 'gitignore'     { Push-Location $ws; try { gitignore 'python' } finally { Pop-Location } } -Net
 T 'gcof'          $null 'interactive fzf picker'
 T 'envload'       { $ef = Join-Path $ws '.env'; [System.IO.File]::WriteAllText($ef, 'PSP_TST=ok', [System.Text.UTF8Encoding]::new($false)); envload $ef }
-T 'tldr'          { tldr 'ls' }
+T 'tldr'          { tldr 'ls' } -Net
 T 'repeat'        { $script:rc=0; repeat 3 { $script:rc++ }; if ($script:rc -ne 3) { throw "expected 3, got $script:rc" } }
 T 'mkvenv'        $null 'creates venv dir'
 
@@ -1596,34 +1248,24 @@ T 'Register-HelpSection'    { Register-HelpSection -Title 'T' -Lines @('x') }
 T 'Register-ProfileCommand' { Register-ProfileCommand -Name 't' -Category 'T' -Synopsis 's' }
 T 'Get-ProfileCommand'      { if (@(Get-ProfileCommand).Count -lt 50) { throw 'registry too small' } }
 T 'Start-ProfileTour'       $null 'interactive Read-Host loop'
-T 'Add-TrustedDirectory'    $null 'persists to user-settings.json (tested in sandbox)'
-T 'Remove-TrustedDirectory' $null 'persists to user-settings.json (tested in sandbox)'
+T 'Add-TrustedDirectory'    { $td = Join-Path $ws 'trusted'; New-Item -ItemType Directory -Path $td -Force | Out-Null; Add-TrustedDirectory -Path $td -Confirm:$false 6>$null; if ($script:PSP.TrustedDirs -notcontains $td) { throw 'not trusted' } }
+T 'Remove-TrustedDirectory' { Remove-TrustedDirectory -Path (Join-Path $ws 'trusted') -Confirm:$false 6>$null; if ($script:PSP.TrustedDirs -contains (Join-Path $ws 'trusted')) { throw 'still trusted' } }
 
 # ===== THEME =====
-T 'Set-TerminalBackground'  $null 'persists to user-settings.json (tested in sandbox)'
-
-# --- Cleanup ---
-Remove-Item $ws -Recurse -Force -ErrorAction SilentlyContinue
+T 'Set-TerminalBackground'  { $img = Join-Path $ws 'bg.png'; [System.IO.File]::WriteAllBytes($img, [byte[]](0x89, 0x50, 0x4E, 0x47)); Set-TerminalBackground -Path $img -Confirm:$false 6>$null; Set-TerminalBackground -Clear -Confirm:$false 6>$null }
 
 # --- Result ---
 Write-Host ""
 $summary = "  Functions: $ok ok, $fail fail, $netFail net-fail, $skip skip"
-Write-Host $summary -ForegroundColor $(if ($fail -gt 0) { 'Red' } elseif ($netFail -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host $summary
 if ($fail -gt 0) { exit 1 }
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $fnOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -ProfileSource $profilePath 2>&1
-    # Show all output
-    foreach ($line in $fnOutput) {
-        $color = if ($line -match '^\s+OK') { 'Green' } elseif ($line -match '^\s+FAIL') { 'Red' } elseif ($line -match '^\s+NET') { 'Yellow' } elseif ($line -match '^\s+SKIP') { 'DarkGray' } else { 'White' }
-        Write-Host "        $line" -ForegroundColor $color
-    }
-    $fnFails = @($fnOutput | Where-Object { $_ -match '^\s+FAIL' })
-    if ($LASTEXITCODE -ne 0 -or $fnFails.Count -gt 0) { throw "$($fnFails.Count) function(s) failed" }
+    Show-ChildOutput $r.Output
+    $fnFails = @($r.Output | Where-Object { $_ -match '^\s+FAIL' })
+    if ($r.ExitCode -ne 0 -or $fnFails.Count -gt 0) { throw "$($fnFails.Count) function(s) failed" }
     Write-Result 'Execute every command' 'PASS'
 }
 catch { Write-Result 'Execute every command' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # =====================================================================
 #  SETUP & INSTALL VERIFICATION
@@ -1633,326 +1275,174 @@ Write-Host '--- Setup & install verification ---' -ForegroundColor Magenta
 Write-Host ''
 
 # -------------------------------------------------------
-# 23. setup.ps1 functions sandbox (AST extract + execute)
+# 23. setup.ps1 functions (hermetic: nothing is installed)
 # -------------------------------------------------------
-Write-Host '[23/26] setup.ps1 functions sandbox' -ForegroundColor Cyan
+Write-Host '[23/27] setup.ps1 functions sandbox' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "setup-fn-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($SetupSource)
-$ErrorActionPreference = 'Stop'
-
-# Parse setup.ps1 AST to extract functions without running install flow
-$tokens = $null; $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($SetupSource, [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count -gt 0) { throw "setup.ps1 has $($parseErrors.Count) parse error(s)" }
-
-# Extract and define all top-level functions
-$fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
-foreach ($fn in $fnDefs) { Invoke-Expression $fn.Extent.Text }
-Write-Host "  Extracted $($fnDefs.Count) functions from setup.ps1"
-
-# Extract $EditorCandidates assignment
-$varDefs = $ast.FindAll({
-    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -eq '$EditorCandidates'
-}, $true)
-if ($varDefs.Count -gt 0) { Invoke-Expression $varDefs[0].Extent.Text }
-
+    $r = Invoke-SandboxChild -Body @'
+$WarningPreference = 'SilentlyContinue'
+. $ProfileSource
+. $PspPostLoadStubs
+$setupFile = Join-Path $RepoRoot 'setup.ps1'
+foreach ($definition in (Get-PspFunctionSource -Path $setupFile -Name @('Install-WingetPackage', 'Install-NerdFonts', 'Invoke-SetupNative', 'Test-InternetConnection', 'Get-OmpThemeUrl', 'Remove-SafeTempDirectory'))) {
+    . ([scriptblock]::Create($definition))
+}
+foreach ($variable in '$EditorCandidates', '$script:CuratedFonts', '$script:CuratedSchemes', '$script:NerdFontVersion', '$script:OmpThemesRef') {
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupFile -Variable $variable)))
+}
+$script:IsElevated = $false
 $ok = 0; $fail = 0
 function T($N, $C) {
     try { $null = & $C 2>&1; Write-Host "  OK    $N"; $script:ok++ }
     catch { Write-Host "  FAIL  $N  ($_)"; $script:fail++ }
 }
-
-# --- Test-InternetConnection ---
-T 'Test-InternetConnection' {
-    $r = Test-InternetConnection
+T 'Install-WingetPackage -WhatIf installs nothing' {
+    # The sandbox puts a recording winget.cmd first on PATH, so even a broken -WhatIf cannot reach the real winget.
+    $r = Install-WingetPackage -Name 'PowerShell' -Id 'Microsoft.PowerShell' -WhatIf 6>$null
     if ($r -ne $true) { throw "expected true, got $r" }
+    $calls = @(Get-PspSandboxWingetCalls -Sandbox $Sandbox)
+    if ($calls.Count -gt 0) { throw "winget ran under -WhatIf: $($calls -join ' | ')" }
 }
-
-# --- Invoke-DownloadWithRetry (real download) ---
-T 'Invoke-DownloadWithRetry' {
-    $tmp = Join-Path $env:TEMP "psp-dltest-$([System.IO.Path]::GetRandomFileName()).json"
-    try {
-        Invoke-DownloadWithRetry -Uri 'https://raw.githubusercontent.com/26zl/PowerShellPerfect/main/theme.json' -OutFile $tmp
-        if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) { throw 'download empty' }
-        $null = Get-Content $tmp -Raw | ConvertFrom-Json
-    }
-    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+T 'Install-WingetPackage reaches only the sandbox winget' {
+    $r = Install-WingetPackage -Name 'PowerShell' -Id 'Microsoft.PowerShell' 6>$null
+    $calls = @(Get-PspSandboxWingetCalls -Sandbox $Sandbox)
+    if ($r -ne $false -or $calls.Count -ne 1 -or $calls[0] -notmatch '^install -e --id Microsoft\.PowerShell\b') { throw "unexpected: result $r, calls $($calls -join ' | ')" }
 }
-
-# --- Merge-JsonObject (setup.ps1 copy) ---
-T 'Merge-JsonObject (setup copy)' {
-    $b = [PSCustomObject]@{ a = 1; n = [PSCustomObject]@{ x = 10; y = 20 } }
-    Merge-JsonObject $b ([PSCustomObject]@{ a = 99; n = [PSCustomObject]@{ y = 30; z = 40 } })
-    if ($b.a -ne 99 -or $b.n.x -ne 10 -or $b.n.y -ne 30 -or $b.n.z -ne 40) { throw 'merge mismatch' }
-}
-
-# --- Wizard -Resume round-trip ---
-T 'Save-WizardChoices persists resumed terminal/feature choices' {
-    $choices = @{
-        Terminal = [ordered]@{ opacity = 90; fontSize = 12; cursorShape = 'bar' }
-        Features = [ordered]@{ psfzf = $false; predictions = $true }
-    }
-    # Simulate state serialization and restoration.
-    $restored = @{}
-    foreach ($p in (($choices | ConvertTo-Json -Depth 20 | ConvertFrom-Json).PSObject.Properties)) { $restored[$p.Name] = $p.Value }
-    foreach ($field in 'Terminal', 'Features') {
-        if ($restored[$field] -is [System.Management.Automation.PSCustomObject]) {
-            $ht = [ordered]@{}
-            foreach ($pp in $restored[$field].PSObject.Properties) { $ht[$pp.Name] = $pp.Value }
-            $restored[$field] = $ht
-        }
-    }
-    $tmp = Join-Path $env:TEMP "psp-wiz-$([System.IO.Path]::GetRandomFileName()).json"
-    try {
-        Save-WizardChoices -Choices $restored -UserSettingsPath $tmp
-        $w = Get-Content $tmp -Raw | ConvertFrom-Json
-        if ($w.defaults.opacity -ne 90) { throw "opacity dropped on resume (got '$($w.defaults.opacity)')" }
-        if ($w.defaults.cursorShape -ne 'bar') { throw 'cursorShape dropped on resume' }
-        if ($w.defaults.font.size -ne 12) { throw 'fontSize dropped on resume' }
-        if ($w.features.predictions -ne $true) { throw 'feature toggle dropped on resume' }
-    }
-    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-}
-
-# --- Install-WingetPackage (already-installed path) ---
-T 'Install-WingetPackage' {
-    $r = Install-WingetPackage -Name 'PowerShell' -Id 'Microsoft.PowerShell'
+T 'Install-NerdFonts -WhatIf downloads nothing' {
+    $r = Install-NerdFonts -WhatIf 6>$null
     if ($r -ne $true) { throw "expected true, got $r" }
+    if (Get-ChildItem -LiteralPath $env:TEMP -Filter 'psp-font-*' -ErrorAction SilentlyContinue) { throw 'font download started under -WhatIf' }
 }
-
-# --- Install-NerdFonts (font detection) ---
-T 'Install-NerdFonts (detection)' {
-    $r = Install-NerdFonts
-    if ($r -ne $true) { throw "expected true, got $r" }
+T 'Install-NerdFonts rejects a bad asset name' {
+    if (Install-NerdFonts -FontName '../x' 6>$null) { throw 'bad asset accepted' }
 }
-
-# --- Install-OhMyPoshTheme (real download to temp) ---
-$configCachePath = Join-Path $env:TEMP "psp-omp-$([System.IO.Path]::GetRandomFileName())"
-New-Item -ItemType Directory $configCachePath -Force | Out-Null
-T 'Install-OhMyPoshTheme' {
-    $r = Install-OhMyPoshTheme -ThemeName 'testtheme' -ThemeUrl 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/agnoster.omp.json'
-    if ($r -ne $true) { throw "expected true, got $r" }
-    if (-not (Test-Path (Join-Path $configCachePath 'testtheme.omp.json'))) { throw 'theme file missing' }
+T 'Curated fonts are pinned' {
+    foreach ($f in $script:CuratedFonts) { if ($f.Sha256 -notmatch '^[A-F0-9]{64}$') { throw "$($f.Name) has no pinned hash" } }
+    if ($script:NerdFontVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Nerd Fonts version not pinned' }
 }
-Remove-Item $configCachePath -Recurse -Force -ErrorAction SilentlyContinue
-
-# --- EditorCandidates validation ---
+T 'Theme URLs use the pinned Oh My Posh release' {
+    if ((Get-OmpThemeUrl -Name 'pure') -notmatch "/oh-my-posh/$([regex]::Escape($script:OmpThemesRef))/themes/pure\.omp\.json$") { throw 'theme URL not pinned' }
+}
 T 'EditorCandidates' {
     if (-not $EditorCandidates -or $EditorCandidates.Count -lt 5) { throw "only $($EditorCandidates.Count) candidates" }
     foreach ($ed in $EditorCandidates) {
         if (-not $ed.Cmd -or -not $ed.Display) { throw "invalid: $($ed | ConvertTo-Json -Compress)" }
     }
 }
-
 Write-Host ''
-Write-Host "  setup.ps1 functions: $ok ok, $fail fail" -ForegroundColor $(if ($fail -gt 0) { 'Red' } else { 'Green' })
+Write-Host "  setup.ps1 functions: $ok ok, $fail fail"
 if ($fail -gt 0) { exit 1 }
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $fnOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -SetupSource $setupPath 2>&1
-    foreach ($line in $fnOutput) {
-        $color = if ($line -match '^\s+OK') { 'Green' } elseif ($line -match '^\s+FAIL') { 'Red' } else { 'White' }
-        Write-Host "        $line" -ForegroundColor $color
-    }
-    $fnFails = @($fnOutput | Where-Object { $_ -match '^\s+FAIL' })
-    if ($LASTEXITCODE -ne 0 -or $fnFails.Count -gt 0) { throw "$($fnFails.Count) function(s) failed" }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw 'setup.ps1 function checks failed' }
     Write-Result 'setup.ps1 functions sandbox' 'PASS'
 }
 catch { Write-Result 'setup.ps1 functions sandbox' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # -------------------------------------------------------
-# 24. setprofile.ps1 sandbox (copy to both PS dirs)
+# 24. setprofile.ps1 sandbox (copy to both PS dirs, -WhatIf writes nothing)
 # -------------------------------------------------------
-Write-Host '[24/26] setprofile.ps1 sandbox' -ForegroundColor Cyan
+Write-Host '[24/27] setprofile.ps1 sandbox' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "setprofile-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($RepoRoot)
-$ErrorActionPreference = 'Stop'
-
-$sb = Join-Path $env:TEMP "psp-setprofile-$([System.IO.Path]::GetRandomFileName())"
-$srcDir  = Join-Path $sb 'src'
-$docsDir = Join-Path $sb 'Documents'
-$ps7Dir  = Join-Path $docsDir 'PowerShell'
-$ps5Dir  = Join-Path $docsDir 'WindowsPowerShell'
+    $r = Invoke-SandboxChild -Body @'
+$errors = @()
+$srcDir = Join-Path $Sandbox.Work 'src'
 New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
-
 Copy-Item (Join-Path $RepoRoot 'Microsoft.PowerShell_profile.ps1') $srcDir
 Copy-Item (Join-Path $RepoRoot 'setprofile.ps1') $srcDir
-
-$origProfile = $PROFILE
-$global:PROFILE = Join-Path $ps7Dir 'Microsoft.PowerShell_profile.ps1'
-
-$errors = @()
-try {
-    Push-Location $srcDir
-    & (Join-Path $srcDir 'setprofile.ps1')
-    Pop-Location
-
-    foreach ($dir in @($ps7Dir, $ps5Dir)) {
-        $pf = Join-Path $dir 'Microsoft.PowerShell_profile.ps1'
-        if (-not (Test-Path $pf)) { $errors += "Not created: $pf" }
-        else {
-            $src = Get-Content (Join-Path $srcDir 'Microsoft.PowerShell_profile.ps1') -Raw
-            $dst = Get-Content $pf -Raw
-            if ($src -ne $dst) { $errors += "Content mismatch: $pf" }
-        }
-    }
+Remove-Item -LiteralPath $Sandbox.Ps7Dir -Recurse -Force
+& (Join-Path $srcDir 'setprofile.ps1') -WhatIf *> $null
+if (Test-Path -LiteralPath (Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1')) { $errors += '-WhatIf wrote a profile' }
+# The user's own PowerShell 7 profile from before the first install; Windows PowerShell has none.
+New-Item -ItemType Directory -Path $Sandbox.Ps7Dir -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $Sandbox.Ps7Dir 'Microsoft.PowerShell_profile.ps1'), '# my own profile', [System.Text.UTF8Encoding]::new($false))
+& (Join-Path $srcDir 'setprofile.ps1') *> $null
+if ($LASTEXITCODE -ne 0) { $errors += "setprofile.ps1 exit code $LASTEXITCODE" }
+foreach ($dir in @($Sandbox.Ps7Dir, $Sandbox.Ps5Dir)) {
+    $pf = Join-Path $dir 'Microsoft.PowerShell_profile.ps1'
+    if (-not (Test-Path $pf)) { $errors += "Not created: $pf" }
+    elseif ((Get-Content (Join-Path $srcDir 'Microsoft.PowerShell_profile.ps1') -Raw) -ne (Get-Content $pf -Raw)) { $errors += "Content mismatch: $pf" }
 }
-finally {
-    $global:PROFILE = $origProfile
-    Remove-Item $sb -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-if ($errors) {
-    $errors | ForEach-Object { Write-Host "ASSERT: $_" -ForegroundColor Red }
-    exit 1
-}
-Write-Host 'setprofile.ps1 sandbox passed'
+# A second run backs up the installed profile, which must never become the "original".
+& (Join-Path $srcDir 'setprofile.ps1') *> $null
+$original = Join-Path $Sandbox.Ps7Dir 'profile.original.ps1'
+if (-not (Test-Path $original) -or (Get-Content $original -Raw).Trim() -ne '# my own profile') { $errors += 'profile.original.ps1 is not the pre-install profile' }
+if (Test-Path (Join-Path $Sandbox.Ps5Dir 'profile.original.ps1')) { $errors += 'a copy of this profile was saved as profile.original.ps1' }
+if ($errors) { $errors | ForEach-Object { Write-Host "ASSERT: $_" }; exit 1 }
+Write-Host '  OK    setprofile.ps1 copies, backs up and honors -WhatIf'
 '@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $spOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -RepoRoot $repoRoot 2>&1
-    $assertLines = @($spOutput | Where-Object { $_ -match 'ASSERT:' })
-    if ($assertLines) { $assertLines | ForEach-Object { Write-Host "        $_" -ForegroundColor Yellow } }
-    if ($LASTEXITCODE -ne 0) { throw "setprofile sandbox failed" }
+    Show-ChildOutput $r.Output
+    if ($r.ExitCode -ne 0) { throw "setprofile sandbox failed" }
     Write-Result 'setprofile.ps1 sandbox' 'PASS'
 }
 catch { Write-Result 'setprofile.ps1 sandbox' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # -------------------------------------------------------
-# 25. Install verification (tools, configs, fonts)
+# 25. Install verification (read-only look at this machine's real install; the profile is not executed)
 # -------------------------------------------------------
-Write-Host '[25/26] Install verification' -ForegroundColor Cyan
+Write-Host '[25/27] Install verification' -ForegroundColor Cyan
 try {
-    $sandboxScript = Join-Path $env:TEMP "install-verify-$([System.IO.Path]::GetRandomFileName()).ps1"
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $sandboxCode = @'
-param($ProfileSource)
-$ErrorActionPreference = 'Stop'
-
-# Refresh PATH from registry (catches winget/scoop installs missed by parent shell)
-$env:PATH = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')
-
-# Load profile to get $script:ProfileTools and tool-dependent function definitions
-$env:CI = 'true'
-. $ProfileSource
-
-$errors = @()
-$warnings = @()
-
-# --- Tools: check each ProfileTools entry via Get-Command (warn-only, profile works without them) ---
-$toolsFound = 0; $toolsMissing = 0
-foreach ($tool in $script:ProfileTools) {
-    $cmd = Get-Command $tool.Cmd -ErrorAction SilentlyContinue
-    if ($cmd) {
+    $errors = @()
+    $warnings = @()
+    # Read $script:ProfileTools and the JSON helpers from the source instead of loading the profile.
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $profilePath -Variable '$script:ProfileTools')))
+    foreach ($definition in (Get-PspFunctionSource -Path $profilePath -Name @('ConvertFrom-JsonC', 'Get-Utf8FileText', 'Read-JsonFile'))) { . ([scriptblock]::Create($definition)) }
+    $toolsFound = 0; $toolsMissing = 0
+    foreach ($tool in $script:ProfileTools) {
+        if (Get-Command $tool.Cmd -CommandType Application -ErrorAction SilentlyContinue) { Write-Host "        OK    $($tool.Name)" -ForegroundColor Green; $toolsFound++ }
+        else { $warnings += "$($tool.Name): not installed"; $toolsMissing++ }
+    }
+    $cachePath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
+    if (-not (Test-Path -LiteralPath $cachePath)) { throw [System.Management.Automation.ItemNotFoundException]::new("no install on this machine ($cachePath is missing); run setup.ps1 to check one") }
+    else {
+        foreach ($cf in @('theme.json', 'terminal-config.json')) {
+            $cfPath = Join-Path $cachePath $cf
+            if (-not (Test-Path -LiteralPath $cfPath)) { $errors += "$cf not cached" }
+            else { try { $null = Read-JsonFile $cfPath } catch { $errors += "$cf corrupt: $_" } }
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $cachePath 'user-settings.json'))) { $errors += 'user-settings.json not found' }
+        if (-not (Get-ChildItem -LiteralPath $cachePath -Filter '*.omp.json' -ErrorAction SilentlyContinue)) { $warnings += 'No OMP theme in cache' }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path (Split-Path $PROFILE) 'profile_user.ps1'))) { $errors += 'profile_user.ps1 not found' }
+    if (Get-Module -ListAvailable -Name PSFzf) { Write-Host '        OK    PSFzf module available' -ForegroundColor Green } else { $warnings += 'PSFzf not installed' }
+    $wtPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+    if (Test-Path -LiteralPath $wtPath) {
         try {
-            $ver = & $tool.Cmd $tool.VerCmd 2>&1 | Out-String
-            Write-Host "  OK    $($tool.Name) = $($ver.Trim().Split([char]10)[0])"
-            $toolsFound++
+            $wt = Read-JsonFile $wtPath
+            if ($wt.profiles.defaults.font.face) { Write-Host "        OK    WT font: $($wt.profiles.defaults.font.face)" -ForegroundColor Green } else { $warnings += 'WT missing font.face in defaults' }
         }
-        catch { $warnings += "$($tool.Name): found but --version failed"; $toolsMissing++ }
+        catch { $warnings += "WT parse failed: $_" }
     }
-    else { $warnings += "$($tool.Name): not installed"; $toolsMissing++ }
-}
-
-# --- Required: cache directory and config files ---
-$cachePath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
-if (-not (Test-Path $cachePath)) { $errors += "Cache dir missing: $cachePath" }
-else {
-    foreach ($cf in @('theme.json', 'terminal-config.json')) {
-        $cfPath = Join-Path $cachePath $cf
-        if (-not (Test-Path $cfPath)) { $errors += "$cf not cached" }
-        else {
-            try { $null = Get-Content $cfPath -Raw | ConvertFrom-Json }
-            catch { $errors += "$cf corrupt: $_" }
-        }
+    foreach ($w in $warnings) { Write-Host "        WARN  $w" -ForegroundColor Yellow }
+    if ($errors) {
+        foreach ($e in $errors) { Write-Host "        FAIL  $e" -ForegroundColor Red }
+        throw 'Required verification checks failed (see FAIL above)'
     }
-    $userSettings = Join-Path $cachePath 'user-settings.json'
-    if (-not (Test-Path $userSettings)) { $errors += 'user-settings.json not found' }
-}
-
-# --- Required: profile_user.ps1 ---
-$userProfile = Join-Path (Split-Path $PROFILE) 'profile_user.ps1'
-if (-not (Test-Path $userProfile)) { $errors += 'profile_user.ps1 not found' }
-
-# --- OMP theme file in cache ---
-$themeFiles = Get-ChildItem $cachePath -Filter '*.omp.json' -ErrorAction SilentlyContinue
-if (-not $themeFiles) { $warnings += 'No OMP theme in cache (oh-my-posh may not be installed)' }
-else { Write-Host "  OK    OMP theme: $($themeFiles[0].Name)" }
-
-# --- Nerd Font installed ---
-try {
-    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-    $fc = New-Object System.Drawing.Text.InstalledFontCollection
-    $nfMatch = @($fc.Families | Where-Object { $_.Name -match 'Caskaydia|NF|Nerd' })
-    $fc.Dispose()
-    if ($nfMatch.Count -eq 0) { $warnings += 'No Nerd Font detected' }
-    else { Write-Host "  OK    Nerd Font: $($nfMatch[0].Name)" }
-}
-catch { $warnings += "Font check failed: $_" }
-
-# --- PSFzf module ---
-if (Get-Module -ListAvailable -Name PSFzf) { Write-Host '  OK    PSFzf module available' }
-else { $warnings += 'PSFzf not installed' }
-
-# --- Windows Terminal settings (if WT installed) ---
-$wtPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
-if (Test-Path $wtPath) {
-    try {
-        $wtRaw = Get-Content $wtPath -Raw
-        $_q = [char]34
-        $jsoncPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*$"
-        $wtRaw = $wtRaw -replace $jsoncPattern, ''
-        $wt = $wtRaw | ConvertFrom-Json
-        if ($wt.profiles.defaults.font.face) { Write-Host "  OK    WT font: $($wt.profiles.defaults.font.face)" }
-        else { $warnings += 'WT missing font.face in defaults' }
-        if ($wt.profiles.defaults.colorScheme) { Write-Host "  OK    WT colorScheme: $($wt.profiles.defaults.colorScheme)" }
-        else { $warnings += 'WT missing colorScheme in defaults' }
-    }
-    catch { $warnings += "WT parse failed: $_" }
-}
-else { Write-Host '  SKIP  Windows Terminal not found' }
-
-# --- Tool strictness: fail if winget is available but zero tools found (skip in CI) ---
-$hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
-if ($toolsFound -eq 0 -and $toolsMissing -gt 0 -and $hasWinget -and -not $env:GITHUB_ACTIONS) {
-    $errors += "All $toolsMissing managed tools missing (winget available - run setup.ps1 or Update-Profile to install)"
-}
-
-# --- Summary ---
-Write-Host ""
-Write-Host "  Tools: $toolsFound found, $toolsMissing missing (winget=$(if ($hasWinget) {'yes'} else {'no'}))"
-if ($warnings) {
-    foreach ($w in $warnings) { Write-Host "  WARN  $w" -ForegroundColor Yellow }
-}
-if ($errors) {
-    foreach ($e in $errors) { Write-Host "  FAIL  $e" -ForegroundColor Red }
-    exit 1
-}
-'@
-    [System.IO.File]::WriteAllText($sandboxScript, $sandboxCode, $utf8NoBom)
-    $ivOutput = pwsh -NonInteractive -NoProfile -File $sandboxScript -ProfileSource $profilePath 2>&1
-    foreach ($line in $ivOutput) {
-        $color = if ($line -match '^\s+OK') { 'Green' } elseif ($line -match '^\s+FAIL') { 'Red' } elseif ($line -match '^\s+WARN') { 'Yellow' } elseif ($line -match '^\s+SKIP') { 'DarkGray' } else { 'White' }
-        Write-Host "        $line" -ForegroundColor $color
-    }
-    if ($LASTEXITCODE -ne 0) { throw 'Required verification checks failed (see FAIL above)' }
     Write-Result 'Install verification' 'PASS'
 }
+catch [System.Management.Automation.ItemNotFoundException] { Write-Result 'Install verification' 'SKIP' $_.Exception.Message }
 catch { Write-Result 'Install verification' 'FAIL' $_.Exception.Message }
-finally { Remove-Item $sandboxScript -Force -ErrorAction SilentlyContinue }
 
 # -------------------------------------------------------
-# 26. Command coverage audit (test.ps1 vs profile exports)
+# 26. Static checks for the hermetic-test rules
 # -------------------------------------------------------
-Write-Host '[26/26] Command coverage audit' -ForegroundColor Cyan
+Write-Host '[26/27] Test hygiene' -ForegroundColor Cyan
+try {
+    $problems = @()
+    foreach ($file in Get-ChildItem -LiteralPath $PSScriptRoot -Filter *.ps1 -File) {
+        $text = Get-Content -LiteralPath $file.FullName -Raw
+        # Uninstall-Profile -All includes -RemoveFonts; only sandboxes that set TestFontScopes may call it.
+        if ($text -match 'Uninstall-Profile -All -Confirm' -and $text -notmatch 'TestFontScopes') { $problems += "$($file.Name) runs Uninstall-Profile -All without a sandboxed font scope" }
+    }
+    if ($problems) { $problems | ForEach-Object { Write-Host "        $_" -ForegroundColor Red }; Write-Result 'Test hygiene' 'FAIL' "$($problems.Count) problem(s)" }
+    else { Write-Result 'Test hygiene' 'PASS' }
+}
+catch { Write-Result 'Test hygiene' 'FAIL' $_.Exception.Message }
+
+# -------------------------------------------------------
+# 27. Command coverage audit (test.ps1 vs profile exports)
+# -------------------------------------------------------
+Write-Host '[27/27] Command coverage audit' -ForegroundColor Cyan
 try {
     # Exported function names from profile source (AST)
     $tokens = $null; $parseErrors = $null
@@ -1966,7 +1456,7 @@ try {
     $aliasNames = [regex]::Matches($profileRaw, 'Set-Alias\s+-Name\s+([A-Za-z0-9\-]+)\s+-Value\s+([A-Za-z0-9\-]+)') |
         ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 
-    # Internal helper functions that are intentionally not direct user commands
+    # Internal helpers are not direct user commands: everything named *-Psp* or *-Wt* plus the list below.
     $internalOnly = @(
         'Get-ExternalCommandPath'
         'Update-SessionPathFromRegistry'
@@ -2001,14 +1491,23 @@ try {
         'Write-Utf8FileAtomic'
         'Set-PspFeatureOverride'
         'Get-LatestMainCommitSha'
+        'ConvertFrom-JsonC'
+        'Read-JsonFile'
+        'Get-CombinedSha256'
+        'Resolve-PspCommitSha'
+        'Update-WindowsTerminalSettingsFile'
+        'Undo-WindowsTerminalSettingsFile'
+        'Copy-PspObject'
+        'Merge-PspUserSettings'
+        'ConvertTo-PspSortedNode'
     )
-    $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
+    $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ -and $_ -notmatch '-(Psp|Wt)[A-Z]' }
 
     # Commands explicitly checked in step 17 existence list
     $existNames = @()
     $inExistBlock = $false
     foreach ($line in (Get-Content $MyInvocation.MyCommand.Path)) {
-        if ($line.Contains('`$expected = @(')) { $inExistBlock = $true; continue }
+        if ($line -match '^\$expected = @\($') { $inExistBlock = $true; continue }
         if ($inExistBlock -and $line -match "^\s*\)") { break }
         if ($inExistBlock) {
             foreach ($m in [regex]::Matches($line, "'([^']+)'")) {
@@ -2047,17 +1546,13 @@ try {
         'Edit-Profile'       # opens editor UI
         'ep'                 # opens editor UI (alias)
         'edit'               # opens editor UI
-        'Clear-ProfileCache' # destructive to real cache
-        'Clear-Cache'        # destructive to real cache
-        'Uninstall-Profile'  # tested in dedicated sandbox (steps 19/20/21)
+        'Uninstall-Profile'  # tested in dedicated sandbox (steps 19/20/21) and tests/unit.ps1
         'gpush'              # no remote configured
         'gpull'              # no remote configured
         'gcl'                # network + clones repo
         'lazyg'              # no remote configured
         'g'                  # needs zoxide github dir
-        'pkill'              # destructive - kills processes
         'Stop-StuckProcess'  # destructive - kills processes
-        'Remove-LockedItem'  # destructive - kills + deletes
         'Stop-ListeningPort' # interactive fzf picker
         'killports'          # alias to Stop-ListeningPort
         'admin'              # opens elevated terminal
@@ -2067,13 +1562,12 @@ try {
         'wifipass'           # requires admin/netsh
         'hosts'              # opens elevated editor
         'vtscan'             # needs API key
-        'killport'           # destructive - kills process
         'watch'              # infinite loop
         'dlogs'              # needs running container
         'dex'                # needs running container
         'dstop'              # destructive
         'dprune'             # destructive
-        'Copy-SshKey'        # needs remote host
+        'Copy-SshKey'        # needs remote host (remote script tested in tests/unit.ps1)
         'ssh-copy-key'       # needs remote host (alias)
         'keygen'             # writes keys to ~/.ssh
         'rdp'                # opens RDP UI
@@ -2101,9 +1595,6 @@ try {
         'mkvenv'             # creates venv dir + activates
         'lint'               # requires PSScriptAnalyzer (covered by lint job)
         'Start-ProfileTour'  # interactive Read-Host walkthrough
-        'Add-TrustedDirectory'    # persists to user-settings.json (tested in sandbox)
-        'Remove-TrustedDirectory' # persists to user-settings.json (tested in sandbox)
-        'Set-TerminalBackground'  # persists to user-settings.json + WT live (tested in sandbox)
     )
     $unexpectedSkips = @($skipOnly | Where-Object { $allowedSkipOnly -notcontains $_ })
 
@@ -2123,11 +1614,14 @@ try {
         throw "$($unexpectedSkips.Count) command(s) skipped without justification"
     }
 
+    # Registration is not execution: require a minimum share of the covered commands to actually run.
+    $minimumExecPct = 70
     $execPct = if ($coveredNames.Count -gt 0) { [math]::Round(($testedNames.Count / $coveredNames.Count) * 100) } else { 0 }
-    $detail = "functions=$($commandFns.Count), aliases=$($aliasNames.Count), executed=$($execActual.Count), skip-only=$($skipOnly.Count)/$($allowedSkipOnly.Count) allowed, exec%=$execPct"
+    $detail = "functions=$($commandFns.Count), aliases=$($aliasNames.Count), executed=$($execActual.Count), skip-only=$($skipOnly.Count)/$($allowedSkipOnly.Count) allowed, exec%=$execPct (minimum $minimumExecPct)"
     if ($skipOnly.Count -gt 0) {
         Write-Host "        Allowed skip-only ($($skipOnly.Count)): $($skipOnly -join ', ')" -ForegroundColor DarkGray
     }
+    if ($execPct -lt $minimumExecPct) { throw "Only $execPct% of covered commands are executed (minimum $minimumExecPct%). $detail" }
     Write-Result 'Command coverage audit' 'PASS' $detail
 }
 catch { Write-Result 'Command coverage audit' 'FAIL' $_.Exception.Message }

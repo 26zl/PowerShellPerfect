@@ -1,8 +1,20 @@
+# Functional suite: installs into a sandbox, runs every profile command it safely can, audits coverage, then uninstalls.
+# Third-party web endpoints are answered by local mocks unless -LiveNetwork is passed (the scheduled workflow does that).
+#   pwsh -NoProfile -File tests/ci-functional.ps1                 # hermetic, as in pull-request CI
+#   pwsh -NoProfile -File tests/ci-functional.ps1 -LiveNetwork    # also call the real endpoints (never uploads to the public paste)
 # Suppress alias warnings because the test invokes profile commands by their short names.
 [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingCmdletAliases', '')]
 param(
     [switch]$VerboseOutput,
-    [switch]$StrictNetwork
+    [switch]$StrictNetwork,
+    # Call the real third-party endpoints instead of the local mocks.
+    [switch]$LiveNetwork,
+    # With -LiveNetwork, let hb really publish its probe file to the public paste service.
+    [switch]$AllowPublicUpload,
+    # CI runners are elevated disposable VMs; elsewhere run the suite from a normal shell.
+    [switch]$AllowElevated,
+    # Registration is not execution: fail when fewer exports than this actually run.
+    [ValidateRange(0, 100)][int]$MinimumExecutedPercent = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +22,8 @@ $ErrorActionPreference = 'Stop'
 # Resolve repository assets relative to the parent of tests/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
+. (Join-Path $PSScriptRoot 'lib\Sandbox.ps1')
+Assert-PspTestSafety -AllowElevated:$AllowElevated -ScriptName 'tests/ci-functional.ps1'
 
 $passed = 0
 $failed = 0
@@ -21,9 +35,9 @@ $script:commandFailures = @()
 $script:networkSoftFails = @()
 $script:installReady = $false
 
-$script:origLocalAppData = $env:LOCALAPPDATA
-$script:origProfileVar = $PROFILE
-$script:origCiVar = $env:CI
+# Everything below runs with LOCALAPPDATA, TEMP and $PROFILE inside this sandbox and machine-changing commands blocked.
+$script:runSandbox = New-PspSandbox -Name 'functional'
+Enter-PspSandbox -Sandbox $script:runSandbox
 
 $script:sandboxRoot = $null
 $script:sandboxPs7Dir = $null
@@ -119,38 +133,67 @@ function Register-SkippedCommand {
     }
 }
 
-# Detect if error message indicates a network/connectivity issue (for soft-fail in probes)
-function Test-IsNetworkIssue {
-    param([string]$Message)
-    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
-    $patterns = @(
-        '(?i)timeout'
-        '(?i)timed out'
-        '(?i)unable to connect'
-        '(?i)could not connect'
-        '(?i)connection.*(closed|failed|forcibly|refused|reset)'
-        '(?i)remote name could not be resolved'
-        '(?i)no such host'
-        '(?i)name or service not known'
-        '(?i)dns'
-        '(?i)network'
-        '(?i)unreachable'
-        '(?i)TLS'
-        '(?i)SSL'
-        '(?i)HttpRequestException'
-        '(?i)temporar'
-        '(?i)service unavailable'
-        '(?i)\b(429|500|502|503|504)\b'
-        '(?i)lookup failed'
-        '(?i)could not fetch'
-        '(?i)failed to retrieve public ip'
-        '(?i)whois lookup failed'
-        '(?i)failed to upload the document'
-    )
-    foreach ($pattern in $patterns) {
-        if ($Message -match $pattern) { return $true }
+# Return $true when an exception chain contains a transport failure (DNS, TCP, TLS handshake, timeout), judged by type, not message text.
+function Test-IsTransportFailure {
+    param([System.Exception]$Exception)
+    # Compared by name: System.Net.Http is not always loaded in Windows PowerShell 5.1.
+    $transportTypes = @('System.Net.Http.HttpRequestException', 'System.Net.WebException', 'System.Net.Sockets.SocketException', 'System.TimeoutException', 'System.Threading.Tasks.TaskCanceledException', 'System.Security.Authentication.AuthenticationException')
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        for ($t = $e.GetType(); $t; $t = $t.BaseType) { if ($transportTypes -contains $t.FullName) { return $true } }
     }
     return $false
+}
+
+# Answer third-party web requests with canned responses so pull-request CI never calls or uploads to external services.
+# Loopback requests (the local HTTP probe) and GitHub file downloads (pinned themes, whose hashes are then checked
+# against the real files) go to the real cmdlets; any other unmocked URL fails the probe.
+function Install-NetworkMocks {
+    param([switch]$UploadOnly)
+    $global:PspMockUploadOnly = [bool]$UploadOnly
+    $global:PspMockResponse = {
+        param([string]$Uri)
+        $u = [Uri]$Uri
+        $suffix = '1E4C9B93F3F0682250B6CF8331B7EE68FD8'
+        if ($u.Host -eq 'bin.christitus.com') { return [PSCustomObject]@{ key = 'mockkey' } }
+        if ($global:PspMockUploadOnly) { return $null }
+        switch -Regex ($u.Host) {
+            '^ifconfig\.me$' { return '203.0.113.7' }
+            '^ipwho\.is$' { return [PSCustomObject]@{ success = $true; ip = '8.8.8.8'; city = 'Mountain View'; region = 'California'; country = 'United States'; connection = [PSCustomObject]@{ isp = 'Mock ISP'; org = 'Mock Org'; asn = 64500 } } }
+            '^rdap\.org$' { return [PSCustomObject]@{ ldhName = 'EXAMPLE.COM'; status = @('active'); entities = @(); events = @([PSCustomObject]@{ eventAction = 'registration'; eventDate = '1995-08-14T04:00:00Z' }); nameservers = @([PSCustomObject]@{ ldhName = 'A.IANA-SERVERS.NET' }) } }
+            '^wttr\.in$' { return 'London: +12C' }
+            '^api\.pwnedpasswords\.com$' { return "${suffix}:42`r`n0018A45C4D1DEF81644B54AB7F969B88D65:1" }
+            '^www\.toptal\.com$' { return "# gitignore mock`n__pycache__/`n" }
+            '^raw\.githubusercontent\.com$' { if ($u.AbsolutePath -like '/tldr-pages/*') { return "# ls`n`n> List directory contents." } }
+            '^api\.github\.com$' {
+                if ($u.AbsolutePath -like '/repos/PowerShell/PowerShell/releases/latest') { return [PSCustomObject]@{ tag_name = "v$($PSVersionTable.PSVersion)" } }
+                if ($u.AbsolutePath -like '/repos/26zl/PowerShellPerfect/commits/*') { return ('a' * 40) }
+            }
+        }
+        throw "Unmocked network call in CI: $Uri (add a mock or run with -LiveNetwork)"
+    }
+    Set-Item -Path 'function:global:Invoke-RestMethod' -Value {
+        param([Parameter(Position = 0)][string]$Uri, [string]$Method, $Body, $Headers, [int]$TimeoutSec, [switch]$UseBasicParsing, [string]$OutFile, [string]$ContentType)
+        $target = [Uri]$Uri
+        $passThrough = $target.IsLoopback -or $target.Host -in @('github.com', 'objects.githubusercontent.com') -or
+            ($target.Host -eq 'raw.githubusercontent.com' -and $target.AbsolutePath -notlike '/tldr-pages/*')
+        if ($passThrough -or ($global:PspMockUploadOnly -and $target.Host -ne 'bin.christitus.com')) {
+            $null = $PSBoundParameters.Remove('ErrorAction')
+            return Microsoft.PowerShell.Utility\Invoke-RestMethod @PSBoundParameters -ErrorAction Stop
+        }
+        $result = & $global:PspMockResponse $Uri
+        if ($OutFile) { [System.IO.File]::WriteAllText($OutFile, [string]$result, [System.Text.UTF8Encoding]::new($false)); return }
+        $result
+    }
+    Set-Item -Path 'function:global:Invoke-WebRequest' -Value {
+        param([Parameter(Position = 0)][string]$Uri, [string]$Method, $Body, $Headers, [int]$TimeoutSec, [switch]$UseBasicParsing, [string]$OutFile, [string]$ContentType)
+        $target = [Uri]$Uri
+        if ($target.IsLoopback -or $global:PspMockUploadOnly) {
+            $null = $PSBoundParameters.Remove('ErrorAction')
+            return Microsoft.PowerShell.Utility\Invoke-WebRequest @PSBoundParameters -ErrorAction Stop
+        }
+        $result = & $global:PspMockResponse $Uri
+        [PSCustomObject]@{ StatusCode = 200; Content = [string]$result; Headers = @{ 'Content-Type' = 'text/plain' }; RawContentStream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes([string]$result)) }
+    }
 }
 
 # Run a single command probe and record result for coverage audit
@@ -173,23 +216,28 @@ function Invoke-CommandProbe {
         return
     }
 
+    $failure = $null
     try {
         $output = & { $ErrorActionPreference = 'Stop'; & $Code } 2>&1
         $errorRecords = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-        if ($errorRecords.Count -gt 0) { throw $errorRecords[0].ToString() }
+        if ($errorRecords.Count -gt 0) { $failure = $errorRecords[0] }
 
-        if ($VerboseOutput -and $output) {
+        if (-not $failure -and $VerboseOutput -and $output) {
             foreach ($line in $output) {
                 Write-Host "        $line" -ForegroundColor DarkGray
             }
         }
+    }
+    catch { $failure = $_ }
 
+    if (-not $failure) {
         Register-ExecutedCommand -Name $Command
         Write-Host "    OK    $Command" -ForegroundColor Green
     }
-    catch {
-        $msg = $_.Exception.Message
-        if (Test-IsNetworkIssue -Message $msg) {
+    else {
+        $msg = $failure.Exception.Message
+        # Only a real transport failure during a live run is a soft failure; mocked runs never touch the network.
+        if ($LiveNetwork -and (Test-IsTransportFailure -Exception $failure.Exception)) {
             Register-ExecutedCommand -Name $Command
             $script:networkSoftFails += "${Command}: $msg"
             Write-Host "    NET   $Command ($msg)" -ForegroundColor Yellow
@@ -202,26 +250,13 @@ function Invoke-CommandProbe {
     }
 }
 
-# Restore environment and remove sandbox dir after test run
+# Restore environment and remove sandbox dirs after test run
 function Restore-SandboxEnvironment {
-    if ($null -ne $script:origLocalAppData) {
-        $env:LOCALAPPDATA = $script:origLocalAppData
-    }
-
-    if ($script:origProfileVar) {
-        Set-Variable -Name PROFILE -Scope Global -Value $script:origProfileVar
-    }
-
-    if ([string]::IsNullOrWhiteSpace($script:origCiVar)) {
-        Remove-Item env:CI -ErrorAction SilentlyContinue
-    }
-    else {
-        $env:CI = $script:origCiVar
-    }
-
+    foreach ($stub in 'Invoke-RestMethod', 'Invoke-WebRequest') { Remove-Item -Path "function:global:$stub" -ErrorAction SilentlyContinue }
     if ($script:sandboxRoot -and (Test-Path $script:sandboxRoot)) {
         Remove-Item -Path $script:sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Exit-PspSandbox -Sandbox $script:runSandbox
 }
 
 Write-Host ''
@@ -230,6 +265,15 @@ Write-Host ''
 
 if (-not (Test-Path $profilePath)) {
     throw "Profile not found: $profilePath"
+}
+
+if ($LiveNetwork) {
+    Write-Host '  Live network mode: probes call the real endpoints.' -ForegroundColor Yellow
+    if (-not $AllowPublicUpload) { Install-NetworkMocks -UploadOnly }
+}
+else {
+    Write-Host '  Mocked network mode: third-party endpoints are answered locally.' -ForegroundColor DarkGray
+    Install-NetworkMocks
 }
 
 try {
@@ -317,7 +361,8 @@ Invoke-TestCase -Name 'Install profile in sandbox' -Code {
     [System.IO.File]::WriteAllText((Join-Path $script:sandboxPs7Dir 'profile_user.ps1'), '# user override', $utf8NoBom)
     [System.IO.File]::WriteAllText((Join-Path $script:sandboxPs5Dir 'profile_user.ps1'), '# user override', $utf8NoBom)
 
-    $smokeOutput = pwsh -NoProfile -NonInteractive -Command ". '$($script:sandboxPs7Profile)'" 2>&1
+    # The child computes its own $PROFILE; point it at the sandbox so no real profile_user.ps1 runs.
+    $smokeOutput = pwsh -NoProfile -NonInteractive -Command "`$global:PROFILE = '$($script:sandboxPs7Profile)'; . '$($script:sandboxPs7Profile)'" 2>&1
     if ($LASTEXITCODE -ne 0) {
         $sample = ($smokeOutput | Select-Object -First 5) -join '; '
         throw "Installed profile failed to load in sandbox smoke test: $sample"
@@ -336,6 +381,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
     Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
     $env:CI = 'true'
     . $script:sandboxPs7Profile
+    . $PspPostLoadStubs
 
     $workspace = Join-Path $env:TEMP "psp-ci-func-$([System.IO.Path]::GetRandomFileName())"
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -409,11 +455,18 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 $listener.Close()
             }
         }
-        Start-Sleep -Milliseconds 200
+        # Start-Job launches a new process; wait until the listener accepts connections instead of guessing a delay.
+        $httpReadyBy = (Get-Date).AddSeconds(20)
+        do {
+            $probeClient = [System.Net.Sockets.TcpClient]::new()
+            try { $probeClient.Connect([System.Net.IPAddress]::Loopback, $httpPort); $httpReady = $true }
+            catch { $httpReady = $false; Start-Sleep -Milliseconds 200 }
+            finally { $probeClient.Dispose() }
+        } until ($httpReady -or (Get-Date) -gt $httpReadyBy)
 
-        # Environment feature detection
-        $clipboardReady = [bool](Get-Command Set-Clipboard -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-Clipboard -ErrorAction SilentlyContinue)
-        $clipboardSkipReason = $null
+        # Environment feature detection; clipboard probes overwrite the clipboard, so they run on CI runners only.
+        $clipboardReady = [bool]$env:GITHUB_ACTIONS -and [bool](Get-Command Set-Clipboard -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-Clipboard -ErrorAction SilentlyContinue)
+        $clipboardSkipReason = if (-not $env:GITHUB_ACTIONS) { 'Would overwrite your clipboard (runs on CI runners only)' } else { $null }
         if ($clipboardReady) {
             try {
                 Set-Clipboard 'psp-ci-probe'
@@ -425,9 +478,10 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
                 $clipboardSkipReason = "Clipboard unavailable in this host: $($_.Exception.Message)"
             }
         }
-        else {
+        elseif (-not $clipboardSkipReason) {
             $clipboardSkipReason = 'Set-Clipboard/Get-Clipboard not available'
         }
+        $liveSkipReason = if ($LiveNetwork) { $null } else { 'Real TLS endpoint; covered by the scheduled -LiveNetwork run' }
 
         $hasDocker = [bool](Get-Command docker -ErrorAction SilentlyContinue)
         $dockerRunning = $false
@@ -481,15 +535,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             Update-PowerShell -WhatIf *> $null
         }
         Invoke-CommandProbe -Command 'Update-Tools' -Code {
-            # Exercise Update-Tools only when winget is absent.
-            if (Get-Command winget -ErrorAction SilentlyContinue) {
-                Write-Host '        (skipping live invocation; winget present in CI host)' -ForegroundColor DarkGray
-            }
-            else {
-                Update-Tools *> $null
-            }
-            $cmd = Get-Command Update-Tools
-            if (-not $cmd) { throw 'Update-Tools missing' }
+            # winget is replaced by a recorder and one tool is reported as installed, so the upgrade path runs without changing anything.
+            $script:wingetCalls = @()
+            function winget { $script:wingetCalls += ($args -join ' '); $global:LASTEXITCODE = -1978335189 }
+            function Get-ProfileToolExecutablePath { param($Tool) if ($Tool.Name -eq 'bat') { 'C:\psp-test\bat.exe' } }
+            function Get-ProfileToolVersionText { param($Tool, $ExecutablePath) '1.0.0' }
+            Update-Tools -Confirm:$false *> $null
+            if (@($script:wingetCalls | Where-Object { $_ -match '^upgrade --id sharkdp\.bat\b' }).Count -ne 1) { throw "unexpected winget calls: $($script:wingetCalls -join ' | ')" }
         }
         Invoke-CommandProbe -Command 'Clear-ProfileCache' -Code {
             $origLocal = $env:LOCALAPPDATA
@@ -630,7 +682,13 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $size = sizeof $textFile
             if (-not $size) { throw 'sizeof returned empty value' }
         }
-        Invoke-CommandProbe -Command 'trash' -SkipReason 'Shell.Application recycle-bin COM is unreliable in headless CI'
+        # -WhatIf: a real run would move the file into the Recycle Bin of the account running the tests.
+        Invoke-CommandProbe -Command 'trash' -Code {
+            $trashFile = Join-Path $workspace 'trash-probe.txt'
+            [System.IO.File]::WriteAllText($trashFile, 'x', $utf8NoBom)
+            trash $trashFile -WhatIf
+            if (-not (Test-Path -LiteralPath $trashFile)) { throw 'trash -WhatIf removed the file' }
+        }
         Invoke-CommandProbe -Command 'extract' -Code {
             New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
             $before = Get-Location
@@ -735,7 +793,11 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $r = pgrep 'pwsh'
             if (-not $r) { throw 'pgrep did not return any pwsh process' }
         }
-        Invoke-CommandProbe -Command 'pkill' -SkipReason 'Destructive process termination command'
+        Invoke-CommandProbe -Command 'pkill' -Code {
+            pkill 'psp-no-such-process' 3>$null
+            pkill '*' -ErrorAction SilentlyContinue -ErrorVariable pkillErr
+            if ((@($pkillErr) -join ' ') -notmatch 'refusing') { throw 'pkill accepted a match-everything pattern' }
+        }
         Invoke-CommandProbe -Command 'export' -Code {
             export 'PSP_TEST_VAR' 'ci'
             if ($env:PSP_TEST_VAR -ne 'ci') { throw 'export did not set env var' }
@@ -752,7 +814,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'ports' -Code { ports | Out-Null }
         Invoke-CommandProbe -Command 'checkport' -SkipReason 'Test-NetConnection can fail on hosted runners without stable adapter metadata'
         Invoke-CommandProbe -Command 'portscan' -Code { portscan '127.0.0.1' -Ports @($localPort) | Out-Null }
-        Invoke-CommandProbe -Command 'tlscert' -Code { tlscert 'example.com' | Out-Null }
+        Invoke-CommandProbe -Command 'tlscert' -Code { tlscert 'example.com' | Out-Null } -SkipReason $liveSkipReason
         Invoke-CommandProbe -Command 'ipinfo' -Code { ipinfo '8.8.8.8' | Out-Null }
         Invoke-CommandProbe -Command 'whois' -Code { whois 'example.com' | Out-Null }
         Invoke-CommandProbe -Command 'nslook' -Code { nslook 'localhost' | Out-Null }
@@ -763,8 +825,38 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'speedtest' -SkipReason 'Long-running network benchmark'
         Invoke-CommandProbe -Command 'wifipass' -SkipReason 'Requires WLAN profile context and often elevation'
         Invoke-CommandProbe -Command 'hosts' -SkipReason 'Opens elevated editor UI'
-        Invoke-CommandProbe -Command 'winutil' -SkipReason 'Remote-script wrapper is unit-tested separately; live run intentionally skipped'
-        Invoke-CommandProbe -Command 'harden' -SkipReason 'Launches external hardening tool / GUI on developer machines'
+        Invoke-CommandProbe -Command 'winutil' -Code {
+            # Serve a local script: winutil must not run it without opt-in or after a hash mismatch, and must run it after a match.
+            $marker = Join-Path $workspace 'winutil-ran.txt'
+            $body = "[System.IO.File]::WriteAllText('$($marker -replace "'", "''")', 'ran', [System.Text.UTF8Encoding]::new(`$false))"
+            $script:winutilBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { $good = [BitConverter]::ToString($sha.ComputeHash($script:winutilBytes)).Replace('-', '') } finally { $sha.Dispose() }
+            function Invoke-WebRequest { param([string]$Uri, [int]$TimeoutSec, [switch]$UseBasicParsing, $ErrorAction) [PSCustomObject]@{ RawContentStream = [System.IO.MemoryStream]::new($script:winutilBytes) } }
+            $savedAdmin = $script:PSP.IsAdmin
+            try {
+                winutil 6>$null
+                # Unelevated, WinUtil would relaunch itself from its latest release, so a pinned run needs an elevated shell.
+                $script:PSP.IsAdmin = $false
+                winutil -ExpectedSha256 $good -Confirm:$false -ErrorAction SilentlyContinue 6>$null
+                if (Test-Path -LiteralPath $marker) { throw 'winutil ran unelevated' }
+                $script:PSP.IsAdmin = $true
+                winutil -ExpectedSha256 ('0' * 64) -Confirm:$false -ErrorAction SilentlyContinue 6>$null
+                if (Test-Path -LiteralPath $marker) { throw 'winutil ran without opt-in or after a hash mismatch' }
+                winutil -ExpectedSha256 $good -Confirm:$false 6>$null
+                if (-not (Test-Path -LiteralPath $marker)) { throw 'winutil did not run after a hash match' }
+            }
+            finally { $script:PSP.IsAdmin = $savedAdmin }
+        }
+        Invoke-CommandProbe -Command 'harden' -Code {
+            $script:hardenTarget = $null
+            function Get-ExternalCommandPath { param([string]$CommandName) if ($CommandName -eq 'hss.exe') { 'C:\Tools\hss.exe' } }
+            function Start-Process { param([string]$FilePath) $script:hardenTarget = $FilePath }
+            harden -WhatIf
+            if ($script:hardenTarget) { throw 'harden launched under -WhatIf' }
+            harden -Confirm:$false
+            if ($script:hardenTarget -ne 'C:\Tools\hss.exe') { throw "unexpected launch target: $script:hardenTarget" }
+        }
 
         # Security and crypto
         $sha256 = $null
@@ -830,7 +922,11 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         }
 
         # Developer
-        Invoke-CommandProbe -Command 'killport' -SkipReason 'Destructive process termination command'
+        Invoke-CommandProbe -Command 'killport' -Code {
+            # The local listener belongs to this process; -WhatIf must leave it running.
+            killport $localPort -WhatIf 6>$null 3>$null
+            if (-not (Get-Process -Id $PID -ErrorAction SilentlyContinue)) { throw 'killport stopped the test process' }
+        }
         Invoke-CommandProbe -Command 'Stop-ListeningPort' -SkipReason 'Interactive fzf picker; destructive'
         Invoke-CommandProbe -Command 'killports' -SkipReason 'Alias to Stop-ListeningPort'
         Invoke-CommandProbe -Command 'Find-FileLocker' -Code {
@@ -846,7 +942,14 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             finally { $stream.Close(); $stream.Dispose() }
         }
         Invoke-CommandProbe -Command 'Stop-StuckProcess' -SkipReason 'Destructive process termination'
-        Invoke-CommandProbe -Command 'Remove-LockedItem' -SkipReason 'Destructive: kills processes and deletes'
+        Invoke-CommandProbe -Command 'Remove-LockedItem' -Code {
+            $lockedProbe = Join-Path $workspace 'locked-probe.txt'
+            [System.IO.File]::WriteAllText($lockedProbe, 'x', $utf8NoBom)
+            Remove-LockedItem $lockedProbe -WhatIf 6>$null
+            if (-not (Test-Path -LiteralPath $lockedProbe)) { throw 'Remove-LockedItem -WhatIf deleted the file' }
+            Remove-LockedItem $lockedProbe -Confirm:$false 6>$null
+            if (Test-Path -LiteralPath $lockedProbe) { throw 'Remove-LockedItem did not delete an unlocked file' }
+        }
         Invoke-CommandProbe -Command 'http' -Code {
             $response = http "http://127.0.0.1:$httpPort/" -Method GET | Out-String
             if ($response -notmatch '"ok"\s*:\s*true') { throw "unexpected http response: $response" }
@@ -857,7 +960,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $pretty = prettyjson $jsonFile | Out-String
             if ($pretty -notmatch '"name"\s*:\s*"ci"') { throw 'prettyjson output missing expected key/value' }
         }
-        # LIVE NETWORK: POST $textFile to bin.christitus.com without prompting.
+        # The paste service is mocked unless -LiveNetwork -AllowPublicUpload; hb copies the URL to the clipboard.
         Invoke-CommandProbe -Command 'hb' -Code { hb $textFile -Confirm:$false | Out-Null } -SkipReason $clipboardSkipReason
         Invoke-CommandProbe -Command 'timer' -Code { timer { Start-Sleep -Milliseconds 5 } | Out-Null }
         Invoke-CommandProbe -Command 'watch' -SkipReason 'Infinite loop by design'
@@ -909,8 +1012,23 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'lsblk' -Code { lsblk | Out-Null }
         Invoke-CommandProbe -Command 'htop' -SkipReason 'Launches interactive TUI process viewer'
         Invoke-CommandProbe -Command 'mtr' -SkipReason 'Long-running traceroute + per-hop ping loop'
-        Invoke-CommandProbe -Command 'fwallow' -SkipReason 'Mutates Windows Firewall rules (requires elevation)'
-        Invoke-CommandProbe -Command 'fwblock' -SkipReason 'Mutates Windows Firewall rules (requires elevation)'
+        foreach ($fwCommand in 'fwallow', 'fwblock') {
+            Invoke-CommandProbe -Command $fwCommand -Code {
+                # New-NetFirewallRule is replaced, so no rule is created; the admin check is satisfied for the probe.
+                $script:fwRules = @()
+                $savedAdmin = $script:PSP.IsAdmin
+                $script:PSP.IsAdmin = $true
+                try {
+                    function New-NetFirewallRule { param([string]$DisplayName, [string]$Direction, [string]$Action, [string]$Protocol, [int]$LocalPort) $script:fwRules += $Action }
+                    & $fwCommand -Name 'PSP CI Probe' -Port 8443 -WhatIf
+                    if ($script:fwRules.Count -ne 0) { throw "$fwCommand changed the firewall under -WhatIf" }
+                    & $fwCommand -Name 'PSP CI Probe' -Port 8443 -Confirm:$false
+                    $expectedAction = if ($fwCommand -eq 'fwallow') { 'Allow' } else { 'Block' }
+                    if ($script:fwRules -notcontains $expectedAction) { throw "$fwCommand did not request an $expectedAction rule" }
+                }
+                finally { $script:PSP.IsAdmin = $savedAdmin }
+            }
+        }
 
         # Cybersec
         Invoke-CommandProbe -Command 'nscan' -SkipReason 'Requires nmap binary'
@@ -929,7 +1047,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         }
         Invoke-CommandProbe -Command 'defscan' -SkipReason 'Triggers Windows Defender scan'
         Invoke-CommandProbe -Command 'pwnd' -Code { pwnd 'password' | Out-Null }
-        Invoke-CommandProbe -Command 'certcheck' -Code { certcheck 'example.com' | Out-Null }
+        Invoke-CommandProbe -Command 'certcheck' -Code { certcheck 'example.com' | Out-Null } -SkipReason $liveSkipReason
         Invoke-CommandProbe -Command 'entropy' -Code { entropy $textFile | Out-Null }
 
         # Developer+
@@ -1143,8 +1261,18 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Write-Utf8FileAtomic'
         'Set-PspFeatureOverride'
         'Get-LatestMainCommitSha'
+        'ConvertFrom-JsonC'
+        'Read-JsonFile'
+        'Get-CombinedSha256'
+        'Resolve-PspCommitSha'
+        'Update-WindowsTerminalSettingsFile'
+        'Undo-WindowsTerminalSettingsFile'
+        'Copy-PspObject'
+        'Merge-PspUserSettings'
+        'ConvertTo-PspSortedNode'
     )
-    $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
+    # Helpers named *-Psp* and *-Wt* are internal too (covered by tests/unit.ps1).
+    $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ -and $_ -notmatch '-(Psp|Wt)[A-Z]' }
 
     $coveredNames = @([string[]]$script:executedCommands + [string[]]$script:skippedCommands.Keys) | Sort-Object -Unique
     $missingFns = $commandFns | Where-Object { $coveredNames -notcontains $_ }
@@ -1165,8 +1293,9 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
 
     $allExports = @($commandFns + $aliasNames) | Sort-Object -Unique
     $execPct = if ($allExports.Count -gt 0) { [math]::Round(($script:executedCommands.Count / $allExports.Count) * 100) } else { 0 }
-    $detail = "functions=$($commandFns.Count), aliases=$($aliasNames.Count), executed=$($script:executedCommands.Count), skipped=$($script:skippedCommands.Count), network-soft-fails=$($script:networkSoftFails.Count), exec%=$execPct"
+    $detail = "functions=$($commandFns.Count), aliases=$($aliasNames.Count), executed=$($script:executedCommands.Count), skipped=$($script:skippedCommands.Count), network-soft-fails=$($script:networkSoftFails.Count), exec%=$execPct (minimum $MinimumExecutedPercent)"
     Write-Host "        $detail" -ForegroundColor DarkGray
+    if ($execPct -lt $MinimumExecutedPercent) { throw "Only $execPct% of exports were executed (minimum $MinimumExecutedPercent%)" }
 } -SkipWhen { -not $script:installReady } -SkipReason 'Sandbox install failed'
 
 Invoke-TestCase -Name 'Uninstall profile from sandbox' -Code {
@@ -1181,6 +1310,7 @@ Invoke-TestCase -Name 'Uninstall profile from sandbox' -Code {
     Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
     $env:CI = 'true'
     . $script:sandboxPs7Profile
+    . $PspPostLoadStubs
 
     Uninstall-Profile -RemoveUserData -Confirm:$false
 
