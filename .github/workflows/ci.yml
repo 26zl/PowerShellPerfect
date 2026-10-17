@@ -9,62 +9,40 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# GitHub-hosted runners are Windows Server images; Windows 10/11 client behaviour is verified manually (see CONTRIBUTING.md).
+# The runner image is pinned instead of windows-latest so an image upgrade cannot change results unnoticed.
 jobs:
   lint:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 20
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
-          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
+          # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
+          egress-policy: audit
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install PSScriptAnalyzer
         shell: pwsh
-        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
 
-      - name: Run PSScriptAnalyzer
+      - name: Run PSScriptAnalyzer (PSScriptAnalyzerSettings.psd1)
         shell: pwsh
-        run: |
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule @(
-            'PSAvoidUsingWriteHost'              # Profile needs colored console output
-            'PSAvoidUsingWMICmdlet'               # PS5 compatibility path in uptime
-            'PSUseShouldProcessForStateChangingFunctions'  # Overkill for a profile
-            'PSUseBOMForUnicodeEncodedFile'       # Not needed
-            'PSReviewUnusedParameter'             # Scriptblock params required by completer API
-            'PSUseSingularNouns'                  # Style preference
-          ) | Where-Object { $_.ScriptName -notin @('ci-functional.ps1', 'test.ps1', 'rawhunt.ps1', 'locallab.ps1', 'lint.ps1') }
-          # tests/ is excluded: those files intentionally call profile aliases (gc, ls, cat, uptime,
-          # eventlog) by their short names to exercise the profile's own function definitions, and
-          # contain patterns that trip secrets/path scanners on their own test data.
-          $results | Format-Table -AutoSize
-          if ($results | Where-Object Severity -in 'Error','Warning') {
-            Write-Error "PSScriptAnalyzer found warnings or errors"
-            exit 1
-          }
+        # tests/ is excluded: those files call profile aliases (gc, ls, cat, uptime, eventlog) by their short names to
+        # exercise the profile's own definitions, and hold fixtures that trip the secret and path scanners.
+        run: pwsh -NoProfile -File tests/lint.ps1 -NoInstall
 
-      - name: Smoke-test profile (non-interactive)
+      - name: Smoke-test profile (PS7, sandboxed, load-time budget)
         shell: pwsh
-        run: |
-          $env:CI = 'true'
-          # $LASTEXITCODE alone misses non-terminating errors (a profile can emit errors and still
-          # exit 0). Capture the child's streams and fail on any ErrorRecord. Warnings are suppressed
-          # in the child because user-file/plugin load failures are non-fatal by design.
-          $smoke = pwsh -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'" 2>&1
-          $code = $LASTEXITCODE
-          $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-          if ($code -ne 0) {
-            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-            Write-Error "Profile failed to load non-interactive (exit code: $code)"
-            exit 1
-          }
-          if ($smokeErrors.Count -gt 0) {
-            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-            Write-Error "Profile loaded but emitted $($smokeErrors.Count) error(s) during load (non-terminating errors are still failures)"
-            exit 1
-          }
-          Write-Host "Profile loaded successfully in non-interactive mode (no errors)." -ForegroundColor Green
+        run: pwsh -NoProfile -File tests/smoke.ps1 -BudgetMs 3000
 
       - name: PS5 parse-check (all .ps1 files)
         shell: powershell
@@ -88,25 +66,9 @@ jobs:
           }
           if ($errors -gt 0) { exit 1 }
 
-      - name: Smoke-test profile (PS5.1 runtime)
+      - name: Smoke-test profile (PS5.1 runtime, sandboxed, load-time budget)
         shell: powershell
-        run: |
-          $env:CI = 'true'
-          # Load the profile under Windows PowerShell 5.1 so PS5-specific runtime paths are exercised, not just parsed.
-          $smoke = powershell -NonInteractive -NoProfile -Command "`$WarningPreference='SilentlyContinue'; . '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'" 2>&1
-          $code = $LASTEXITCODE
-          $smokeErrors = @($smoke | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-          if ($code -ne 0) {
-            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-            Write-Error "Profile failed to load under PS5.1 (exit code: $code)"
-            exit 1
-          }
-          if ($smokeErrors.Count -gt 0) {
-            $smokeErrors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-            Write-Error "Profile loaded under PS5.1 but emitted $($smokeErrors.Count) error(s) during load"
-            exit 1
-          }
-          Write-Host "Profile loaded successfully under PS5.1 (no errors)." -ForegroundColor Green
+        run: powershell -NoProfile -File tests/smoke.ps1 -BudgetMs 4000
 
       - name: Check for hardcoded paths
         shell: pwsh
@@ -146,7 +108,7 @@ jobs:
       - name: Check for non-ASCII characters in scripts
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1 -Recurse
+          $files = Get-ChildItem -Path '${{ github.workspace }}' -Include *.ps1,*.psd1 -Recurse
           $found = @()
           foreach ($file in $files) {
             $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
@@ -170,7 +132,7 @@ jobs:
       - name: Check for UTF-8 BOM
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Recurse -Include *.ps1,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.psd1,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
           $found = @()
           foreach ($file in $files) {
             $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
@@ -223,7 +185,7 @@ jobs:
             '(?i)connectionstring\s*[:=]\s*[''"]Server='
           )
           # tests/test.ps1 contains secret-detection regex patterns locally; excluded by name.
-          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' -and $_.Name -ne 'test.ps1' }
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.psd1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' -and $_.Name -ne 'test.ps1' }
           $found = @()
           foreach ($file in $files) {
             $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
@@ -245,14 +207,18 @@ jobs:
           Write-Host "No secrets found." -ForegroundColor Green
 
   install-flow:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 20
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
-          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
+          # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
+          egress-policy: audit
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Validate JSON configs parse correctly
         shell: pwsh
@@ -269,21 +235,22 @@ jobs:
           }
           if ($errors -gt 0) { exit 1 }
 
-      - name: Validate config schema (required keys)
+      - name: Validate config schema (required keys and pins)
         shell: pwsh
         run: |
           $theme = Get-Content 'theme.json' -Raw | ConvertFrom-Json
           $terminal = Get-Content 'terminal-config.json' -Raw | ConvertFrom-Json
           $errors = @()
-          # theme.json must have theme.name and theme.url
           if (-not $theme.theme.name) { $errors += 'theme.json: missing theme.name' }
           if (-not $theme.theme.url) { $errors += 'theme.json: missing theme.url' }
-          # terminal-config.json must have defaults and fontInstall
+          if ($theme.theme.url -match '/main/') { $errors += 'theme.json: theme.url follows a branch instead of a release tag' }
+          if ($theme.theme.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { $errors += 'theme.json: theme.sha256 missing or malformed' }
           if (-not $terminal.defaults) { $errors += 'terminal-config.json: missing defaults' }
           if (-not $terminal.fontInstall) { $errors += 'terminal-config.json: missing fontInstall' }
           if (-not $terminal.fontInstall.name) { $errors += 'terminal-config.json: missing fontInstall.name' }
           if (-not $terminal.fontInstall.displayName) { $errors += 'terminal-config.json: missing fontInstall.displayName' }
-          if (-not $terminal.fontInstall.version) { $errors += 'terminal-config.json: missing fontInstall.version' }
+          if ($terminal.fontInstall.version -notmatch '^\d+\.\d+\.\d+$') { $errors += 'terminal-config.json: fontInstall.version missing or not x.y.z' }
+          if ($terminal.fontInstall.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { $errors += 'terminal-config.json: fontInstall.sha256 missing or malformed' }
           if ($errors.Count -gt 0) {
             $errors | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }
             exit 1
@@ -293,35 +260,16 @@ jobs:
       - name: Validate wizard curated data (CuratedSchemes + CuratedFonts)
         shell: pwsh
         run: |
-          # Extract $script:CuratedSchemes and $script:CuratedFonts from setup.ps1 via AST
-          # and assert each entry has all required fields. Avoids running setup.ps1 itself.
-          $setup = Join-Path $PWD 'setup.ps1'
-          $tokens = $null; $parseErrors = $null
-          $ast = [System.Management.Automation.Language.Parser]::ParseFile($setup, [ref]$tokens, [ref]$parseErrors)
-          if ($parseErrors.Count -gt 0) { Write-Error "setup.ps1 has parse errors"; exit 1 }
-
-          $assignments = $ast.FindAll({
-            param($n)
-            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            ($n.Left.Extent.Text -in @('$script:CuratedSchemes', '$script:CuratedFonts'))
-          }, $true)
-
-          $found = @{}
-          foreach ($a in $assignments) {
-            $name = $a.Left.Extent.Text.TrimStart('$').Replace('script:','')
-            Invoke-Expression $a.Extent.Text
-            $found[$name] = Get-Variable -Name $name -Scope Local -ValueOnly
-          }
-
+          . ./tests/lib/Sandbox.ps1
+          . ([scriptblock]::Create((Get-PspAssignmentSource -Path 'setup.ps1' -Variable '$script:CuratedSchemes')))
+          . ([scriptblock]::Create((Get-PspAssignmentSource -Path 'setup.ps1' -Variable '$script:CuratedFonts')))
           $errors = 0
           # Schemes: expect 7 entries, each with Name, Desc, and a nested Scheme with name + background
-          $schemes = $found['CuratedSchemes']
-          if (-not $schemes) { Write-Host "FAIL: CuratedSchemes not found" -ForegroundColor Red; exit 1 }
+          $schemes = $script:CuratedSchemes
           if ($schemes.Count -ne 7) { Write-Host "FAIL: expected 7 curated schemes, got $($schemes.Count)" -ForegroundColor Red; $errors++ }
-          $schemeReq = @('Name','Desc','Scheme')
           $schemeInnerReq = @('name','background','foreground','black','red','green','yellow','blue','purple','cyan','white')
           foreach ($s in $schemes) {
-            foreach ($k in $schemeReq) {
+            foreach ($k in 'Name', 'Desc', 'Scheme') {
               if (-not $s.ContainsKey($k)) { Write-Host "FAIL: scheme '$($s.Name)' missing '$k'" -ForegroundColor Red; $errors++ }
             }
             if ($s.Scheme) {
@@ -334,168 +282,65 @@ jobs:
             }
           }
           Write-Host "OK: $($schemes.Count) curated schemes validated" -ForegroundColor Green
-
-          # Fonts: expect 6 entries, each with Name (wizard menu label), Asset, DisplayName, Desc
-          $fonts = $found['CuratedFonts']
-          if (-not $fonts) { Write-Host "FAIL: CuratedFonts not found" -ForegroundColor Red; exit 1 }
+          # Fonts: expect 6 entries, each with the menu label, release asset, display name, description and pinned hash
+          $fonts = $script:CuratedFonts
           if ($fonts.Count -ne 6) { Write-Host "FAIL: expected 6 curated fonts, got $($fonts.Count)" -ForegroundColor Red; $errors++ }
-          $fontReq = @('Name','Asset','DisplayName','Desc')
           foreach ($f in $fonts) {
-            foreach ($k in $fontReq) {
+            foreach ($k in 'Name', 'Asset', 'DisplayName', 'Desc', 'Sha256') {
               if (-not $f.ContainsKey($k) -or [string]::IsNullOrWhiteSpace([string]$f[$k])) {
                 Write-Host "FAIL: font '$($f.Asset)' missing '$k'" -ForegroundColor Red; $errors++
               }
             }
+            if ($f.Sha256 -notmatch '^[A-F0-9]{64}$') { Write-Host "FAIL: font '$($f.Asset)' hash malformed" -ForegroundColor Red; $errors++ }
           }
           Write-Host "OK: $($fonts.Count) curated fonts validated" -ForegroundColor Green
-
           if ($errors -gt 0) { exit 1 }
 
-      - name: Dry-run setup.ps1 (parse + function definitions)
+      - name: setup.ps1 structure (copies match the profile, verification before changes)
         shell: pwsh
         run: |
-          # Source setup.ps1 functions without running the main install flow
-          # by extracting and testing the helper functions in isolation
-          $content = Get-Content 'setup.ps1' -Raw
-
-          # Verify required functions are defined in setup.ps1
-          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry', 'Remove-SafeTempDirectory', 'Update-SessionPathFromRegistry')
-          $errors = 0
-          foreach ($fn in $requiredFunctions) {
-            if ($content -notmatch "function\s+$fn\b") {
-              Write-Host "FAIL: setup.ps1 missing function $fn" -ForegroundColor Red
-              $errors++
-            } else {
-              Write-Host "OK: $fn defined" -ForegroundColor Green
-            }
+          . ./tests/lib/Sandbox.ps1
+          $problems = @()
+          $setup = Get-Content 'setup.ps1' -Raw
+          foreach ($fn in 'Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Select-PreferredEditor', 'Remove-SafeTempDirectory', 'Initialize-InstallBundle', 'Save-WizardChoices', 'Resolve-WizardState', 'Invoke-SetupInstall') {
+            if ($setup -notmatch "function\s+$fn\b") { $problems += "missing function $fn" }
           }
-          if ($errors -gt 0) { exit 1 }
+          # setup.ps1 needs these before the bundle is verified, so it carries copies that must match the profile exactly.
+          foreach ($fn in 'Write-PspHost', 'Invoke-DownloadWithRetry', 'Get-CombinedSha256', 'Resolve-PspCommitSha', 'Get-PspReleaseChecksums') {
+            $a = (Get-PspFunctionSource -Path 'setup.ps1' -Name $fn) -replace "`r`n", "`n"
+            $b = (Get-PspFunctionSource -Path 'Microsoft.PowerShell_profile.ps1' -Name $fn) -replace "`r`n", "`n"
+            if ($a -cne $b) { $problems += "$fn in setup.ps1 differs from the profile" }
+          }
+          # Everything else setup.ps1 loads from the verified profile must exist there.
+          . ([scriptblock]::Create((Get-PspAssignmentSource -Path 'setup.ps1' -Variable '$script:SharedFunctionNames')))
+          try { $null = Get-PspFunctionSource -Path 'Microsoft.PowerShell_profile.ps1' -Name $script:SharedFunctionNames } catch { $problems += $_.Exception.Message }
+          if ($setup.IndexOf('$script:Bundle = Initialize-InstallBundle') -gt $setup.IndexOf('$installed = Invoke-SetupInstall')) { $problems += 'bundle verification does not come before installation' }
+          if ($problems) { $problems | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }; exit 1 }
+          Write-Host 'setup.ps1 structure OK' -ForegroundColor Green
 
-      - name: Test Merge-JsonObject logic
+      - name: Regression tests (PS7, tests/unit.ps1)
         shell: pwsh
-        run: |
-          # Extract Merge-JsonObject from setup.ps1 and test it (with null guard like production)
-          function Merge-JsonObject($base, $override) {
-            if ($null -eq $override) { return }
-            if ($null -eq $base) { throw 'Merge-JsonObject: $base cannot be null (caller must pass an object to merge into).' }
-            foreach ($prop in $override.PSObject.Properties) {
-              $baseVal = $base.PSObject.Properties[$prop.Name]
-              if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
-                Merge-JsonObject $baseVal.Value $prop.Value
-              } else {
-                $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
-              }
-            }
-          }
+        run: pwsh -NoProfile -File tests/unit.ps1 -AllowElevated
 
-          # Test 1: flat merge
-          $base = [PSCustomObject]@{ a = 1; b = 2 }
-          $override = [PSCustomObject]@{ b = 99; c = 3 }
-          Merge-JsonObject $base $override
-          if ($base.a -ne 1 -or $base.b -ne 99 -or $base.c -ne 3) {
-            Write-Error "Flat merge failed: $($base | ConvertTo-Json -Compress)"
-            exit 1
-          }
-          Write-Host "OK: flat merge" -ForegroundColor Green
-
-          # Test 2: deep merge preserves nested keys
-          $base = [PSCustomObject]@{ font = [PSCustomObject]@{ face = "Consolas"; size = 11 }; opacity = 75 }
-          $override = [PSCustomObject]@{ font = [PSCustomObject]@{ size = 14 } }
-          Merge-JsonObject $base $override
-          if ($base.font.face -ne "Consolas" -or $base.font.size -ne 14 -or $base.opacity -ne 75) {
-            Write-Error "Deep merge failed: $($base | ConvertTo-Json -Compress)"
-            exit 1
-          }
-          Write-Host "OK: deep merge" -ForegroundColor Green
-
-          # Test 3: override replaces non-object with object
-          $base = [PSCustomObject]@{ theme = "simple" }
-          $override = [PSCustomObject]@{ theme = [PSCustomObject]@{ name = "pure" } }
-          Merge-JsonObject $base $override
-          if ($base.theme.name -ne "pure") {
-            Write-Error "Object replacement failed: $($base | ConvertTo-Json -Compress)"
-            exit 1
-          }
-          Write-Host "OK: object replacement" -ForegroundColor Green
-
-          # Test 4: null override is a no-op; null base throws (caller-bug surfacing)
-          $base = [PSCustomObject]@{ a = 1 }
-          Merge-JsonObject $base $null
-          if ($base.a -ne 1) { Write-Error "Null override should not modify base"; exit 1 }
-          $threw = $false
-          try { Merge-JsonObject $null ([PSCustomObject]@{ a = 1 }) } catch { $threw = $true }
-          if (-not $threw) { Write-Error "Null base should throw"; exit 1 }
-          Write-Host "OK: null guard" -ForegroundColor Green
-
-      - name: Test WT settings merge (mock)
-        shell: pwsh
-        run: |
-          # Simulate the WT settings update flow with mock data
-          $mockWt = [PSCustomObject]@{
-            profiles = [PSCustomObject]@{
-              defaults = [PSCustomObject]@{ font = [PSCustomObject]@{ face = "Consolas"; size = 10 } }
-              list = @()
-            }
-            schemes = @()
-            actions = @()
-          }
-          $theme = Get-Content 'theme.json' -Raw | ConvertFrom-Json
-          $terminal = Get-Content 'terminal-config.json' -Raw | ConvertFrom-Json
-          $defaults = $mockWt.profiles.defaults
-
-          # Apply terminal defaults
-          $terminal.defaults.PSObject.Properties | ForEach-Object {
-            $defaults | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force
-          }
-
-          # Apply theme colors
-          if ($theme.windowsTerminal.colorScheme) {
-            $defaults | Add-Member -NotePropertyName "colorScheme" -NotePropertyValue $theme.windowsTerminal.colorScheme -Force
-          }
-
-          # Verify results (read expected values from config, not hardcoded)
-          $errors = 0
-          if ($defaults.opacity -ne $terminal.defaults.opacity) { Write-Host "FAIL: opacity=$($defaults.opacity), expected $($terminal.defaults.opacity)" -ForegroundColor Red; $errors++ }
-          if ($defaults.colorScheme -ne $theme.windowsTerminal.colorScheme) { Write-Host "FAIL: colorScheme=$($defaults.colorScheme), expected $($theme.windowsTerminal.colorScheme)" -ForegroundColor Red; $errors++ }
-          if ($defaults.font.face -ne $terminal.defaults.font.face) { Write-Host "FAIL: font.face=$($defaults.font.face), expected $($terminal.defaults.font.face)" -ForegroundColor Red; $errors++ }
-
-          # Verify scheme upsert
-          $schemeDef = $theme.windowsTerminal.scheme
-          $mockWt.schemes = @(@($mockWt.schemes | Where-Object { $_ -and $_.name -ne $schemeDef.name }) + ([PSCustomObject]$schemeDef))
-          if ($mockWt.schemes.Count -ne 1 -or $mockWt.schemes[0].name -ne $schemeDef.name) {
-            Write-Host "FAIL: scheme upsert" -ForegroundColor Red; $errors++
-          }
-
-          # Verify keybinding upsert
-          foreach ($kb in $terminal.keybindings) {
-            $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
-            $mockWt.actions = @($mockWt.actions) + ([PSCustomObject]@{ keys = $kb.keys; command = $kb.command })
-          }
-          $firstKb = @($terminal.keybindings)[0]
-          $found = $mockWt.actions | Where-Object { $_.keys -eq $firstKb.keys }
-          if (-not $found -or $found.command -ne $firstKb.command) {
-            Write-Host "FAIL: keybinding upsert (expected keys=$($firstKb.keys) command=$($firstKb.command))" -ForegroundColor Red; $errors++
-          }
-
-          if ($errors -gt 0) { exit 1 }
-
-          # Verify JSON roundtrip (depth matches production: profile/setup write WT settings with -Depth 100)
-          $json = $mockWt | ConvertTo-Json -Depth 100
-          $null = $json | ConvertFrom-Json -ErrorAction Stop
-          Write-Host "OK: WT settings merge + JSON roundtrip" -ForegroundColor Green
+      - name: Regression tests (PS5.1, tests/unit.ps1)
+        shell: powershell
+        run: powershell -NoProfile -File tests/unit.ps1 -AllowElevated
 
   functional:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 30
     needs: [lint, install-flow]
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
-          egress-policy: audit  # advisory: logs egress without blocking. Flip to 'block' once the allowed-endpoints list is pinned from audit output.
+          # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
+          egress-policy: audit
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Run functional profile tests
+      - name: Run functional profile tests (third-party endpoints mocked)
         shell: pwsh
-        run: |
-          pwsh -NoProfile -File '${{ github.workspace }}/tests/ci-functional.ps1'
+        run: pwsh -NoProfile -File '${{ github.workspace }}/tests/ci-functional.ps1' -AllowElevated

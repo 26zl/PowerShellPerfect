@@ -1,0 +1,82 @@
+name: Release
+
+# Push a tag vX.Y.Z (matching Version in the profile) to publish a release with SHA256SUMS.txt and a build provenance
+# attestation. setup.ps1 -Ref vX.Y.Z and Update-Profile -Ref vX.Y.Z verify their downloads against that SHA256SUMS.txt.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the release and upload its files
+      id-token: write      # sign the build provenance attestation
+      attestations: write  # store the attestation
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # Audit first; switch to block with the endpoints from the first run's insights.
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build release files from the tagged commit
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Release files are the committed blobs (LF line endings), byte-identical to what raw.githubusercontent.com serves
+          # for this tag; a checkout would convert .ps1 files to CRLF and change their hashes.
+          mkdir -p dist
+          files="setup.ps1 setprofile.ps1 Microsoft.PowerShell_profile.ps1 theme.json terminal-config.json"
+          for f in $files; do git cat-file blob "${GITHUB_SHA}:${f}" > "dist/${f}"; done
+          version=$(grep -oP "^\s*Version\s*=\s*'\K[0-9]+\.[0-9]+\.[0-9]+" dist/Microsoft.PowerShell_profile.ps1 | head -n 1)
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::Tag ${TAG} does not match Version '${version}' in Microsoft.PowerShell_profile.ps1"
+            exit 1
+          fi
+          (cd dist && sha256sum $files > SHA256SUMS.txt)
+          hash() { sha256sum "dist/$1" | cut -d' ' -f1 | tr 'a-f' 'A-F'; }
+          bundle=$(printf 'profile:%s:theme:%s:terminal:%s' "$(hash Microsoft.PowerShell_profile.ps1)" "$(hash theme.json)" "$(hash terminal-config.json)" | sha256sum | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          # Release notes: the CHANGELOG section for this version plus how to verify and install.
+          awk -v v="${version}" '$0 ~ "^## \\[" v "\\]" {found=1; next} found && /^## \[/ {exit} found {print}' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for ${version}"
+            exit 1
+          fi
+          {
+            echo
+            echo "## Verify and install"
+            echo
+            echo "Each file's SHA-256 is in \`SHA256SUMS.txt\`; \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\` checks that it was built here from this tag."
+            echo "\`setup.ps1 -Ref ${TAG}\` and \`Update-Profile -Ref ${TAG}\` check their downloads against \`SHA256SUMS.txt\` automatically."
+            echo "Install bundle hash (\`-ExpectedSha256\`): \`${bundle}\`"
+            echo
+            echo "See the README for the full install command."
+          } >> notes.md
+          cat dist/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*'
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Upload the files to a draft first, so an immutable release is published complete.
+          gh release create "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag --title "PowerShellPerfect ${TAG}" --notes-file notes.md
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false

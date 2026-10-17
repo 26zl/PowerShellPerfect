@@ -1,7 +1,8 @@
 {
   "theme": {
     "name": "pure",
-    "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/pure.omp.json"
+    "url": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/v31.8.0/themes/pure.omp.json",
+    "sha256": "E0786DA374967BF4B4D3B107580AC86246C132679C309291F378D73C1E804E5A"
   },
   "windowsTerminal": {
     "colorScheme": "Tokyo Night",

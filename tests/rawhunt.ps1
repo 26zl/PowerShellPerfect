@@ -1,5 +1,20 @@
-# Exercise profile functions, lifecycle operations, caching, and configuration merging.
+# Exercise profile functions, lifecycle operations, caching, and configuration merging against the REAL environment.
+# Unlike tests/test.ps1 and tests/unit.ps1 this is not sandboxed: it loads the profile with your settings, calls live web
+# services, publishes a probe file to a public paste (hb), overwrites the clipboard, and runs winget. Opt in explicitly:
+#   pwsh -NoProfile -File tests/rawhunt.ps1 -AllowSideEffects
+param(
+    [switch]$AllowSideEffects,
+    [switch]$AllowElevated
+)
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\Sandbox.ps1')
+if (-not $AllowSideEffects) {
+    Write-Host 'tests/rawhunt.ps1 changes real state: it loads your profile_user.ps1 and plugins, uploads a file to a public paste,' -ForegroundColor Yellow
+    Write-Host 'overwrites the clipboard, calls third-party web services and runs winget. Re-run with -AllowSideEffects to proceed,' -ForegroundColor Yellow
+    Write-Host 'or use tests/test.ps1 and tests/unit.ps1, which are sandboxed.' -ForegroundColor Yellow
+    exit 2
+}
+Assert-PspTestSafety -AllowElevated:$AllowElevated -ScriptName 'tests/rawhunt.ps1'
 
 $ok = 0; $fail = 0; $bugs = @()
 function T {
@@ -75,16 +90,16 @@ $mergeFn = $ast.FindAll({
 }, $true) | Select-Object -First 1
 if ($mergeFn) { . ([scriptblock]::Create($mergeFn.Extent.Text)) }
 
-# Extract setup.ps1 functions via AST
+# Extract setup.ps1 functions and data via AST; the helpers it shares with the profile are already loaded from the profile.
 $tokens2 = $null; $parseErrors2 = $null
 $setupAst = [System.Management.Automation.Language.Parser]::ParseFile($setupPath, [ref]$tokens2, [ref]$parseErrors2)
-$setupFns = $setupAst.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
+$setupFns = $setupAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] }
 foreach ($fn in $setupFns) { . ([scriptblock]::Create($fn.Extent.Text)) }
-$varDefs = $setupAst.FindAll({
-    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -eq '$EditorCandidates'
-}, $true)
-if ($varDefs.Count -gt 0) { . ([scriptblock]::Create($varDefs[0].Extent.Text)) }
+foreach ($variable in '$EditorCandidates', '$script:CuratedFonts', '$script:CuratedSchemes', '$script:NerdFontVersion', '$script:OmpThemesRef', '$script:PinnedOmpThemes', '$script:SharedFunctionNames') {
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupPath -Variable $variable)))
+}
+$script:IsElevated = Test-PspTestElevated
+$script:IsCiHost = $false
 
 # Workspace
 $ws = Join-Path $env:TEMP "psp-raw-$([System.IO.Path]::GetRandomFileName())"
@@ -753,24 +768,24 @@ T 'Install-WingetPackage (already installed)' {
 }
 
 T 'Install-NerdFonts (detection only)' {
-    $r = Install-NerdFonts
+    # -WhatIf: detect without installing when the font is missing.
+    $r = Install-NerdFonts -WhatIf
     if ($r -ne $true) { throw "Expected true, got $r" }
 }
 
-T 'Install-OhMyPoshTheme (real download)' {
-    $tmpCache = Join-Path $ws 'omp-cache'
-    New-Item -ItemType Directory $tmpCache -Force | Out-Null
-    $origConfigCache = $configCachePath
-    $script:configCachePath = $tmpCache
+T 'Install-OhMyPoshTheme (real download, pinned hash)' {
+    $tmpLocal = Join-Path $ws 'omp-local'
+    New-Item -ItemType Directory $tmpLocal -Force | Out-Null
+    $origLocal = $env:LOCALAPPDATA
+    $env:LOCALAPPDATA = $tmpLocal
     try {
-        $r = Install-OhMyPoshTheme -ThemeName 'test-theme' -ThemeUrl 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/agnoster.omp.json'
-        if ($r -ne $true) { throw "Expected true, got $r" }
-        $themeFile = Join-Path $tmpCache 'test-theme.omp.json'
+        $r = Install-OhMyPoshTheme -ThemeName 'pure' -ThemeUrl (Get-OmpThemeUrl -Name 'pure') -Sha256 $script:PinnedOmpThemes['pure']
+        if ($r -ne $true) { throw "Expected true, got $r (pinned hash no longer matches upstream?)" }
+        $themeFile = Join-Path (Get-PspCacheDir) 'pure.omp.json'
         if (-not (Test-Path $themeFile)) { throw "Theme file not written" }
-        $j = Get-Content $themeFile -Raw | ConvertFrom-Json
-        if (-not $j) { throw "Theme file not valid JSON" }
+        if (-not (Read-JsonFile $themeFile)) { throw "Theme file not valid JSON" }
     }
-    finally { $script:configCachePath = $origConfigCache }
+    finally { $env:LOCALAPPDATA = $origLocal }
 }
 
 T 'EditorCandidates valid' {
@@ -780,7 +795,7 @@ T 'EditorCandidates valid' {
     }
 }
 
-T 'Merge-JsonObject from setup.ps1' {
+T 'Merge-JsonObject (shared with setup.ps1)' {
     $b = [PSCustomObject]@{ x = 1; n = [PSCustomObject]@{ a = 10 } }
     Merge-JsonObject $b ([PSCustomObject]@{ x = 99; n = [PSCustomObject]@{ b = 20 } })
     if ($b.x -ne 99 -or $b.n.a -ne 10 -or $b.n.b -ne 20) { throw "merge mismatch" }
@@ -1247,39 +1262,16 @@ T 'Update-Tools: ProfileTools drive data' {
     }
 }
 
-T 'setup.ps1 and profile Merge-JsonObject identical' {
-    $profileMerge = $ast.FindAll({
-        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $args[0].Name -eq 'Merge-JsonObject'
-    }, $true) | Select-Object -First 1
-    $setupMerge = $setupAst.FindAll({
-        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $args[0].Name -eq 'Merge-JsonObject'
-    }, $true) | Select-Object -First 1
-    if (-not $profileMerge) { throw "Not found in profile" }
-    if (-not $setupMerge) { throw "Not found in setup.ps1" }
-    $pBody = ($profileMerge.Extent.Text -replace '\s+', ' ').Trim()
-    $sBody = ($setupMerge.Extent.Text -replace '\s+', ' ').Trim()
-    if ($pBody -ne $sBody) { throw "Merge-JsonObject differs between profile and setup.ps1" }
+T 'setup.ps1 copies of pre-bundle helpers match the profile' {
+    foreach ($name in 'Write-PspHost', 'Invoke-DownloadWithRetry', 'Get-CombinedSha256', 'Resolve-PspCommitSha', 'Get-PspReleaseChecksums') {
+        $a = (Get-PspFunctionSource -Path $setupPath -Name $name) -replace "`r`n", "`n"
+        $b = (Get-PspFunctionSource -Path $profilePath -Name $name) -replace "`r`n", "`n"
+        if ($a -cne $b) { throw "$name differs between setup.ps1 and the profile" }
+    }
 }
 
-T 'setup.ps1 and profile Invoke-DownloadWithRetry match' {
-    $profileDl = $ast.FindAll({
-        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $args[0].Name -eq 'Invoke-DownloadWithRetry'
-    }, $true) | Select-Object -First 1
-    $setupDl = $setupAst.FindAll({
-        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $args[0].Name -eq 'Invoke-DownloadWithRetry'
-    }, $true) | Select-Object -First 1
-    if (-not $profileDl) { throw "Not found in profile" }
-    if (-not $setupDl) { throw "Not found in setup.ps1" }
-    $pText = $profileDl.Extent.Text
-    $sText = $setupDl.Extent.Text
-    if ($pText -notmatch 'MaxAttempts') { throw "Profile missing MaxAttempts" }
-    if ($sText -notmatch 'MaxAttempts') { throw "Setup missing MaxAttempts" }
-    if ($pText -notmatch 'BackoffSec') { throw "Profile missing BackoffSec" }
-    if ($sText -notmatch 'BackoffSec') { throw "Setup missing BackoffSec" }
+T 'setup.ps1 shared helpers exist in the profile' {
+    $null = Get-PspFunctionSource -Path $profilePath -Name $script:SharedFunctionNames
 }
 
 # #####################################################################

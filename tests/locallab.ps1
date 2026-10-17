@@ -1,12 +1,13 @@
 # Run the tracked local test and installation harness from the repository root.
 #
 # Typical usage:
-#   pwsh -NoProfile -File tests/locallab.ps1                        # run all non-destructive checks
-#   pwsh -NoProfile -File tests/locallab.ps1 -Install               # tests + replace live profile (minimal)
-#   pwsh -NoProfile -File tests/locallab.ps1 -FullInstall           # tests + setup.ps1 -LocalRepo (winget tools too)
-#   pwsh -NoProfile -File tests/locallab.ps1 -Wizard                # tests + setup.ps1 -LocalRepo -Wizard (implies -FullInstall)
-#   pwsh -NoProfile -File tests/locallab.ps1 -Functional            # also run tests/ci-functional.ps1 (elevated recommended)
+#   pwsh -NoProfile -File tests/locallab.ps1                        # run all checks (sandboxed; nothing outside the repo changes)
+#   pwsh -NoProfile -File tests/locallab.ps1 -Install               # checks + install this checkout live without tools (setup.ps1 -CiMode)
+#   pwsh -NoProfile -File tests/locallab.ps1 -FullInstall           # checks + setup.ps1 -LocalRepo (winget tools, font, wizard prompts)
+#   pwsh -NoProfile -File tests/locallab.ps1 -Wizard                # checks + setup.ps1 -LocalRepo -Wizard (implies -FullInstall)
+#   pwsh -NoProfile -File tests/locallab.ps1 -Functional            # also run tests/ci-functional.ps1 (sandboxed, mocked network)
 #   pwsh -NoProfile -File tests/locallab.ps1 -Restore               # restore profile(s) from last backup
+# The test steps refuse to run in an elevated shell unless -AllowElevated is passed (use that only in a disposable VM).
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -18,7 +19,8 @@ param(
     [switch]$Install,
     [switch]$FullInstall,
     [switch]$Wizard,
-    [switch]$Restore
+    [switch]$Restore,
+    [switch]$AllowElevated
 )
 
 # -Wizard implies -FullInstall (wizard only meaningful when driving setup.ps1)
@@ -28,6 +30,7 @@ $ErrorActionPreference = 'Stop'
 # Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
+. (Join-Path $repoRoot 'tests\lib\Sandbox.ps1')
 
 $script:failures = @()
 $script:step = 0
@@ -75,38 +78,33 @@ if ($Restore) {
     exit 0
 }
 
+# Test steps change nothing outside their sandboxes, but an elevated mistake could reach machine-wide state.
+if (-not ($SkipLint -and $SkipParse -and $SkipSmoke -and $SkipTest -and -not $Functional)) {
+    try { Assert-PspTestSafety -AllowElevated:$AllowElevated -ScriptName 'tests/locallab.ps1' }
+    catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 2 }
+}
+$elevatedArgs = if ($AllowElevated) { @('-AllowElevated') } else { @() }
+
 # --- Validate files exist ---
 Step 'Repo structure'
-foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'setup.ps1', 'setprofile.ps1', 'theme.json', 'terminal-config.json', 'tests/ci-functional.ps1')) {
+foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'setup.ps1', 'setprofile.ps1', 'theme.json', 'terminal-config.json', 'tests/ci-functional.ps1', 'tests/unit.ps1', 'PSScriptAnalyzerSettings.psd1')) {
     if (Test-Path $f) { Ok $f }
     else { Fail $f 'missing'; }
 }
 
-# --- 1. PSScriptAnalyzer (mirror CI) ---
+# --- 1. PSScriptAnalyzer (same version and settings as CI) ---
 if (-not $SkipLint) {
-    Step 'PSScriptAnalyzer'
-    try {
-        if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
-            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
-        }
-        Import-Module PSScriptAnalyzer -ErrorAction Stop
-        $excluded = @(
-            'PSAvoidUsingWriteHost', 'PSAvoidUsingWMICmdlet',
-            'PSUseShouldProcessForStateChangingFunctions', 'PSUseBOMForUnicodeEncodedFile',
-            'PSReviewUnusedParameter', 'PSUseSingularNouns'
-        )
-        # Exclude test harnesses and untracked scratch scripts from source linting.
-        $testHarnesses = @('ci-functional.ps1', 'rawhunt.ps1', 'test.ps1', 'locallab.ps1', 'lint.ps1')
-        $results = Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule $excluded |
-            Where-Object { $_.ScriptName -notin $testHarnesses -and $_.ScriptName -notlike '_*.ps1' }
-        $hits = @($results | Where-Object Severity -in 'Error', 'Warning')
-        if ($hits) {
-            $hits | Format-Table ScriptName, Line, RuleName, Message -AutoSize | Out-String | Write-Host
-            Fail 'lint' "$($hits.Count) warnings/errors"
-        }
-        else { Ok 'lint' 'clean' }
+    Step 'PSScriptAnalyzer (tests/lint.ps1)'
+    # Never installs modules: without the pinned analyzer the step is skipped with the install command.
+    $lintOutput = & pwsh -NoProfile -NonInteractive -File tests/lint.ps1 -NoInstall 2>&1
+    if ($LASTEXITCODE -eq 0) { Ok 'lint' 'clean' }
+    elseif (($lintOutput | Out-String) -match 'PSScriptAnalyzer [\d.]+ is not installed') {
+        Write-Host '  SKIP  PSScriptAnalyzer 1.25.0 is not installed: Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser (or run tests/lint.ps1)' -ForegroundColor DarkGray
     }
-    catch { Fail 'lint' $_.Exception.Message }
+    else {
+        $lintOutput | ForEach-Object { Write-Host "  $_" }
+        Fail 'lint' "exit $LASTEXITCODE"
+    }
 }
 
 # --- 2. PS5 parse-check (uses real powershell.exe) ---
@@ -132,44 +130,31 @@ if (-not $SkipParse) {
     }
 }
 
-# --- 3. Non-interactive smoke load ---
+# --- 3. Non-interactive smoke load inside a sandbox (your profile_user.ps1 and plugins are not run) ---
 if (-not $SkipSmoke) {
-    Step 'Smoke-test non-interactive load'
-    $env:CI = 'true'
-    try {
-        pwsh -NoProfile -NonInteractive -Command ". './Microsoft.PowerShell_profile.ps1'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE }" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { Ok 'smoke' 'loaded' }
-        else { Fail 'smoke' "exit $LASTEXITCODE" }
-    }
-    finally { Remove-Item env:CI -ErrorAction SilentlyContinue }
+    Step 'Smoke-test non-interactive load (sandboxed)'
+    $smoke = "& { param(`$repo) . (Join-Path `$repo 'tests\lib\Sandbox.ps1'); `$sb = New-PspSandbox -Name 'locallab'; Enter-PspSandbox -Sandbox `$sb; try { `$WarningPreference = 'SilentlyContinue'; `$Error.Clear(); . (Join-Path `$repo 'Microsoft.PowerShell_profile.ps1'); if (`$Error.Count) { exit 1 } } finally { Exit-PspSandbox -Sandbox `$sb } } '$($repoRoot -replace "'", "''")'"
+    pwsh -NoProfile -NonInteractive -Command $smoke 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok 'smoke' 'loaded without errors' }
+    else { Fail 'smoke' "exit $LASTEXITCODE" }
 }
 
-# --- 4. Optional: test.ps1 local test suite ---
+# --- 4. Optional: test.ps1 local test suite (includes tests/unit.ps1) ---
 if (-not $SkipTest -and (Test-Path 'tests/test.ps1')) {
     Step 'Run tests/test.ps1 (-SkipPS5)'
-    $testOutput = & pwsh -NoProfile -File tests/test.ps1 -SkipPS5 2>&1
+    $testOutput = & pwsh -NoProfile -File tests/test.ps1 -SkipPS5 @elevatedArgs 2>&1
     $tail = ($testOutput | Select-Object -Last 3) -join [Environment]::NewLine
     Write-Host $tail -ForegroundColor DarkGray
     if ($LASTEXITCODE -eq 0) { Ok 'tests/test.ps1' }
     else { Fail 'tests/test.ps1' "exit $LASTEXITCODE" }
 }
 
-# --- 5. Optional: ci-functional.ps1 ---
+# --- 5. Optional: ci-functional.ps1 (sandboxed, third-party endpoints mocked) ---
 if ($Functional) {
     Step 'Run ci-functional.ps1'
-    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $elevated) {
-        Write-Host '  Note: not elevated. Forcing GITHUB_ACTIONS=true so setup step runs in CiMode.' -ForegroundColor Yellow
-        $env:GITHUB_ACTIONS = 'true'
-    }
-    try {
-        & pwsh -NoProfile -File tests/ci-functional.ps1
-        if ($LASTEXITCODE -eq 0) { Ok 'tests/ci-functional.ps1' }
-        else { Fail 'tests/ci-functional.ps1' "exit $LASTEXITCODE" }
-    }
-    finally {
-        if (-not $elevated) { Remove-Item env:GITHUB_ACTIONS -ErrorAction SilentlyContinue }
-    }
+    & pwsh -NoProfile -File tests/ci-functional.ps1 @elevatedArgs
+    if ($LASTEXITCODE -eq 0) { Ok 'tests/ci-functional.ps1' }
+    else { Fail 'tests/ci-functional.ps1' "exit $LASTEXITCODE" }
 }
 
 # --- 6. Install to live profile dirs (replaces GitHub version) ---
@@ -205,76 +190,16 @@ if ($Install -or $FullInstall) {
         $label = if ($Wizard) { 'setup.ps1 -LocalRepo -Wizard (interactive: theme/scheme/font/features)' }
                  else { 'setup.ps1 -LocalRepo (full install: tools, fonts, WT settings)' }
         Step $label
-        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if (-not $elevated) { Write-Warning 'Not elevated. setup.ps1 needs admin for fonts/winget. Consider rerunning from an elevated pwsh.' }
         if ($Wizard) { & './setup.ps1' -LocalRepo $repoRoot -Wizard }
         else { & './setup.ps1' -LocalRepo $repoRoot }
         if ($LASTEXITCODE -eq 0) { Ok 'setup.ps1' } else { Fail 'setup.ps1' "exit $LASTEXITCODE" }
     }
     else {
-        Step 'setprofile.ps1 (minimal: copy profile to PS5 + PS7)'
-        & './setprofile.ps1'
-        if ($LASTEXITCODE -eq 0) { Ok 'setprofile.ps1' } else { Fail 'setprofile.ps1' "exit $LASTEXITCODE" }
-
-        # Refresh cached JSON configuration after copying the profile.
-        Step 'Refresh cached configs (theme.json, terminal-config.json)'
-        $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
-        if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-        foreach ($cfg in @('theme.json', 'terminal-config.json')) {
-            $src = Join-Path $repoRoot $cfg
-            $dst = Join-Path $cacheDir $cfg
-            if (Test-Path $src) {
-                Copy-Item -LiteralPath $src -Destination $dst -Force
-                Ok 'refreshed' $cfg
-            }
-        }
-        # Apply local terminal theme changes without downloads or tool installation.
-        Step 'Apply WT theme to settings.json (live)'
-        $wtCandidates = @(
-            Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
-            Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'
-            Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalCanary_8wekyb3d8bbwe\LocalState\settings.json'
-            Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'
-        )
-        $wtPath = $wtCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-        if (-not $wtPath) {
-            Write-Host '  (skip: Windows Terminal not installed)' -ForegroundColor DarkGray
-        }
-        else {
-            try {
-                $themeJson = Get-Content (Join-Path $repoRoot 'theme.json') -Raw | ConvertFrom-Json -ErrorAction Stop
-                $wtRaw = Get-Content $wtPath -Raw
-                $q = [char]34
-                $jsoncPat = "(?m)(?<=^([^$q]*$q[^$q]*$q)*[^$q]*)\s*//.*`$"
-                $wt = ($wtRaw -replace $jsoncPat, '') | ConvertFrom-Json -ErrorAction Stop
-                $backup = "$wtPath.locallab-$((Get-Date).ToString('yyyyMMdd-HHmmss')).bak"
-                Copy-Item -LiteralPath $wtPath -Destination $backup -Force
-                # Upsert custom theme
-                if ($themeJson.windowsTerminal.themeDefinition) {
-                    $td = [PSCustomObject]$themeJson.windowsTerminal.themeDefinition
-                    if (-not $wt.PSObject.Properties['themes']) {
-                        $wt | Add-Member -NotePropertyName 'themes' -NotePropertyValue @() -Force
-                    }
-                    $wt.themes = @(@($wt.themes | Where-Object { $_ -and $_.name -ne $td.name }) + $td)
-                }
-                if ($themeJson.windowsTerminal.theme) {
-                    if ($wt.PSObject.Properties['theme']) { $wt.theme = $themeJson.windowsTerminal.theme }
-                    else { $wt | Add-Member -NotePropertyName 'theme' -NotePropertyValue $themeJson.windowsTerminal.theme -Force }
-                }
-                # Upsert color scheme
-                if ($themeJson.windowsTerminal.scheme) {
-                    $sd = [PSCustomObject]$themeJson.windowsTerminal.scheme
-                    if (-not $wt.PSObject.Properties['schemes']) {
-                        $wt | Add-Member -NotePropertyName 'schemes' -NotePropertyValue @() -Force
-                    }
-                    $wt.schemes = @(@($wt.schemes | Where-Object { $_ -and $_.name -ne $sd.name }) + $sd)
-                }
-                $out = $wt | ConvertTo-Json -Depth 100
-                [System.IO.File]::WriteAllText($wtPath, $out, [System.Text.UTF8Encoding]::new($false))
-                Ok 'applied' "WT themes/schemes upserted; backup: $backup"
-            }
-            catch { Fail 'apply WT theme' $_.Exception.Message }
-        }
+        # -CiMode installs the profile, configs and Windows Terminal settings (recorded, so Uninstall-Profile reverts them)
+        # without winget tools, fonts, PowerShell Gallery modules or prompts.
+        Step 'setup.ps1 -LocalRepo -CiMode (profile, configs, WT settings; no tools)'
+        & './setup.ps1' -LocalRepo $repoRoot -CiMode -SkipWizard
+        if ($LASTEXITCODE -eq 0) { Ok 'setup.ps1 -CiMode' } else { Fail 'setup.ps1 -CiMode' "exit $LASTEXITCODE" }
         Write-Host '  PSReadLine colors apply on next pwsh launch.' -ForegroundColor DarkGray
     }
 }
