@@ -95,8 +95,12 @@ foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'setup.ps1', 'setprofile.ps
 # --- 1. PSScriptAnalyzer (same version and settings as CI) ---
 if (-not $SkipLint) {
     Step 'PSScriptAnalyzer (tests/lint.ps1)'
-    $lintOutput = & pwsh -NoProfile -NonInteractive -File tests/lint.ps1 2>&1
+    # Never installs modules: without the pinned analyzer the step is skipped with the install command.
+    $lintOutput = & pwsh -NoProfile -NonInteractive -File tests/lint.ps1 -NoInstall 2>&1
     if ($LASTEXITCODE -eq 0) { Ok 'lint' 'clean' }
+    elseif (($lintOutput | Out-String) -match 'PSScriptAnalyzer [\d.]+ is not installed') {
+        Write-Host '  SKIP  PSScriptAnalyzer 1.25.0 is not installed: Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser (or run tests/lint.ps1)' -ForegroundColor DarkGray
+    }
     else {
         $lintOutput | ForEach-Object { Write-Host "  $_" }
         Fail 'lint' "exit $LASTEXITCODE"
