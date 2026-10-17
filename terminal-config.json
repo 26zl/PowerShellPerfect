@@ -15,7 +15,8 @@
   "fontInstall": {
     "name": "CascadiaCode",
     "displayName": "CaskaydiaCove NF",
-    "version": "3.2.1"
+    "version": "3.5.1",
+    "sha256": "1298BF92698AFA06185CF1D05E6AE05F2D8A1E8C3CB45DDF4C3035168AB342A1"
   },
   "keybindings": [
     {
