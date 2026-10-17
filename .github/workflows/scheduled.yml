@@ -1,0 +1,98 @@
+name: Scheduled checks
+
+# Pull-request CI mocks third-party web services; this workflow covers what that leaves out.
+on:
+  schedule:
+    - cron: '17 4 * * 1'  # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-network:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Functional tests against the real endpoints (no public paste upload)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/ci-functional.ps1 -AllowElevated -LiveNetwork
+
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pinned downloads still match their hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./tests/lib/Sandbox.ps1
+          foreach ($v in '$script:NerdFontVersion', '$script:CuratedFonts', '$script:OmpThemesRef', '$script:PinnedOmpThemes') {
+            . ([scriptblock]::Create((Get-PspAssignmentSource -Path 'setup.ps1' -Variable $v)))
+          }
+          . ([scriptblock]::Create((Get-PspFunctionSource -Path 'Microsoft.PowerShell_profile.ps1' -Name 'Get-PspComponentPins')))
+          $problems = @()
+          $work = Join-Path ([System.IO.Path]::GetTempPath()) 'psp-pins'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+          # Nerd Fonts: the curated fonts and terminal-config.json against the release's own SHA-256.txt.
+          $sumsFile = Join-Path $work 'nf-sums.txt'
+          Invoke-WebRequest "https://github.com/ryanoasis/nerd-fonts/releases/download/v$($script:NerdFontVersion)/SHA-256.txt" -OutFile $sumsFile
+          $nf = @{}
+          foreach ($line in Get-Content $sumsFile) { if ($line -match '^([0-9a-f]{64})\s+(\S+)$') { $nf[$Matches[2]] = $Matches[1].ToUpperInvariant() } }
+          foreach ($font in $script:CuratedFonts) {
+            if ($nf["$($font.Asset).zip"] -ne $font.Sha256) { $problems += "setup.ps1 hash for $($font.Asset).zip does not match Nerd Fonts v$($script:NerdFontVersion)" }
+          }
+          $fontInstall = (Get-Content 'terminal-config.json' -Raw | ConvertFrom-Json).fontInstall
+          if ($fontInstall.version -ne $script:NerdFontVersion) { $problems += "terminal-config.json font version $($fontInstall.version) differs from setup.ps1 $($script:NerdFontVersion)" }
+          elseif ($nf["$($fontInstall.name).zip"] -ne $fontInstall.sha256.ToUpperInvariant()) { $problems += "terminal-config.json hash for $($fontInstall.name).zip does not match" }
+
+          # Oh My Posh themes pinned in setup.ps1 and theme.json.
+          foreach ($name in $script:PinnedOmpThemes.Keys) {
+            $file = Join-Path $work "$name.omp.json"
+            Invoke-WebRequest "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/$($script:OmpThemesRef)/themes/$name.omp.json" -OutFile $file
+            if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $script:PinnedOmpThemes[$name]) { $problems += "Oh My Posh theme $name changed at $($script:OmpThemesRef)" }
+          }
+          $theme = (Get-Content 'theme.json' -Raw | ConvertFrom-Json).theme
+          $file = Join-Path $work 'theme-json.omp.json'
+          Invoke-WebRequest $theme.url -OutFile $file
+          if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $theme.sha256.ToUpperInvariant()) { $problems += "theme.json hash for $($theme.url) does not match" }
+
+          # Pinned packages still exist.
+          $pins = Get-PspComponentPins
+          # The Packages(Id,Version) entry answers 404 for a version that does not exist (a filtered search would return an empty feed).
+          try {
+            $entry = Invoke-RestMethod "https://www.powershellgallery.com/api/v2/Packages(Id='PSFzf',Version='$($pins.PSFzf)')"
+            if (-not $entry) { throw 'empty response' }
+          } catch { $problems += "PSFzf $($pins.PSFzf) not found on the PowerShell Gallery" }
+          try { $null = Invoke-RestMethod "https://registry.npmjs.org/http-server/$($pins.HttpServer)" } catch { $problems += "http-server $($pins.HttpServer) not found on npm" }
+
+          # Newer upstream releases are reported, not failed.
+          foreach ($repo in 'ryanoasis/nerd-fonts', 'JanDeDobbeleer/oh-my-posh') {
+            try {
+              $latest = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest" -Headers @{ 'User-Agent' = 'PowerShellPerfect-pins' }).tag_name
+              Write-Host "::notice::Latest $repo release: $latest"
+            } catch { Write-Host "::warning::Could not read the latest $repo release: $($_.Exception.Message)" }
+          }
+
+          if ($problems) { $problems | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host 'All pinned downloads match.'
