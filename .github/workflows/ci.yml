@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
           egress-policy: audit
@@ -211,7 +211,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
           egress-policy: audit
@@ -332,7 +332,7 @@ jobs:
     needs: [lint, install-flow]
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           # Windows runners support audit mode only (block mode needs a Linux runner), so egress is logged, not blocked.
           egress-policy: audit
