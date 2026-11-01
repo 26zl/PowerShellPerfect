@@ -55,7 +55,8 @@ if (-not [System.IO.Directory]::Exists($cacheDir)) {
 }
 
 # Detect administrator status safely across PowerShell editions and platforms.
-$_pspIsWindowsOS = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows
+# Startup and the first prompt avoid cmdlets of Microsoft.PowerShell.Management: importing it costs about 25 ms, paid later at the first cd instead.
+$_pspIsWindowsOS = $PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows
 if ($_pspIsWindowsOS) {
     try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
     catch { $isAdmin = $false }
@@ -596,7 +597,7 @@ function Get-ExternalCommandPath {
     Where-Object { $_ -and [System.IO.Path]::IsPathRooted([string]$_) } |
     Select-Object -Unique
     foreach ($pathCandidate in $pathCandidates) {
-        if (Test-Path -LiteralPath $pathCandidate -PathType Leaf) {
+        if ([System.IO.File]::Exists($pathCandidate)) {
             return $pathCandidate
         }
     }
@@ -1225,7 +1226,7 @@ function Get-OhMyPoshExecutablePath {
     foreach ($candidatePath in $candidatePaths) {
         if (-not [System.IO.File]::Exists($candidatePath)) { continue }
 
-        $candidateDir = Split-Path -Path $candidatePath -Parent
+        $candidateDir = [System.IO.Path]::GetDirectoryName($candidatePath)
         $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
         if ($pathEntries -notcontains $candidateDir) {
             $env:PATH = (@($candidateDir, $env:PATH) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
@@ -1565,7 +1566,7 @@ function Complete-OhMyPoshCommand {
             # Stop the whole tree: segments such as git run as child processes.
             try {
                 if ($PSVersionTable.PSVersion.Major -ge 7) { $process.Kill($true) }
-                else { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /T /F /PID $process.Id 2>&1 }
+                else { $null = & ([System.IO.Path]::Combine($env:SystemRoot, 'System32\taskkill.exe')) /T /F /PID $process.Id 2>&1 }
             }
             catch { $null = $_ }
             return $null
@@ -1637,7 +1638,7 @@ function Get-OhMyPoshPromptContext {
     }
 
     try {
-        $locations = Get-Location -Stack
+        $locations = $ExecutionContext.SessionState.Path.LocationStack($null)
         if ($locations) {
             $context.StackCount = $locations.Count
         }
@@ -2947,7 +2948,8 @@ function Exit-PspNoGcRegion {
 
 # Return the plain prompt text, also used when oh-my-posh fails or times out.
 function Get-PspPlainPrompt {
-    if ($script:PSP.IsAdmin) { "[" + (Get-Location) + "] # " } else { "[" + (Get-Location) + "] $ " }
+    $location = $ExecutionContext.SessionState.Path.CurrentLocation
+    if ($script:PSP.IsAdmin) { "[" + $location + "] # " } else { "[" + $location + "] $ " }
 }
 
 function prompt {
@@ -8021,10 +8023,12 @@ $_pspReadlineColors = $null
 $_pspThemeConfig = $null
 $_pspRlUser = $null
 $_pspRlUserError = $null
-try { $_pspRlUser = Read-JsonFile (Join-Path $cacheDir 'user-settings.json') }
+$_pspUserSettingsPath = [System.IO.Path]::Combine($cacheDir, 'user-settings.json')
+try { if ([System.IO.File]::Exists($_pspUserSettingsPath)) { $_pspRlUser = ConvertFrom-JsonC -Text ([System.IO.File]::ReadAllText($_pspUserSettingsPath)) } }
 catch { $_pspRlUserError = $_ }
 try {
-    $_pspThemeConfig = Read-JsonFile (Join-Path $cacheDir 'theme.json')
+    $_pspThemeJsonPath = [System.IO.Path]::Combine($cacheDir, 'theme.json')
+    if ([System.IO.File]::Exists($_pspThemeJsonPath)) { $_pspThemeConfig = ConvertFrom-JsonC -Text ([System.IO.File]::ReadAllText($_pspThemeJsonPath)) }
     if ($_pspThemeConfig) {
         if ($_pspThemeConfig.psreadline -and $_pspThemeConfig.psreadline.colors) {
             $_pspReadlineColors = @{}
@@ -8165,14 +8169,17 @@ if ($script:PSP.IsInteractive -and (Get-Module PSReadLine)) {
     Register-ProfileHook -EventName PrePrompt -Action {
         try {
             $parts = @()
-            if ($env:VIRTUAL_ENV) { $parts += "venv:$(Split-Path $env:VIRTUAL_ENV -Leaf)" }
+            # .NET calls instead of file cmdlets: this runs on every prompt, and the first file cmdlet would import a module.
+            if ($env:VIRTUAL_ENV) { $parts += "venv:$([System.IO.Path]::GetFileName($env:VIRTUAL_ENV.TrimEnd('\', '/')))" }
             if ($env:CONDA_DEFAULT_ENV) { $parts += "conda:$env:CONDA_DEFAULT_ENV" }
             if ($env:AWS_PROFILE) { $parts += "aws:$env:AWS_PROFILE" }
             if ($env:AWS_VAULT) { $parts += "aws-vault:$env:AWS_VAULT" }
             # Kubernetes context from the kubeconfig (first KUBECONFIG entry), re-read only when the file changes.
-            $kubeConfig = if ($env:KUBECONFIG) { @($env:KUBECONFIG -split ';' | Where-Object { $_ })[0] } else { Join-Path $HOME '.kube/config' }
-            if ($kubeConfig -and (Test-Path -LiteralPath $kubeConfig -PathType Leaf)) {
-                $kubeItem = Get-Item -LiteralPath $kubeConfig -Force
+            $kubeConfig = if ($env:KUBECONFIG) { @($env:KUBECONFIG -split ';' | Where-Object { $_ })[0] } else { [System.IO.Path]::Combine($HOME, '.kube', 'config') }
+            # A relative entry resolves against the current PowerShell location.
+            if ($kubeConfig) { $kubeConfig = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($kubeConfig) }
+            if ($kubeConfig -and [System.IO.File]::Exists($kubeConfig)) {
+                $kubeItem = [System.IO.FileInfo]::new($kubeConfig)
                 $stamp = '{0}|{1}|{2}' -f $kubeItem.FullName, $kubeItem.LastWriteTimeUtc.Ticks, $kubeItem.Length
                 $kubeCache = $script:PSP.KubeContextCache
                 if (-not $kubeCache -or $kubeCache.Stamp -ne $stamp) {
@@ -8248,7 +8255,7 @@ if ($script:PSP.IsInteractive) {
             Write-Warning "No cached OMP theme is configured. Run Update-Profile or setup.ps1 to restore theme.json."
         }
 
-        $_pspLocalThemePath = if ($_pspThemeName) { Join-Path $cacheDir "$_pspThemeName.omp.json" } else { $null }
+        $_pspLocalThemePath = if ($_pspThemeName) { [System.IO.Path]::Combine($cacheDir, "$_pspThemeName.omp.json") } else { $null }
         if ($_pspLocalThemePath -and -not [System.IO.File]::Exists($_pspLocalThemePath)) {
             # Move a theme file left in the profile folder into the cache.
             $_pspOldThemePath = Join-Path (Split-Path $PROFILE) "$_pspThemeName.omp.json"
@@ -8452,7 +8459,10 @@ function New-PspZoxideCache {
     } -ArgumentList @($ExecutablePath) -TimeoutSec 10
     if (-not $initScript) { return $false }
     $version = if ($versionText) { $versionText } else { 'unknown' }
-    [System.IO.File]::WriteAllText($CachePath, ("# ZOXIDE_CACHE_VERSION: $version`n" + (@($initScript) -join "`n")), [System.Text.UTF8Encoding]::new($false))
+    # zoxide reads the folder at load with Get-Location, which would import Microsoft.PowerShell.Management; the session API returns the same PathInfo.
+    $text = (@($initScript) -join "`n").Replace('$cwd = Microsoft.PowerShell.Management\Get-Location', '$cwd = $ExecutionContext.SessionState.Path.CurrentLocation')
+    # The psp suffix marks caches written with that change, so older ones are generated again.
+    [System.IO.File]::WriteAllText($CachePath, ("# ZOXIDE_CACHE_VERSION: $version; psp 2`n" + $text), [System.Text.UTF8Encoding]::new($false))
     return $true
 }
 
@@ -8468,7 +8478,7 @@ if ($script:PSP.IsInteractive) {
                 $_pspZoxideReader = [System.IO.StreamReader]::new($_pspZoxideCachePath)
                 try { $_pspCacheContent = $_pspZoxideReader.ReadLine() }
                 finally { $_pspZoxideReader.Dispose() }
-                if ($_pspCacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $_pspCacheValid = $true }
+                if ($_pspCacheContent -match '^# ZOXIDE_CACHE_VERSION: .+; psp 2$') { $_pspCacheValid = $true }
             }
             catch { Write-Verbose "Zoxide cache read failed (will regenerate)." }
             if (-not $_pspCacheValid) { Remove-Item $_pspZoxideCachePath -Force -ErrorAction SilentlyContinue }
@@ -9258,9 +9268,11 @@ if ($script:UserSettings) {
     # Apply feature toggles again in case the PSReadLine block skipped them.
     Set-PspFeatureOverride $script:UserSettings
     # Trusted directories carry the SHA-256 of the .psprc.ps1 that was approved; entries without one need a new approval.
-    $_pspTrust = Get-PspTrustState $script:UserSettings
-    $script:PSP.TrustedDirs = $_pspTrust.Dirs
-    $script:PSP.TrustedRcHashes = $_pspTrust.Hashes
+    if ($script:UserSettings.PSObject.Properties['trustedDirs'] -or $script:UserSettings.PSObject.Properties['trustedRcHashes']) {
+        $_pspTrust = Get-PspTrustState $script:UserSettings
+        $script:PSP.TrustedDirs = $_pspTrust.Dirs
+        $script:PSP.TrustedRcHashes = $_pspTrust.Hashes
+    }
     if ($script:UserSettings.PSObject.Properties['commandOverrides']) {
         $_pspOverrideCount = @($script:UserSettings.commandOverrides.PSObject.Properties).Count
         if (-not $script:PSP.Features.commandOverrides) {
@@ -9325,9 +9337,9 @@ if ([System.IO.Directory]::Exists($_pspPluginDir)) {
 # Check GitHub weekly for updates when the interactive updateCheck feature is enabled.
 if ($script:PSP.IsInteractive -and $script:PSP.Features.updateCheck) {
     try {
-        $_pspUcStampFile = Join-Path $cacheDir 'last-update-check.txt'
+        $_pspUcStampFile = [System.IO.Path]::Combine($cacheDir, 'last-update-check.txt')
         $_pspUcDoCheck = $true
-        if (Test-Path -LiteralPath $_pspUcStampFile) {
+        if ([System.IO.File]::Exists($_pspUcStampFile)) {
             $_pspUcRaw = (Get-Utf8FileText $_pspUcStampFile).Trim()
             $_pspUcLast = [datetime]::MinValue
             if ([datetime]::TryParse($_pspUcRaw, [ref]$_pspUcLast)) {
@@ -9337,8 +9349,8 @@ if ($script:PSP.IsInteractive -and $script:PSP.Features.updateCheck) {
         if ($_pspUcDoCheck) {
             $_pspUcLatest = Get-LatestMainCommitSha
             if ($_pspUcLatest) {
-                $_pspUcBaselineFile = Join-Path $cacheDir 'applied-commit.sha'
-                $_pspUcStored = if (Test-Path -LiteralPath $_pspUcBaselineFile) { (Get-Utf8FileText $_pspUcBaselineFile).Trim() } else { $null }
+                $_pspUcBaselineFile = [System.IO.Path]::Combine($cacheDir, 'applied-commit.sha')
+                $_pspUcStored = if ([System.IO.File]::Exists($_pspUcBaselineFile)) { (Get-Utf8FileText $_pspUcBaselineFile).Trim() } else { $null }
                 if (-not $_pspUcStored) {
                     # First check: record baseline so future checks can compare without false negatives.
                     Write-Utf8FileAtomic -Path $_pspUcBaselineFile -Content $_pspUcLatest
@@ -9365,11 +9377,14 @@ if ($script:PspNoGcRegion -and -not ([string]$Function:prompt).Contains('Exit-Ps
 $_pspStopwatch.Stop()
 $script:PSP.LoadTimeMs = $_pspStopwatch.ElapsedMilliseconds
 if ($script:PSP.IsInteractive -and $script:PSP.Features.startupMessage) {
-    Write-PspHost "Profile loaded in $($_pspStopwatch.ElapsedMilliseconds)ms." -ForegroundColor DarkGray
-    Write-PspHost "Use 'Show-Help' or 'Start-ProfileTour' to explore." -ForegroundColor Yellow
+    # Written through the host directly: the first Write-PspHost call costs about 10 ms more, on every start.
+    foreach ($_pspLine in @(@("Profile loaded in $($_pspStopwatch.ElapsedMilliseconds)ms.", [System.ConsoleColor]::DarkGray), @("Use 'Show-Help' or 'Start-ProfileTour' to explore.", [System.ConsoleColor]::Yellow))) {
+        try {
+            if ([string]::IsNullOrEmpty($env:NO_COLOR)) { $Host.UI.WriteLine($_pspLine[1], $Host.UI.RawUI.BackgroundColor, $_pspLine[0]) }
+            else { $Host.UI.WriteLine($_pspLine[0]) }
+        }
+        catch { Write-PspHost $_pspLine[0] -ForegroundColor $_pspLine[1] }
+    }
 }
 # Load-time temporaries all start with _psp, so variables that profile_user.ps1 or plugins define are left alone.
-foreach ($_pspName in @(Get-Variable -Name '_psp*' -Scope Script -ErrorAction Ignore | ForEach-Object { $_.Name })) {
-    Remove-Variable -Name $_pspName -Scope Script -ErrorAction Ignore
-}
-Remove-Variable -Name '_pspName' -Scope Script -ErrorAction Ignore
+Remove-Variable -Name '_psp*' -Scope Script -ErrorAction Ignore

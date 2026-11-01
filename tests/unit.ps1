@@ -1656,6 +1656,54 @@ Test-Case 'Versions named in README.md and SECURITY.md match the pins' {
     Assert-True ($stale.Count -eq 0) "versions in the docs that match no pin: $($stale -join ', ')"
 }
 
+Test-Case 'The prompt path and the tab-title hook call no Microsoft.PowerShell.Management cmdlet (its import costs about 25 ms)' {
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $management = @{}
+    foreach ($c in (Get-Command -Module Microsoft.PowerShell.Management -CommandType Cmdlet)) { $management[$c.Name] = $true }
+    foreach ($a in (Get-Alias | Where-Object { $management.ContainsKey([string]$_.Definition) })) { $management[$a.Name] = $true }
+    $names = @('Invoke-PromptStage', 'Invoke-ProfileHook', 'Get-OhMyPoshPromptText', 'Get-OhMyPoshPromptContext', 'Invoke-OhMyPoshCommand', 'Complete-OhMyPoshCommand',
+        'Get-OhMyPoshChildPath', 'Get-ProfileEnvironmentFingerprint', 'Get-PspPlainPrompt', 'Exit-PspNoGcRegion', 'Get-OhMyPoshExecutablePath', 'Get-ExternalCommandPath',
+        'Find-ProfileExecutable', 'ConvertFrom-JsonC', 'Set-PspFeatureOverride', 'Get-PspCacheDir', 'Test-PspOmpVersionSafe', 'Get-PspExecutableVersion')
+    $bodies = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name }, $true))
+    Assert-True ($bodies.Count -eq $names.Count) "found $($bodies.Count) of $($names.Count) functions"
+    $bodies += @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Register-ProfileHook' -and $n.Extent.Text -match '-EventName PrePrompt' }, $true))
+    $hits = @(foreach ($b in $bodies) {
+            foreach ($c in $b.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $name = $c.GetCommandName()
+                if ($name -and $management.ContainsKey($name)) { '{0} (line {1})' -f $name, $c.Extent.StartLineNumber }
+            }
+        })
+    Assert-True ($hits.Count -eq 0) "Management cmdlets on the prompt path: $($hits -join ', ')"
+}
+
+Test-Case 'Loading the profile in a fresh process does not import Microsoft.PowerShell.Management' {
+    # The cache and plugin folders exist, as after any earlier start, so the load creates nothing.
+    New-Item -ItemType Directory -Path (Join-Path (Get-PspCacheDir) 'plugins') -Force | Out-Null
+    $shell = (Get-Process -Id $PID).Path
+    $out = & $shell -NoProfile -NonInteractive -Command ". '$profilePath' *> `$null; 'mgmt=' + [bool](Get-Module Microsoft.PowerShell.Management)" 2>&1 | Out-String
+    Assert-True ($out -match 'mgmt=False') "the load imported the module: $out"
+}
+
+Test-Case 'The zoxide cache reads the folder through the session API, and the load accepts only caches written that way' {
+    function Invoke-WithTimeout {
+        param([scriptblock]$ScriptBlock, $ArgumentList, $TimeoutSec)
+        $null = $ArgumentList, $TimeoutSec
+        if ($ScriptBlock.ToString() -match 'init --cmd') { "function global:__zoxide_pwd {`n    `$cwd = Microsoft.PowerShell.Management\Get-Location`n}" } else { 'zoxide 0.10.0' }
+    }
+    $cache = Join-Path $script:Sandbox.Work 'zoxide-init.ps1'
+    Assert-True (New-PspZoxideCache -ExecutablePath 'zoxide.exe' -CachePath $cache) 'the cache was not written'
+    $lines = [System.IO.File]::ReadAllLines($cache)
+    $text = $lines -join "`n"
+    Assert-True ($text.Contains('$cwd = $ExecutionContext.SessionState.Path.CurrentLocation') -and -not $text.Contains('Management\Get-Location')) 'Get-Location was not replaced'
+    # The header the writer produces is the one the load path checks for; an older header is regenerated.
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $check = ($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.StartsWith('^# ZOXIDE_CACHE_VERSION') }, $true) | Select-Object -First 1).Value
+    Assert-True ($lines[0] -match $check) "the load would reject the header '$($lines[0])'"
+    Assert-True (-not ('# ZOXIDE_CACHE_VERSION: zoxide 0.10.0' -match $check)) 'a cache without the session API change is still accepted'
+}
+
 Test-Case 'Install-NerdFonts never extracts an archive whose hash differs' {
     $script:Extracted = $false
     function Invoke-DownloadWithRetry { param($Uri, $OutFile, $TimeoutSec, $MaxAttempts) $null = $Uri, $TimeoutSec, $MaxAttempts; [System.IO.File]::WriteAllText($OutFile, 'not the pinned archive', [System.Text.UTF8Encoding]::new($false)) }
