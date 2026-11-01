@@ -24,7 +24,7 @@ param()
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
 
-# Copy the profile to PS5 and PS7 directories while normalizing agent detection.
+# Normalize known agent env vars to AI_AGENT (same as the profile).
 if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_CODE -or [bool]$env:CODEX -or [bool]$env:CODEX_AGENT)) { $env:AI_AGENT = '1' }
 $source = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'Microsoft.PowerShell_profile.ps1' } else { $null }
 if (-not $source -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
@@ -68,8 +68,10 @@ foreach ($dir in $profileDirs) {
             $backupPath = Join-Path $dir ("oldprofile.{0}.ps1" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
             Copy-Item -LiteralPath $targetProfile -Destination $backupPath -Force
             Write-Host "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
+            # Only timestamped backups rotate, newest by the stamp in the name, since Copy-Item keeps the source LastWriteTime.
             Get-ChildItem -LiteralPath $dir -Filter 'oldprofile*.ps1' -File -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+                Where-Object { $_.Name -match '^oldprofile\.\d{8}-\d{6}\.ps1$' } |
+                Sort-Object Name -Descending | Select-Object -Skip 5 |
                 ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
         }
         Copy-Item -LiteralPath $source -Destination $targetProfile -Force
@@ -80,7 +82,9 @@ foreach ($dir in $profileDirs) {
         $failed++
     }
 }
-if ([Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AI_AGENT -and -not $WhatIfPreference) {
+# CI=false or CI=0 (set by some shells and tools) does not count as a CI run.
+$isCi = [bool]$env:CI -and $env:CI -ne 'false' -and $env:CI -ne '0'
+if ([Environment]::UserInteractive -and -not $isCi -and -not [bool]$env:AI_AGENT -and -not $WhatIfPreference) {
     Write-Host ""
     Write-Host "Press Enter to close..." -ForegroundColor Yellow
     try { $null = Read-Host } catch { $null = $_ }

@@ -7,7 +7,7 @@
 
 A modern PowerShell profile for Windows. The installer drops you into a **`p10k configure`-style install wizard** that picks your theme, color scheme, font, and feature toggles, then ships 145+ commands (Unix-style utilities plus git, network, security, sysadmin, WSL, and docker), a tuned Oh My Posh prompt, fuzzy search, zoxide, and a full uninstall + self-update behind it.
 
-> **Stability.** The command surface, install flow, and extension points are settled; new work stays additive where it can and is listed in [CHANGELOG.md](CHANGELOG.md). Every push and pull request runs PSScriptAnalyzer, Windows PowerShell 5.1 and PowerShell 7 parse and load checks with a load-time budget, regression tests on both editions, a sandboxed install/uninstall cycle, and a functional command suite. Releases are tagged `vX.Y.Z` and published with `SHA256SUMS.txt` and a build provenance attestation.
+> **Stability.** The command surface, install flow, and extension points are settled; new work stays additive where it can and is described in each [release](https://github.com/26zl/PowerShellPerfect/releases)'s notes. Every push and pull request runs PSScriptAnalyzer, Windows PowerShell 5.1 and PowerShell 7 parse and load checks with a load-time budget, regression tests on both editions, a sandboxed install/uninstall cycle, and a functional command suite. Releases are tagged `vX.Y.Z` and published with `SHA256SUMS.txt` and a build provenance attestation.
 
 ## Install
 
@@ -30,7 +30,7 @@ With `-Ref vX.Y.Z`, setup resolves the tag to its commit, downloads the profile,
 
 ```powershell
 gh release download v1.0.0 --repo 26zl/PowerShellPerfect --dir psp-release
-gh attestation verify psp-release\setup.ps1 --repo 26zl/PowerShellPerfect   # repeat for the other files
+gh attestation verify psp-release\setup.ps1 --repo 26zl/PowerShellPerfect --source-ref refs/tags/v1.0.0 --signer-workflow 26zl/PowerShellPerfect/.github/workflows/release.yml   # repeat for the other files
 cd psp-release; powershell -ExecutionPolicy Bypass -File .\setup.ps1          # installs from the verified files
 ```
 
@@ -42,7 +42,7 @@ $setup = irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1"
 & ([scriptblock]::Create($setup)) -Ref <commit> -ExpectedSha256 '<hash>' # installs exactly that commit
 ```
 
-Run setup as a script block, as shown, or as a file; `irm ... | iex` is not supported. As a script block it does not close your window when it exits and removes the variables it created in your session.
+Run setup as a script block, as shown, or as a file; `irm ... | iex` is not supported. As a script block it sets `$LASTEXITCODE` instead of exiting and removes the variables it created in your session, except after a successful install in an interactive, non-elevated window: setup then asks you to press Enter, opens a new terminal and closes the one it ran in.
 
 The printed hash is computed over the bytes you just downloaded: it makes the install reproducible and detects changes in transit, but it cannot tell you whether those bytes are what the maintainer intended. That is what release checksums and attestations are for. See [SECURITY.md](SECURITY.md).
 
@@ -61,7 +61,7 @@ The **install wizard runs by default** in an interactive window (pass `-SkipWiza
 | **OS** | Windows 10 1809+ / Windows 11 (Windows Terminal recommended). CI runs on Windows Server images; client versions are checked by hand. |
 | **Shell** | Windows PowerShell 5.1 (works) or [PowerShell 7+](https://github.com/PowerShell/PowerShell) (recommended; every PS5/PS7 API fork is guarded) |
 | **Privileges** | None. Without elevation the Nerd Font is installed for your user and the optional telemetry opt-out is set for your user; in an elevated shell both are machine-wide. Run setup unelevated so the terminal it restarts into is not elevated. |
-| **Network** | Install and `Update-Profile` fetch the profile bundle from GitHub, the Oh My Posh theme and Nerd Font at pinned versions, and CLI tools through winget. TLS 1.2+ is enforced on PS5.1. |
+| **Network** | Setup fetches the profile bundle from GitHub, the Oh My Posh theme, the portable Oh My Posh build and the Nerd Font at pinned versions, and the other CLI tools through winget. `Update-Profile` fetches the bundle and the theme; it installs missing tools (the portable Oh My Posh build, winget packages, PSFzf) only with `-InstallMissingTools` and never installs fonts. TLS 1.2+ is enforced on PS5.1. |
 | **Optional tools** | `eza`, `bat`, `ripgrep`, `fzf`, `zoxide`, `oh-my-posh`; installed by setup. Every command degrades gracefully if a tool is absent. |
 
 ## What setup changes
@@ -69,11 +69,15 @@ The **install wizard runs by default** in an interactive window (pass `-SkipWiza
 | Change | Where | Reverted by |
 | --- | --- | --- |
 | Profile for both editions, previous profile kept as `profile.original.ps1` (once; a copy of this profile is never kept as the original) and `oldprofile.<timestamp>.ps1` (latest 5) | `Documents\PowerShell`, `Documents\WindowsPowerShell` | `Uninstall-Profile` (restores `profile.original.ps1`; `-RemoveUserData` also removes the `oldprofile` copies) |
-| Caches, `user-settings.json`, install record (`installed.json`), Windows Terminal change record (`wt-changes.json`), logs | `%LOCALAPPDATA%\PowerShellProfile` | `Uninstall-Profile` (`user-settings.json` and `plugins\` stay unless `-RemoveUserData`) |
-| Windows Terminal: font, opacity, color scheme, tab theme, `Ctrl+A` binding, and `-NoLogo` on the PowerShell profiles' command lines. Every installed variant (Stable, Preview, Canary, unpackaged); each value is recorded with what it replaced, and the untouched pre-install file is kept as `settings.json.psp-original` | `settings.json` of each variant | `Uninstall-Profile` reverts each recorded value it still finds; values you changed later are kept |
-| winget packages: Oh My Posh, eza, zoxide, fzf, bat, ripgrep (winget accepts the source and package agreements for you) | winget | `Uninstall-Profile -RemoveTools` |
+| Starter `profile_user.ps1` for your own overrides (every line commented out), created only when missing | `Documents\PowerShell`, `Documents\WindowsPowerShell` | `Uninstall-Profile -RemoveUserData` |
+| Interactive runs: the editor you pick, as a `$script:EditorPriority` line in each `profile_user.ps1` (the previous file is kept as `profile_user.ps1.bak`) | `Documents\PowerShell`, `Documents\WindowsPowerShell` | `Uninstall-Profile -RemoveUserData` (removes `profile_user.ps1` and the `.bak`) |
+| Caches (each run clears the generated zoxide and Oh My Posh caches so the next load rebuilds them), `user-settings.json`, install record (`installed.json`), Windows Terminal change record (`wt-changes.json`), logs | `%LOCALAPPDATA%\PowerShellProfile` | `Uninstall-Profile` (`user-settings.json` and `plugins\` stay unless `-RemoveUserData`) |
+| Windows Terminal: font, opacity, color scheme, tab theme, the keybindings you list in `user-settings.json` (none are shipped; a `Ctrl+A` binding left by an earlier version is removed again), and `-NoLogo` on the PowerShell profiles' command lines. Every installed variant (Stable, Preview, Canary, unpackaged); each value is recorded with what it replaced, and the untouched pre-install file is kept as `settings.json.psp-original` | `settings.json` of each variant | `Uninstall-Profile` reverts each recorded value it still finds; values you changed later are kept |
+| Oh My Posh portable build, pinned release, SHA-256 and Authenticode signer checked (winget is the fallback when the download fails; an existing direct or MSI install is left alone) | `%LOCALAPPDATA%\Programs\oh-my-posh\bin` | `Uninstall-Profile -RemoveTools`, which also removes a winget or MSI install of Oh My Posh, even one made before setup |
+| winget packages: eza, zoxide, fzf, bat, ripgrep (winget accepts the source and package agreements for you) | winget | `Uninstall-Profile -RemoveTools`, which removes these packages even when they were installed before setup |
 | PSFzf module, pinned version, current user | PowerShell Gallery | `Uninstall-Profile -RemoveTools` |
 | Nerd Font, pinned release, archive SHA-256 checked | per-user font store (machine-wide when elevated) | `Uninstall-Profile -RemoveFonts` |
+| Optional, asked first: the editor you pick, when it is not installed; setup then installs it with winget (this accepts its license) | winget | not reverted (`Uninstall-Profile` does not remove it) |
 | Optional, asked first: `POWERSHELL_TELEMETRY_OPTOUT=true` | user environment (machine when elevated) | `Uninstall-Profile` (only if setup set it) |
 | Optional, asked first: CurrentUser execution policy `AllSigned` -> `RemoteSigned`; uninstalling the Terminal-Icons module (this profile shows icons through eza instead) | | not reverted (you chose it) |
 
@@ -88,10 +92,10 @@ Inspired by [powerlevel10k](https://github.com/romkatv/powerlevel10k)'s `p10k co
 # Resume a half-finished wizard (state in %LOCALAPPDATA%\PowerShellProfile\wizard-state.json):
 .\setup.ps1 -Resume
 
-# Re-run the wizard any time after install (setup.ps1 of a release is checked against its SHA256SUMS.txt; runs in this window):
+# Re-run the wizard any time after install (setup.ps1 of a release is checked against its SHA256SUMS.txt; runs in a child PowerShell in this window):
 Reconfigure-Profile -Ref v1.0.0
-# From a branch or commit, pin setup.ps1 to the hash the first run prints:
-Reconfigure-Profile -Ref <commit> -ExpectedSha256 '<setup.ps1 hash>'
+# From a branch or commit, pin setup.ps1 and then the bundle to the hashes the runs print:
+Reconfigure-Profile -Ref <commit> -ExpectedSha256 '<setup.ps1 hash>' -BundleExpectedSha256 '<bundle hash>'
 ```
 
 **Steps** (all accept Enter to keep the default / skip):
@@ -104,7 +108,7 @@ Reconfigure-Profile -Ref <commit> -ExpectedSha256 '<setup.ps1 hash>'
 6. **Terminal appearance**: opacity, `useAcrylic`, font size, cursor shape, padding, scrollbar state, history size. Each prompt keeps the current default on Enter.
 7. **PSReadLine colors**: derive from chosen scheme (default) / shipped palette / skip.
 8. **Background image**: optional path + opacity (0.05-0.50). Skipped by default.
-9. **Editor preference**: VS Code, Notepad++, Neovim, Vim, Notepad, or a custom exe. Used by `edit`, `ep`, `hosts`, etc.
+9. **Editor preference**: Visual Studio Code, Neovim, Vim, Microsoft Edit, Sublime Text, Notepad++, or Notepad. If the one you pick is not installed, you are asked whether setup should install it with winget, which accepts its license; the install runs after the summary. Used by `edit`, `ep`, `hosts`, etc.
 10. **Telemetry opt-out + feature toggles**: `psfzf`, `predictions`, `startupMessage`, `perDirProfiles`, `commandOverrides`; y/n per item with sensible defaults.
 
 **Design**:
@@ -132,7 +136,7 @@ Inspired by [ChrisTitusTech/powershell-profile](https://github.com/ChrisTitusTec
 
 ## Install (alternatives)
 
-> **Recommended for Oh My Posh:** Install the x64 MSI from the [releases](https://github.com/JanDeDobbeleer/oh-my-posh/releases) page (see [Oh My Posh](https://github.com/JanDeDobbeleer/oh-my-posh)) instead of `winget`/Store; this profile preserves a direct install and avoids the WindowsApps path. If you already have the MSI install, setup leaves it as is.
+> **Oh My Posh:** setup installs the portable release build of [Oh My Posh](https://github.com/JanDeDobbeleer/oh-my-posh) (pinned version, SHA-256 and signer checked) to `%LOCALAPPDATA%\Programs\oh-my-posh\bin`; the profile adds that folder to `PATH` for each session, so `oh-my-posh` also runs by name. The `winget`/Store MSIX build adds about 30 ms to every prompt, so `Update-Tools` replaces it with the portable build; a direct or MSI install you made yourself is left as is.
 
 ### Manual Setup (local clone)
 
@@ -152,22 +156,31 @@ When running locally you can override terminal defaults:
 .\setup.ps1 -SkipWizard -Opacity 85 -ColorScheme "One Half Dark" -FontSize 12
 ```
 
-Exit codes: `0` when the profile is installed (optional tools that were skipped or failed are listed in the summary), `1` when nothing was applied (verification failed, unsupported system) or the profile could not be installed. `Get-Help .\setup.ps1 -Full` lists every parameter.
+Exit codes: `0` when the profile is installed (optional tools that were skipped or failed are listed in the summary), `1` when nothing was applied (verification failed, unsupported system) or the profile could not be installed, `2` when the wizard was cancelled (nothing is installed). `Get-Help .\setup.ps1 -Full` lists every parameter.
 
 > **Controlled Folder Access:** setup writes the profile to `Documents`, which CFA protects. The
 > symptom is a misleading `Could not find file` and a Defender event 1123. Allow the PowerShell
 > you are running **for the install only**, then take it out again. A permanent entry lets every
-> PowerShell script, ransomware included, write to your protected folders.
+> PowerShell script, ransomware included, write to your protected folders. Changing the list needs
+> an elevated window, while setup runs in a normal one:
 >
 > ```powershell
-> $ps = (Get-Process -Id $PID).Path   # also right for the Store build, whose path changes per version
+> # In the normal window you will run setup from: print the PowerShell to allow
+> (Get-Process -Id $PID).Path   # also right for the Store build, whose path changes per version
+>
+> # In an elevated window: allow it
+> $ps = '<the path printed above>'
 > Add-MpPreference -ControlledFolderAccessAllowedApplications $ps
+>
+> # In the normal window: install
 > .\setup.ps1
+>
+> # In the elevated window: take it out again and check it is gone
 > Remove-MpPreference -ControlledFolderAccessAllowedApplications $ps
-> (Get-MpPreference).ControlledFolderAccessAllowedApplications   # check it is gone
+> (Get-MpPreference).ControlledFolderAccessAllowedApplications
 > ```
 >
-> Later profile and module updates write to the same folder and need the same two lines around them.
+> Later profile and module updates write to the same folder and need the same allow and remove steps around them.
 
 ## Updates
 
@@ -176,7 +189,7 @@ Update-Profile -Ref v1.1.0           # Install a release, checked against its SH
 Update-Profile                       # Latest main: prints the hashes and stops; re-run with -Ref <commit> -ExpectedSha256 '<hash>'
 Update-Profile -InstallMissingTools  # Also install missing managed tools with winget (accepting the agreements) and the pinned PSFzf
 Update-PowerShell                    # Check for new PowerShell 7 releases
-Update-Tools                         # Update winget-managed tools; direct/MSI Oh My Posh installs are preserved
+Update-Tools                         # Update winget-managed tools and the portable Oh My Posh build; tools installed another way are left alone
 ```
 
 `Update-Profile` resolves `-Ref` to a commit, so the profile, `theme.json` and `terminal-config.json` always come from the same commit. For a release tag it checks the downloads against the release's `SHA256SUMS.txt`; for a branch or commit it needs `-ExpectedSha256` (the hash printed by the previous run) or `-SkipHashCheck`. Nothing is installed unless you pass `-InstallMissingTools` (which also works when the profile is already up to date); without it, missing tools are only listed. A `user-settings.json` that does not parse leaves Windows Terminal's `settings.json` alone until it is fixed. `-Force` re-applies settings even when nothing changed. `psp-doctor` shows the installed version, ref and commit.
@@ -186,7 +199,7 @@ Update-Tools                         # Update winget-managed tools; direct/MSI O
 ```powershell
 Uninstall-Profile              # Profile files, caches, and the Windows Terminal changes the profile made
 Uninstall-Profile -RemoveUserData -RemoveFonts # Everything except the tools (CLI tools and PSFzf stay)
-Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools and the PSFzf module (including direct/MSI Oh My Posh when detected)
+Uninstall-Profile -RemoveTools # Also uninstall the managed CLI tools, the portable Oh My Posh build and PSFzf; winget packages and an Oh My Posh MSI go even if they were installed before setup
 Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
 Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
 Uninstall-Profile -All -Force  # Also uninstall PSFzf/managed tools when CI or agent guards are active
@@ -201,14 +214,15 @@ A plain `Uninstall-Profile` keeps `user-settings.json`, `profile_user.ps1`, `plu
 Four extension points survive updates. From simplest to most powerful:
 
 - **`user-settings.json`** (`%LOCALAPPDATA%\PowerShellProfile\`) - JSON overrides (comments and trailing commas allowed). Keys:
-  - `theme`, `windowsTerminal`, `defaults`, `keybindings` - terminal and OMP theme
+  - `theme`, `windowsTerminal`, `defaults`, `keybindings` - terminal and OMP theme; `keybindings` are the only Windows Terminal bindings the profile sets, and one you remove here is removed from `settings.json` on the next update
+  - `theme.allowCommands` - set to `true` to use a theme that can run commands on every prompt: `command` segments, template functions such as `cmd`, `readFile` or `getHostByName`, or `extends` (which pulls in a config the profile does not check). Without it such a theme is refused at download and at load (none of the official themes uses any of these).
   - `windowsTerminal.manage` - set to `false` when another tool owns Windows Terminal's `settings.json` (a dotfiles repo, for example). `setup.ps1`, `Update-Profile`, `Set-TerminalBackground` and `Uninstall-Profile` then leave that file alone, and `psp-doctor` reports who owns it. A symlinked `settings.json` is always written in place, so the link survives updates.
   - `defaults.backgroundImage` / `backgroundImageOpacity` / `backgroundImageStretchMode` / `backgroundImageAlignment` - Windows Terminal background image
-  - `features` - toggle heavy/optional behavior: `psfzf`, `predictions`, `startupMessage`, `perDirProfiles` (all `true` by default), `transientPrompt` (collapses previous prompt on Enter; default `false`, customize via `$script:PSP.TransientPrompt = { ... }` in `profile_user.ps1`), `updateCheck` (notifies once a week when main has advanced past the applied commit; default `false` so `irm | iex` in scripts does not trigger a surprise network call)
+  - `features` - toggle heavy/optional behavior: `psfzf`, `predictions`, `startupMessage`, `perDirProfiles`, `fastGitPrompt` (renders git-heavy themes from a copy without the upstream and stash lookups, one git process fewer per prompt) (all `true` by default), `transientPrompt` (collapses previous prompt on Enter; default `false`, customize via `$script:PSP.TransientPrompt = { ... }` in `profile_user.ps1`), `updateCheck` (notifies once a week when main has advanced past the applied commit; default `false` so `irm | iex` in scripts does not trigger a surprise network call)
   - `commandOverrides` - redefine any command without editing source: `{ "gs": "git status --short" }`. Opt-in: set `features.commandOverrides = true` in the same file. Default off because it compiles JSON strings into executable scriptblocks.
   - `trustedDirs` and `trustedRcHashes` - directories whose `.psprc.ps1` auto-loads and the SHA-256 of the file you approved (managed by `Add-TrustedDirectory`)
 - **`profile_user.ps1`** (`Split-Path $PROFILE`) - PowerShell overrides (aliases, functions, editor, colors, modules), dot-sourced after `user-settings.json` (so PS-level definitions win over JSON `commandOverrides` and feature toggles) and before `plugins/`
-- **`plugins/*.ps1`** (`%LOCALAPPDATA%\PowerShellProfile\plugins\`) - drop-in plugins. Each file is auto-loaded; errors are isolated per plugin
+- **`plugins/*.ps1`** (`%LOCALAPPDATA%\PowerShellProfile\plugins\`) - drop-in plugins, loaded in name order (hidden files are skipped). Each file is auto-loaded; errors are isolated per plugin
 - **`.psprc.ps1`** (per directory) - project-specific profile. `Add-TrustedDirectory` approves the file as it is now; it then auto-loads on `cd` into that directory **only while its content is unchanged**. After any change (for example a `git pull` or branch switch) it is skipped with a warning until you review it and run `Add-TrustedDirectory` again, like `direnv allow`. The file is read once and the checked text is what runs (`$PSScriptRoot` is its folder). Use `function global:foo` / `Set-Alias -Scope Global` for lasting definitions; `$env:VAR` always persists
 
 Set `NO_COLOR` (any value, see [no-color.org](https://no-color.org)) to turn off colored output from the profile's commands and `Show-Help`. Call `Start-ProfileTour` for a live walkthrough, `Get-ProfileCommand -Category <cat>` to list what's available, or `Get-Help <command>` for a command's details.
@@ -236,7 +250,6 @@ Default fills the whole tab with low opacity (typical backdrop). For a small cor
 | `Ctrl+Left` / `Ctrl+Right` | Jump word backwards / forwards |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / Redo |
 | `Alt+V` | Smart paste (inserts clipboard without executing) |
-| `Ctrl+A` | Select entire terminal buffer (Windows Terminal) |
 
 ## Commands
 
@@ -250,9 +263,9 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `Edit-Profile` / `ep` | Open profile in preferred editor |
 | `Update-Profile [-Ref <tag\|commit>]` | Sync profile, theme, caches, and WT settings (hash-checked); `-InstallMissingTools` also installs missing tools |
 | `Update-PowerShell` | Check for new PowerShell 7 releases |
-| `Update-Tools` | Update winget-managed tools; direct/MSI Oh My Posh installs are preserved |
+| `Update-Tools` | Update winget-managed tools and the portable Oh My Posh build (an MSIX install is replaced); tools installed another way (scoop, choco, by hand, a direct/MSI Oh My Posh) are left alone and reported as preserved |
 | `Invoke-ProfileWizard` / `Reconfigure-Profile` | Re-run the install wizard to pick a new theme / scheme / font / feature set |
-| `reload` | Reload the PowerShell profile |
+| `reload` | Reload the PowerShell profile; run it as `. reload` so new and changed functions reach the session |
 | `Show-Help` | Show help in terminal |
 | `Uninstall-Profile` | Remove profile, caches, and the WT changes it made (`-All` for everything) |
 
@@ -327,7 +340,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `wifipass [ssid] [-Reveal]` | List saved WiFi profiles (passwords masked unless `-Reveal`) |
 | `hosts` | Open hosts file in elevated editor |
 | `Clear-Cache` [-IncludeSystemCaches] | Clear the user temp folder and the legacy Internet Explorer (WinINet) cache after confirmation; refuses a `TEMP` that is not a `Temp`/`Tmp` folder (or a Remote Desktop session folder such as `Temp\2`) and keeps going past files in use. `-IncludeSystemCaches` adds `Windows\Temp` and `Prefetch` (admin) |
-| `Clear-ProfileCache` | Reset profile caches plus OMP internal caches (settings and state files are kept) |
+| `Clear-ProfileCache` | Reset profile caches plus OMP internal caches (settings, state and theme files are kept) |
 | `duration` | Show elapsed time of the last executed command |
 | `Test-ProfileHealth [-PassThru]` / `psp-doctor` | Diagnose install (version, tools, caches, fonts, PATH, modules); `-PassThru` also emits the result rows for scripting |
 | `winutil [-ExpectedSha256 <hash>]` / `winutil -Force` | Fetch [Chris Titus WinUtil](https://github.com/ChrisTitusTech/winutil). Safe-by-default: prints source URL and SHA256, then stops. Re-run with `-ExpectedSha256 '<hash>'` (hash-pinned) or `-Force` (trust without verification) from an elevated shell (`admin`): unelevated, WinUtil relaunches itself from its latest release, which the hash check never saw. The script is hashed and run from memory, and PowerShell still asks for a high-impact confirmation before launch. |
@@ -343,7 +356,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `mtr <host>` | Traceroute with per-hop ping stats |
 | `fwallow` / `fwblock <name> [-Port n]` | Quick Windows Firewall rule (needs admin; supports `-WhatIf` / `-Confirm`) |
 | `Find-FileLocker <path> [-MaxFiles n]` | Show processes holding a file open, or any file inside a folder (Windows Restart Manager API) |
-| `Stop-StuckProcess <name\|-Id>` | Escalating kill: `Stop-Process -Force` -> `taskkill /F` -> `/F /T` for processes that ignore normal kill |
+| `Stop-StuckProcess <name\|-Id> [-Tree]` | Escalating kill: `Stop-Process -Force`, then `taskkill /F` (`/T` with `-Tree`) for processes that ignore normal kill |
 | `Remove-LockedItem <path> [-Recurse] [-Tree]` | Find lockers, confirm each process, stop them, then delete. For "file is in use" errors |
 
 ### Security & Crypto
@@ -352,7 +365,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | --- | --- |
 | `hash <file> [algo]` | File hash (default SHA256) |
 | `checksum <file> <expected>` | Verify file hash |
-| `genpass [length]` | Random password (default 20), copies to clipboard |
+| `genpass [length]` | Random password (default 20), copied to the clipboard and kept out of Windows clipboard history and cloud sync |
 | `b64` / `b64d <text>` | Base64 encode / decode |
 | `jwtd <token>` | Decode JWT header and payload |
 | `uuid` | Generate random UUID (copies to clipboard) |
@@ -383,7 +396,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `serve [port] [path] [-Bind addr]` | One-line HTTP server (python, or a pinned `http-server` via npx). Loopback only by default; `-Bind 0.0.0.0` shares it on the LAN |
 | `gitignore <lang...>` | Generate .gitignore from gitignore.io (Toptal) |
 | `gcof` | Fuzzy git branch checkout (fzf) |
-| `envload [path]` | Load .env file into current session |
+| `envload [path] [-AllowSensitive]` | Load .env file into current session; names that change which programs run or where they connect (`PATH`, `NODE_OPTIONS`, `GIT_*`, proxies, ...) are skipped unless `-AllowSensitive` |
 | `tldr <cmd>` | Quick command-example lookup (tldr-pages) |
 | `repeat <count> { cmd } [-UntilSuccess]` | Repeat a scriptblock |
 | `mkvenv [name]` | Create and activate a Python venv |
@@ -423,7 +436,7 @@ Inspired by the PowerShell VSCode extension: AST-powered tools that understand P
 | `dimg` | List images |
 | `dlogs <container>` | Follow container logs |
 | `dex <container> [shell]` | Exec into container |
-| `dstop` | Stop all running containers (asks first) |
+| `dstop [names]` | Stop the named containers, or all running ones (asks first) |
 | `dprune` | System prune (asks first) |
 
 ### SSH & Remote
@@ -469,7 +482,8 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | p10k-style install wizard | ✅ | — | — | — |
 | 145+ commands (Unix-style + git/net/security/sysadmin) | ✅ | partial | — | — |
 | Prompt theming | ✅ (via Oh My Posh) | ✅ (via Oh My Posh) | ✅ (engine) | ✅ (engine) |
-| Hash-verified self-update + full uninstall | ✅ | ✅ | n/a | n/a |
+| Self-update checked against published hashes | ✅ | — (a hash compare only detects changes) | n/a | n/a |
+| Full uninstall | ✅ | — | n/a | n/a |
 | PS 5.1 + PS 7 (guarded forks) | ✅ | ✅ | ✅ | ✅ (cross-shell) |
 | Secret-scrubbed history | ✅ | — | — | — |
 | Customization surfaces | `user-settings.json` + `profile_user.ps1` + `plugins/` + `.psprc.ps1` | profile edits | themes | `starship.toml` |
@@ -490,25 +504,28 @@ PowerShellPerfect bundles a **prompt** (via Oh My Posh), a **command suite**, an
 | Setup blocked by Windows Defender (Controlled Folder Access), often shown as `Could not find file` | Allow PowerShell through for the duration of the install and remove it afterwards (see [Install](#install-alternatives)). Moving the clone does not help: it is the write to `Documents` that is blocked. |
 | `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. (The install commands run an in-memory scriptblock, which isn't subject to the script-file execution policy.) |
 | Prompt shows boxes / missing glyphs | The terminal font isn't a Nerd Font. Set your Windows Terminal profile font to the one setup installed (e.g. *CaskaydiaCove Nerd Font*) and restart WT. |
-| `oh-my-posh` not found right after install | Reopen the terminal (PATH refresh) or run `Update-SessionPathFromRegistry`; confirm with `psp-doctor`. |
+| `oh-my-posh` not found right after install | Open a new terminal, or run `. reload` in the current one; confirm with `psp-doctor`. |
+| Warning that Oh My Posh at `<path>` is older than 29.35.1 (CVE-2026-73505) | Builds before 29.35.1 run template code taken from folder names, so the prompt never uses them. Run `Update-Tools` to install the portable build, which the prompt then uses, or update or remove that install. |
 | Windows Terminal settings keep changing back | Another tool also writes `settings.json`. Pick one owner: set `windowsTerminal.manage` to `false` in `user-settings.json` to let the other tool have it, or stop the other tool. `psp-doctor` shows whether the file is a symlink and who manages it. |
 | A `.psprc.ps1` stopped loading | It changed since you approved it (a pull, a checkout). Review it, then run `Add-TrustedDirectory` in that directory again. `psp-doctor` lists directories that need re-approval. |
 | Turned a feature off in the wizard but it still loads | Check the `features` block in `user-settings.json`, then restart PowerShell. |
+| Prompt feels slow | Run `psp-doctor`: a WARN on Oh My Posh means the MSIX build is in use (about 30 ms per prompt for package activation), and `Update-Tools` switches to the portable build. In git repositories each prompt runs `git status`; keep `features.fastGitPrompt` on so themes do not add git calls for upstream icons and stash counts. |
+| A theme is refused because it "can run commands on every prompt" | The message names what was found (a `command` segment, a template function such as `cmd`, or `extends`). Read the theme, then set `theme.allowCommands` to `true` in `user-settings.json` if you trust it. |
 | Something feels off | Run `psp-doctor` (alias for `Test-ProfileHealth`): OK/WARN/FAIL per check across version, tools, caches, fonts, PATH, and modules. Setup logs are in `%LOCALAPPDATA%\PowerShellProfile\logs`. |
 
 ## Tests
 
-Everything in `tests/` is tracked. Run the suites from a normal (non-elevated) shell; they refuse to run elevated unless you pass `-AllowElevated`, which is meant for disposable VMs and CI runners.
+Everything in `tests/` is tracked. Run the suites from a normal (non-elevated) shell: `unit.ps1`, `test.ps1`, `ci-functional.ps1`, `rawhunt.ps1` and the test steps of `locallab.ps1` refuse to run elevated unless you pass `-AllowElevated`, which is meant for disposable VMs and CI runners. `lint.ps1` and `smoke.ps1` do not check.
 
 | File | Run | Purpose |
 | --- | --- | --- |
 | `tests/unit.ps1` | `pwsh -NoProfile -File tests/unit.ps1` (also with `powershell`) | Regression tests: Windows Terminal change records, uninstall semantics, `.psprc.ps1` approval, hash gates in `Update-Profile` and `setup.ps1`, wizard input checks, encoding, command guards. Fully sandboxed, no network |
-| `tests/lint.ps1` | `pwsh -NoProfile -File tests/lint.ps1` | PSScriptAnalyzer 1.25.0 with `PSScriptAnalyzerSettings.psd1`, as in CI |
+| `tests/lint.ps1` | `pwsh -NoProfile -File tests/lint.ps1` | PSScriptAnalyzer 1.25.0 with `PSScriptAnalyzerSettings.psd1`, as in CI. Installs that version for the current user when it is missing; `-NoInstall` fails instead |
 | `tests/smoke.ps1` | `pwsh -NoProfile -File tests/smoke.ps1` | Sandboxed non-interactive load with a load-time budget |
 | `tests/test.ps1` | `pwsh -NoProfile -File tests/test.ps1` | Full local gate: lint, PS5 parse, static scans, sandboxed install/uninstall/lifecycle, both regression runs, every command in a sandbox, coverage audit. Commands that need the internet are skipped offline |
 | `tests/ci-functional.ps1` | GitHub Actions `functional` job | Install via `setup.ps1 -LocalRepo -CiMode` into a sandbox, run the command matrix with third-party endpoints mocked, coverage audit (at least 60% of exports executed), uninstall. `-LiveNetwork` uses the real endpoints (weekly scheduled run) |
 | `tests/rawhunt.ps1` | `pwsh -NoProfile -File tests/rawhunt.ps1 -AllowSideEffects` | Not sandboxed: exercises the real profile with real I/O (live services, clipboard, a public paste upload, winget). Opt-in only |
-| `tests/locallab.ps1` | `pwsh -NoProfile -File tests/locallab.ps1` | Dev harness: runs the checks and optionally installs this checkout (`-Install`, `-FullInstall`, `-Wizard`); `-Restore` rolls back to the last backup |
+| `tests/locallab.ps1` | `pwsh -NoProfile -File tests/locallab.ps1` | Dev harness: runs the checks and optionally installs this checkout (`-Install`, `-FullInstall`, `-Wizard`); `-Restore` copies back only the two profile files from its last backup in `%TEMP%`, not Windows Terminal settings or caches |
 
 CI (`.github/workflows/ci.yml`) runs three jobs on every push/PR: **lint** (PSScriptAnalyzer, PS5 parse, sandboxed loads with a load-time budget, static scans), **install-flow** (config and pin checks, curated data, setup structure, regression tests on PS 5.1 and 7), and **functional** (the end-to-end suite above). `scheduled.yml` runs the functional suite against the real endpoints every week and checks that every pinned download still matches its hash; `release.yml` publishes tagged releases. Which jobs block a merge is a repository ruleset setting, not part of the workflow files.
 
@@ -523,4 +540,6 @@ Further ideas:
 
 ## License
 
-MIT. Use it, fork it, rip out what you need. Credit appreciated, not required.
+MIT, see [LICENSE](LICENSE). The profile is derived from [ChrisTitusTech/powershell-profile](https://github.com/ChrisTitusTech/powershell-profile), so the license carries his 2025 copyright next to this project's. Use it, fork it, take what you need; copies and substantial portions must keep the copyright and permission notice.
+
+Not affiliated with or endorsed by Microsoft.

@@ -8,7 +8,7 @@ body:
     attributes:
       label: Pre-flight checklist
       options:
-        - label: I have run `Update-Profile` and the issue persists
+        - label: I have checked the [troubleshooting table](https://github.com/26zl/PowerShellPerfect#troubleshooting)
         - label: I have run `Clear-ProfileCache` and the issue persists
         - label: I have searched existing issues for duplicates
           required: true
@@ -30,6 +30,15 @@ body:
       label: Windows version
       description: "Run `[System.Environment]::OSVersion.Version` or `winver`"
       placeholder: "e.g. Windows 11 24H2 (26200)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: psp-doctor
+    attributes:
+      label: psp-doctor output
+      description: 'Run `psp-doctor` and paste the output: it shows the profile version, the commit it was installed from, and the state of tools, caches and fonts. Paths include your user name; edit it out if you like. If the profile does not load, say so.'
+      render: text
     validations:
       required: true
 

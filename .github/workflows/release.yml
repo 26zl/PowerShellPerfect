@@ -27,6 +27,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history, so the next step can see whether the tagged commit is on main.
+          fetch-depth: 0
+
+      - name: Check that the tagged commit is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A tag on a commit that never reached main skipped review and CI, so it is not released.
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_SHA} is not on main. Tag a commit that is on main."
+            exit 1
+          fi
 
       - name: Build release files from the tagged commit
         shell: bash
@@ -47,17 +59,11 @@ jobs:
           (cd dist && sha256sum $files > SHA256SUMS.txt)
           hash() { sha256sum "dist/$1" | cut -d' ' -f1 | tr 'a-f' 'A-F'; }
           bundle=$(printf 'profile:%s:theme:%s:terminal:%s' "$(hash Microsoft.PowerShell_profile.ps1)" "$(hash theme.json)" "$(hash terminal-config.json)" | sha256sum | cut -d' ' -f1 | tr 'a-f' 'A-F')
-          # Release notes: the CHANGELOG section for this version plus how to verify and install.
-          awk -v v="${version}" '$0 ~ "^## \\[" v "\\]" {found=1; next} found && /^## \[/ {exit} found {print}' CHANGELOG.md > notes.md
-          if [ ! -s notes.md ]; then
-            echo "::error::CHANGELOG.md has no section for ${version}"
-            exit 1
-          fi
+          # Release notes: how to verify and install, followed by the notes GitHub generates from the merged pull requests.
           {
-            echo
             echo "## Verify and install"
             echo
-            echo "Each file's SHA-256 is in \`SHA256SUMS.txt\`; \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\` checks that it was built here from this tag."
+            echo "Each file's SHA-256 is in \`SHA256SUMS.txt\`; \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --source-ref refs/tags/${TAG} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml\` checks that it was built by this workflow from this tag."
             echo "\`setup.ps1 -Ref ${TAG}\` and \`Update-Profile -Ref ${TAG}\` check their downloads against \`SHA256SUMS.txt\` automatically."
             echo "Install bundle hash (\`-ExpectedSha256\`): \`${bundle}\`"
             echo
@@ -77,6 +83,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Upload the files to a draft first, so an immutable release is published complete.
-          gh release create "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag --title "PowerShellPerfect ${TAG}" --notes-file notes.md
+          # Upload the files to a draft first, so the release is complete when it is published (required for immutable releases).
+          gh release create "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag --title "PowerShellPerfect ${TAG}" --notes-file notes.md --generate-notes
           gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false

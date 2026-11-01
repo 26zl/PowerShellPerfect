@@ -69,7 +69,6 @@ function Get-SettledClipboard {
 
 Write-Host "`n==================== RAW Bug Hunt ====================" -ForegroundColor Cyan
 
-# Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $profilePath = Join-Path $repoRoot 'Microsoft.PowerShell_profile.ps1'
 $setupPath = Join-Path $repoRoot 'setup.ps1'
@@ -80,15 +79,6 @@ $env:CI = 'true'
 Remove-Item env:CI
 
 Write-Host "Profile loaded from: $repoRoot" -ForegroundColor DarkGray
-
-# Extract nested Merge-JsonObject via AST (lives inside Update-Profile)
-$tokens = $null; $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
-$mergeFn = $ast.FindAll({
-    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $args[0].Name -eq 'Merge-JsonObject'
-}, $true) | Select-Object -First 1
-if ($mergeFn) { . ([scriptblock]::Create($mergeFn.Extent.Text)) }
 
 # Extract setup.ps1 functions and data via AST; the helpers it shares with the profile are already loaded from the profile.
 $tokens2 = $null; $parseErrors2 = $null
@@ -106,11 +96,9 @@ $ws = Join-Path $env:TEMP "psp-raw-$([System.IO.Path]::GetRandomFileName())"
 New-Item -ItemType Directory -Path $ws -Force | Out-Null
 $origDir = Get-Location
 
-# #####################################################################
-#  PART 1: UTILITY FUNCTIONS
-# #####################################################################
+# PART 1: UTILITY FUNCTIONS
 
-# --- File Operations ---
+# File Operations
 Write-Host "`n--- File Operations ---" -ForegroundColor Magenta
 
 $tf = Join-Path $ws "testfile.txt"
@@ -231,7 +219,7 @@ T 'trash' {
     if (Test-Path $trashFile) { throw "file not moved to recycle bin" }
 }
 
-# --- Navigation ---
+# Navigation
 Write-Host "`n--- Navigation ---" -ForegroundColor Magenta
 
 T 'docs' {
@@ -250,21 +238,19 @@ T 'dtop' {
     if ($after.Path -notmatch 'Desktop') { throw "not in Desktop: $after" }
 }
 
-# --- Listing (eza/bat) ---
+# Listing (eza/bat)
 Write-Host "`n--- Listing ---" -ForegroundColor Magenta
 
-T 'ls' { & (Get-Command 'ls').Name $ws }
 T 'la' { la $ws }
 T 'll' { ll $ws }
 T 'lt' { lt $ws }
-T 'cat' { & (Get-Command 'cat').Name $tf }
 T 'grep (in file)' {
     Set-Location $ws
     grep "hello" $ws
     Set-Location $origDir
 }
 
-# --- System ---
+# System
 Write-Host "`n--- System ---" -ForegroundColor Magenta
 
 T 'uptime' { & (Get-Command 'uptime').Name }
@@ -278,7 +264,7 @@ T 'eventlog' { & (Get-Command 'eventlog').Name 5 }
 T 'pgrep' { $r = pgrep "pwsh"; if (-not $r) { throw "no pwsh process found" } }
 T 'ports' { ports }
 
-# --- Network ---
+# Network
 Write-Host "`n--- Network ---" -ForegroundColor Magenta
 
 T 'pubip' { $r = pubip; if (-not $r -or $r.Trim().Length -lt 5) { throw "invalid IP: $r" } }
@@ -297,7 +283,7 @@ T 'http GET' { $r = http "https://httpbin.org/get"; if (-not $r) { throw "no res
 T 'http POST' { $r = http "https://httpbin.org/post" -Method POST -Body '{"test":true}'; if (-not $r) { throw "no response" } }
 T 'hb' { hb $tf -Confirm:$false }  # LIVE NETWORK: real upload to bin.christitus.com (rawhunt exercises real I/O by design)
 
-# --- Crypto & Encoding ---
+# Crypto & Encoding
 Write-Host "`n--- Crypto & Encoding ---" -ForegroundColor Magenta
 
 T 'hash (SHA256)' {
@@ -390,7 +376,7 @@ T 'urldecode' {
     if ($r -ne "hello world&foo=bar") { throw "wrong decoding: $r" }
 }
 
-# --- Developer ---
+# Developer
 Write-Host "`n--- Developer ---" -ForegroundColor Magenta
 
 T 'prettyjson (file)' {
@@ -408,7 +394,7 @@ T 'timer' {
     timer { Start-Sleep -Milliseconds 50 }
 }
 
-# --- Git (temp repo) ---
+# Git (temp repo)
 Write-Host "`n--- Git ---" -ForegroundColor Magenta
 
 $gitDir = Join-Path $ws "gitrepo"
@@ -430,8 +416,8 @@ T 'ga' {
     if ($status -match '^\?\?') { throw "unstaged files remain" }
 }
 
-T 'gc (commit)' {
-    & (Get-Command 'gc' -CommandType Function).Name "test commit message"
+T 'gcmsg (commit)' {
+    gcmsg "test commit message"
     $log = git log --oneline -1 2>&1
     if ($log -notmatch "test commit") { throw "commit not found: $log" }
 }
@@ -445,7 +431,7 @@ T 'gcom' {
 
 Set-Location $origDir
 
-# --- Clipboard ---
+# Clipboard
 Write-Host "`n--- Clipboard ---" -ForegroundColor Magenta
 
 T 'cpy' {
@@ -457,7 +443,7 @@ T 'pst' {
     if ($r -ne "raw-test-clipboard-value") { throw "clipboard mismatch: expected 'raw-test-clipboard-value', got '$r'" }
 }
 
-# --- Docker (if available) ---
+# Docker (if available)
 $hasDocker = [bool](Get-Command docker -ErrorAction SilentlyContinue)
 $dockerRunning = $false
 if ($hasDocker) { $null = docker info 2>&1; $dockerRunning = ($LASTEXITCODE -eq 0) }
@@ -468,9 +454,7 @@ if ($dockerRunning) {
     T 'dimg' { dimg }
 }
 
-# #####################################################################
-#  PART 2: CACHING
-# #####################################################################
+# PART 2: CACHING
 Write-Host "`n--- Caching: OMP & zoxide init ---" -ForegroundColor Magenta
 
 $realCacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
@@ -518,7 +502,7 @@ T 'zoxide init cache format' {
     if ($header -notmatch '^# ZOXIDE_CACHE_VERSION:') { throw "Invalid header: $header" }
 }
 
-# --- Cache corruption recovery ---
+# Cache corruption recovery
 Write-Host "`n--- Cache corruption recovery ---" -ForegroundColor Magenta
 
 T 'zoxide cache: wrong version invalidation' {
@@ -546,9 +530,7 @@ T 'Corrupt JSON config recovery' {
     if (-not $recovered) { throw "Corrupt JSON was not caught" }
 }
 
-# #####################################################################
-#  PART 3: CONFIG MERGE
-# #####################################################################
+# PART 3: CONFIG MERGE
 Write-Host "`n--- Config merge (Merge-JsonObject) ---" -ForegroundColor Magenta
 
 T 'Merge-JsonObject: flat override' {
@@ -604,9 +586,7 @@ T 'Config merge: keybindings append (not replace)' {
     if ($terminalConfig.keybindings[1].keys -ne 'ctrl+b') { throw "user binding not appended" }
 }
 
-# #####################################################################
-#  PART 4: WINDOWS TERMINAL SETTINGS
-# #####################################################################
+# PART 4: WINDOWS TERMINAL SETTINGS
 Write-Host "`n--- Windows Terminal settings ---" -ForegroundColor Magenta
 
 $wtSettingsPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
@@ -657,21 +637,23 @@ if ($hasWT) {
         if (-not $scheme) { throw "Scheme '$schemeName' not in schemes array" }
     }
 
-    T 'WT settings: keybinding upsert format' {
-        $_q = [char]34
-        $jsoncPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*$"
-        $raw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncPattern, ''
-        $wt = $raw | ConvertFrom-Json
-        $hasNewFormat = $null -ne $wt.PSObject.Properties['keybindings']
-        if ($hasNewFormat) {
-            $kb = $wt.keybindings | Where-Object { $_.keys -eq 'ctrl+a' }
-            if (-not $kb) { throw "ctrl+a not in keybindings array" }
-            if (-not $kb.id) { throw "keybinding missing id" }
-            $action = $wt.actions | Where-Object { $_.id -eq $kb.id }
-            if (-not $action) { throw "No action for id '$($kb.id)'" }
-        } else {
-            $action = $wt.actions | Where-Object { $_.keys -eq 'ctrl+a' }
-            if (-not $action) { throw "ctrl+a not in actions (old format)" }
+    T 'WT settings: profile keybindings match terminal-config.json and user-settings.json' {
+        $wt = Read-JsonFile $wtSettingsPath
+        # The profile binds only the keys these two files list; any other User.profile.* binding is a leftover.
+        $wanted = @()
+        foreach ($name in 'terminal-config.json', 'user-settings.json') {
+            $file = Join-Path $env:LOCALAPPDATA "PowerShellProfile\$name"
+            if (Test-Path $file) { $wanted += @((Read-JsonFile $file).keybindings | Where-Object { $_ } | ForEach-Object { [string]$_.keys }) }
+        }
+        if ($null -ne $wt.PSObject.Properties['keybindings']) {
+            foreach ($kb in @($wt.keybindings | Where-Object { [string]$_.id -like 'User.profile.*' })) {
+                if ($wanted -notcontains [string]$kb.keys) { throw "leftover profile keybinding $($kb.id) for $($kb.keys)" }
+                if (-not ($wt.actions | Where-Object { $_.id -eq $kb.id })) { throw "No action for id '$($kb.id)'" }
+            }
+            foreach ($k in $wanted) { if (-not ($wt.keybindings | Where-Object { $_.keys -eq $k })) { throw "$k is not bound" } }
+        }
+        else {
+            foreach ($k in $wanted) { if (-not ($wt.actions | Where-Object { $_.keys -eq $k })) { throw "$k not in actions (old format)" } }
         }
     }
 
@@ -689,7 +671,10 @@ if ($hasWT) {
             foreach ($p in $pwshProfiles) {
                 $cmd = if ($p.commandline) { $p.commandline } else { '' }
                 if ($cmd -match '(?i)-(Command|File|EncodedCommand)') { continue }
-                if ($cmd -and $cmd -notmatch '-NoLogo') {
+                # A command line that starts with another program (cmd.exe /k pwsh) is left alone, as the profile does.
+                if ($cmd -notmatch '(?i)^\s*("(?:[^"]*[\\/])?(?:pwsh|powershell)(?:\.exe)?"|(?:[^\s"]*[\\/])?(?:pwsh|powershell)(?:\.exe)?)(?=\s|$)') { continue }
+                # PowerShell accepts any prefix of -NoLogo, such as -nol.
+                if ($cmd -notmatch '(?i)(^|\s)[-/]nol') {
                     throw "Profile '$($p.name)' missing -NoLogo: $cmd"
                 }
             }
@@ -732,9 +717,7 @@ if ($hasWT) {
     Write-Host "  SKIP  Windows Terminal not installed" -ForegroundColor DarkGray
 }
 
-# #####################################################################
-#  PART 5: SETUP.PS1 FUNCTIONS
-# #####################################################################
+# PART 5: SETUP.PS1 FUNCTIONS
 Write-Host "`n--- setup.ps1 functions ---" -ForegroundColor Magenta
 
 T 'setup.ps1 parses without errors' {
@@ -801,9 +784,7 @@ T 'Merge-JsonObject (shared with setup.ps1)' {
     if ($b.x -ne 99 -or $b.n.a -ne 10 -or $b.n.b -ne 20) { throw "merge mismatch" }
 }
 
-# #####################################################################
-#  PART 6: UNINSTALL-PROFILE
-# #####################################################################
+# PART 6: UNINSTALL-PROFILE
 Write-Host "`n--- Uninstall-Profile (-WhatIf) ---" -ForegroundColor Magenta
 
 T 'Uninstall-Profile -WhatIf (no changes)' {
@@ -1020,9 +1001,7 @@ finally {
     }
 }
 
-# #####################################################################
-#  PART 7: PROFILE LOAD & INIT
-# #####################################################################
+# PART 7: PROFILE LOAD & INIT
 Write-Host "`n--- Profile load & init ---" -ForegroundColor Magenta
 
 T 'Profile loads without errors (CI mode)' {
@@ -1096,9 +1075,7 @@ T 'Get-SystemBootTime' {
     if ($r -gt (Get-Date)) { throw "boot time is in the future: $r" }
 }
 
-# #####################################################################
-#  PART 8: EDGE CASES
-# #####################################################################
+# PART 8: EDGE CASES
 Write-Host "`n--- Edge cases ---" -ForegroundColor Magenta
 
 T 'touch (no args)' {
@@ -1155,8 +1132,8 @@ T 'cpy (no args)' {
     Test-Throws { cpy } "cpy should require input text"
 }
 
-T 'gc (no args)' {
-    Test-Throws { & (Get-Command 'gc' -CommandType Function).Name } "gc should require a commit message"
+T 'gcmsg (no args)' {
+    Test-Throws { gcmsg } "gcmsg should require a commit message"
 }
 
 T 'gcom (no args)' {
@@ -1274,9 +1251,7 @@ T 'setup.ps1 shared helpers exist in the profile' {
     $null = Get-PspFunctionSource -Path $profilePath -Name $script:SharedFunctionNames
 }
 
-# #####################################################################
 #  CLEANUP & SUMMARY
-# #####################################################################
 Set-Location $origDir
 Remove-Item $ws -Recurse -Force -ErrorAction SilentlyContinue
 

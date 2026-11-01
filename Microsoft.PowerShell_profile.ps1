@@ -8,13 +8,32 @@ if (-not [bool]$env:AI_AGENT -and ([bool]$env:AGENT_ID -or [bool]$env:CLAUDE_COD
     $env:AI_AGENT = '1'
 }
 
-# Detect non-interactive environments that should skip network calls and UI setup.
+# A run of a script or command (-File, -Command, -EncodedCommand) never shows a prompt unless -NoExit comes before it.
+# Only the documented spellings are listed (case-insensitive -in, no regex: this runs on every start); others count as interactive.
+$_pspScriptRun = $false
+$_pspArgs = [Environment]::GetCommandLineArgs()
+foreach ($_pspArg in $_pspArgs) {
+    if ($_pspArg -in '-noe', '-noexit', '--noexit', '/noexit') { break }
+    if ($_pspArg -in '-c', '-command', '--command', '/c', '/command', '-f', '-file', '--file', '/f', '/file', '-e', '-ec', '-enc', '-encodedcommand', '/e', '/ec', '/encodedcommand') {
+        $_pspScriptRun = $true
+        break
+    }
+}
+
+# Detect non-interactive environments that should skip network calls and UI setup; CI=false or CI=0 does not count as CI.
 $isInteractive = [Environment]::UserInteractive -and
--not [bool]$env:CI -and
+-not ([bool]$env:CI -and $env:CI -ne 'false' -and $env:CI -ne '0') -and
 -not [bool]$env:AI_AGENT -and
 -not ($host.Name -eq 'Default Host') -and
 -not $(try { [Console]::IsOutputRedirected } catch { $false }) -and
--not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '(?i)^-NonI' })
+-not (@($_pspArgs) -like '-NonI*') -and
+-not $_pspScriptRun
+
+# Reserve 128 MB so no GC pauses the load or first prompt; Exit-PspNoGcRegion ends the reservation.
+$script:PspNoGcRegion = $false
+if ($isInteractive) {
+    try { $script:PspNoGcRegion = [System.GC]::TryStartNoGCRegion(128MB) } catch { $script:PspNoGcRegion = $false }
+}
 
 # Enforce TLS 1.2 for network commands on Windows PowerShell 5.1.
 if ($PSVersionTable.PSVersion.Major -lt 6) {
@@ -24,12 +43,12 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 # Return the profile cache directory, resolved from LOCALAPPDATA at call time so redirected environments are honored.
 function Get-PspCacheDir {
     $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [System.IO.Path]::GetTempPath() }
-    Join-Path $base 'PowerShellProfile'
+    [System.IO.Path]::Combine($base, 'PowerShellProfile')
 }
 
-# Kept for scripts that read it; profile functions call Get-PspCacheDir instead.
+# Load-time code reads $cacheDir; functions call Get-PspCacheDir.
 $cacheDir = Get-PspCacheDir
-if (-not (Test-Path -LiteralPath $cacheDir)) {
+if (-not [System.IO.Directory]::Exists($cacheDir)) {
     # Cache creation is best-effort.
     try { New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction Stop | Out-Null }
     catch { Write-Warning "Could not create cache dir '$cacheDir': $($_.Exception.Message)" }
@@ -48,7 +67,7 @@ $script:ProtectedProcessNames = @('System', 'Idle', 'Registry', 'csrss', 'winini
 
 # Define tool installation, upgrade, cache, and version metadata.
 $script:ProfileTools = @(
-    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = $null; VerCmd = "version"; UpgradeStrategy = "preserve-direct" }
+    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = $null; VerCmd = "version"; UpgradeStrategy = "portable" }
     @{ Name = "eza"; Id = "eza-community.eza"; Cmd = "eza"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
     @{ Name = "zoxide"; Id = "ajeetdsouza.zoxide"; Cmd = "zoxide"; Cache = "zoxide-init.ps1"; VerCmd = "--version"; UpgradeStrategy = "winget" }
     @{ Name = "fzf"; Id = "junegunn.fzf"; Cmd = "fzf"; Cache = $null; VerCmd = "--version"; UpgradeStrategy = "winget" }
@@ -85,6 +104,8 @@ $script:PSP = @{
         commandOverrides = $false
         # Keep the weekly GitHub update check disabled by default.
         updateCheck      = $false
+        # fastGitPrompt renders oh-my-posh from a tuned theme copy without per-prompt git calls for upstream icons and stash counts.
+        fastGitPrompt    = $true
     }
     # Return the collapsed prompt text used by the customizable transient prompt.
     TransientPrompt = { "$ " }
@@ -196,6 +217,8 @@ function Invoke-DownloadWithRetry {
         [int]$MaxAttempts = 2,
         [int]$BackoffSec = 2
     )
+    # The progress display slows large downloads on Windows PowerShell 5.1 a lot; this scope only.
+    $ProgressPreference = 'SilentlyContinue'
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
@@ -220,7 +243,7 @@ function Invoke-DownloadWithRetry {
 
 # Quote arguments for a single native command line using the CommandLineToArgvW rules (quotes and trailing backslashes).
 function ConvertTo-NativeArgumentLine {
-    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ArgumentList)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$ArgumentList)
     ($ArgumentList | ForEach-Object {
         if ($_ -eq '') { '""' }
         elseif ($_ -notmatch '[\s"]') { $_ }
@@ -293,14 +316,23 @@ function Write-Utf8FileAtomic {
 # Parse JSON that may contain // or /* */ comments and trailing commas (Windows Terminal JSONC); string contents are never altered.
 function ConvertFrom-JsonC {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-    $keepStrings = [System.Text.RegularExpressions.MatchEvaluator] {
-        param($m)
-        if ($m.Value[0] -eq [char]34) { $m.Value } elseif ($m.Value.StartsWith('/*')) { ' ' } else { '' }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    # Text that parses as it is skips the comment scan, which keeps it off the startup path; PowerShell 7 parses comments and
+    # trailing commas itself, and on Windows PowerShell such text fails here and is cleaned below.
+    $parsed = $null
+    $needsCleaning = $false
+    try { $parsed = $Text | ConvertFrom-Json -ErrorAction Stop }
+    catch { $needsCleaning = $true }
+    if ($needsCleaning) {
+        $keepStrings = [System.Text.RegularExpressions.MatchEvaluator] {
+            param($m)
+            if ($m.Value[0] -eq [char]34) { $m.Value } elseif ($m.Value.StartsWith('/*')) { ' ' } else { '' }
+        }
+        $noComments = [regex]::Replace($Text, '"(?:[^"\\]|\\.)*"|//[^\r\n]*|/\*[\s\S]*?\*/', $keepStrings)
+        $clean = [regex]::Replace($noComments, '"(?:[^"\\]|\\.)*"|,(?=\s*[}\]])', $keepStrings)
+        if ([string]::IsNullOrWhiteSpace($clean)) { return $null }
+        $parsed = $clean | ConvertFrom-Json -ErrorAction Stop
     }
-    $noComments = [regex]::Replace($Text, '"(?:[^"\\]|\\.)*"|//[^\r\n]*|/\*[\s\S]*?\*/', $keepStrings)
-    $clean = [regex]::Replace($noComments, '"(?:[^"\\]|\\.)*"|,(?=\s*[}\]])', $keepStrings)
-    if ([string]::IsNullOrWhiteSpace($clean)) { return $null }
-    $parsed = $clean | ConvertFrom-Json -ErrorAction Stop
     if ($parsed -is [System.Collections.IList]) { return , $parsed }
     return $parsed
 }
@@ -484,8 +516,16 @@ function Get-LatestMainCommitSha {
 # Return the pinned versions of third-party components the profile and setup.ps1 install at runtime.
 function Get-PspComponentPins {
     @{
-        PSFzf      = '2.7.12'
-        HttpServer = '14.1.1'
+        PSFzf           = '2.7.12'
+        HttpServer      = '14.1.1'
+        # The portable oh-my-posh build: release version and each Windows asset's SHA-256 from that release's checksums.txt.
+        OhMyPosh        = '31.9.1'
+        OhMyPoshSha256  = @{
+            'posh-windows-amd64.exe' = 'C2B34D2E8D9DB243172170CE4ADB70B0BD1476D29D355BC783CFA886724EB27E'
+            'posh-windows-arm64.exe' = 'D9694FFA0EF7C24A6518C29AB66E995DF7C1DBC24031229888C742ED83486A67'
+        }
+        # The oldest oh-my-posh the prompt renders with: earlier builds run template code taken from folder names (CVE-2026-73505).
+        OhMyPoshMinimum = '29.35.1'
     }
 }
 
@@ -564,10 +604,48 @@ function Get-ExternalCommandPath {
     return $null
 }
 
+# Resolve an executable through direct PATH file probes, which stays fast when the tool is missing (startup checks use this).
+function Find-ProfileExecutable {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    # Get-Command for a missing tool scans every PATH folder for every PATHEXT extension; one File.Exists per folder is much cheaper.
+    $onWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $suffix = [string][System.IO.Path]::DirectorySeparatorChar + $(if ($onWindows -and -not [System.IO.Path]::HasExtension($Name)) { $Name + '.exe' } else { $Name })
+    foreach ($dir in ([string]$env:PATH).Split([System.IO.Path]::PathSeparator)) {
+        if ($dir -and [System.IO.File]::Exists($dir + $suffix)) { return [System.IO.Path]::GetFullPath($dir + $suffix) }
+    }
+    return $null
+}
+
+# Check PSModulePath folders for a module directory without the cost of Get-Module -ListAvailable.
+function Test-ProfileModuleInstalled {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    foreach ($root in ([string]$env:PSModulePath).Split([System.IO.Path]::PathSeparator)) {
+        $root = $root.Trim().Trim('"')
+        if ($root -and [System.IO.Directory]::Exists($root + [System.IO.Path]::DirectorySeparatorChar + $Name)) { return $true }
+    }
+    return $false
+}
+
+# Append the registry PATH entries this session lacks (new installs) and keep the session's own entries, such as an active venv.
 function Update-SessionPathFromRegistry {
-    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    $env:PATH = (@($machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+    $sessionEntries = @(([string]$env:PATH) -split ';' | Where-Object { $_ })
+    $known = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $sessionEntries) { $null = $known.Add($entry.TrimEnd('\')) }
+    $added = [System.Collections.Generic.List[string]]::new()
+    foreach ($scope in 'Machine', 'User') {
+        foreach ($entry in @(([string][System.Environment]::GetEnvironmentVariable('PATH', $scope)) -split ';')) {
+            if (-not [string]::IsNullOrWhiteSpace($entry) -and $known.Add($entry.TrimEnd('\'))) { $added.Add($entry) }
+        }
+    }
+    if ($added.Count -gt 0) { $env:PATH = (@($sessionEntries) + @($added)) -join ';' }
 }
 
 # Manage restorable tab titles for long-running commands.
@@ -585,10 +663,6 @@ function Pop-TabTitle {
     try { $Host.UI.RawUI.WindowTitle = $OldTitle } catch { $null = $_ }
 }
 
-# Return the first Windows Terminal settings file found across supported install variants (or $null).
-function Get-WindowsTerminalSettingsPath {
-    @(Get-WindowsTerminalSettingsPaths)[0]
-}
 
 # Return all Windows Terminal settings files found across supported install variants.
 function Get-WindowsTerminalSettingsPaths {
@@ -725,7 +799,8 @@ function Set-WtRecordedKeybinding {
     $keys = [string](Get-PspProp $Binding 'keys')
     if ([string]::IsNullOrWhiteSpace($keys)) { return }
     $command = Get-PspProp $Binding 'command'
-    $id = 'User.profile.' + ($keys -replace '[^a-zA-Z0-9]', '')
+    # Punctuation is written as hex so ctrl+= and ctrl+- get different ids; keys made of letters and digits keep their earlier ids.
+    $id = 'User.profile.' + [regex]::Replace(($keys -replace '\+', ''), '[^a-zA-Z0-9]', { param($m) '{0:x2}' -f [int][char]$m.Value })
     $newFormat = Test-PspProp $Root 'keybindings'
     $record = Get-PspProp $Section $keys
     if (-not $record) {
@@ -754,7 +829,7 @@ function Set-WtRecordedKeybinding {
         $bindingEntry = [PSCustomObject]@{ id = $id; keys = $keys }
         Set-PspProp $Root 'actions' ([object[]]($actions + $action))
         Set-PspProp $Root 'keybindings' ([object[]]($bindings + $bindingEntry))
-        $record.format = 'new'; $record.appliedAction = $action; $record.appliedBinding = $bindingEntry
+        Set-PspProp $record 'id' $id; $record.format = 'new'; $record.appliedAction = $action; $record.appliedBinding = $bindingEntry
     }
     else {
         $actions = @($actions | Where-Object { (Get-PspProp $_ 'keys') -ne $keys })
@@ -762,6 +837,59 @@ function Set-WtRecordedKeybinding {
         Set-PspProp $Root 'actions' ([object[]]($actions + $action))
         $record.format = 'old'; $record.appliedAction = $action; $record.appliedBinding = $null
     }
+}
+
+# Revert keybindings the profile set earlier for keys the configuration no longer lists, keeping any the user changed since.
+function Remove-WtRetiredKeybinding {
+    param(
+        [Parameter(Mandatory)][object]$Root,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Keybindings,
+        [Parameter(Mandatory)][object]$Section,
+        [AllowNull()][object]$LegacyBaseline
+    )
+    $wantedKeys = @($Keybindings | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-PspProp $_ 'keys') })
+    # The record list is copied first because restored entries are removed from it.
+    foreach ($p in @($Section.PSObject.Properties)) {
+        if ($wantedKeys -contains $p.Name) { continue }
+        if (Restore-WtRecordedKeybinding -Root $Root -Record $p.Value) { Remove-PspProp $Section $p.Name }
+    }
+    # Versions without a change record tagged their bindings User.profile.<keys>; the pre-install copy shows what each replaced.
+    if (-not (Test-PspProp $Root 'keybindings')) { return }
+    $source = if ($null -ne $LegacyBaseline) { $LegacyBaseline } else { [PSCustomObject]@{} }
+    foreach ($binding in (Get-PspArray $Root 'keybindings')) {
+        $bindingId = [string](Get-PspProp $binding 'id')
+        $bindingKeys = [string](Get-PspProp $binding 'keys')
+        if (-not $bindingId.StartsWith('User.profile.', [System.StringComparison]::Ordinal) -or -not $bindingKeys) { continue }
+        if ($wantedKeys -contains $bindingKeys -or (Test-PspProp $Section $bindingKeys)) { continue }
+        $action = (Get-PspArray $Root 'actions') | Where-Object { (Get-PspProp $_ 'id') -eq $bindingId } | Select-Object -First 1
+        if ($null -eq $action) { continue }
+        $removedBindings = @((Get-PspArray $source 'keybindings') | Where-Object { (Get-PspProp $_ 'keys') -eq $bindingKeys })
+        $boundIds = @($removedBindings | ForEach-Object { Get-PspProp $_ 'id' })
+        $removedActions = @((Get-PspArray $source 'actions') | Where-Object { $boundIds -contains (Get-PspProp $_ 'id') })
+        $record = [PSCustomObject]@{ format = 'new'; id = $bindingId; appliedAction = $action; appliedBinding = $binding; removedActions = [object[]]$removedActions; removedBindings = [object[]]$removedBindings }
+        [void](Restore-WtRecordedKeybinding -Root $Root -Record $record)
+    }
+}
+
+# Return $true when a Windows Terminal settings file still holds a binding the profile set for keys the configuration no longer lists.
+function Test-WtRetiredKeybindingPending {
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Keybindings, [Parameter(Mandatory)][string]$ManifestPath)
+    $wantedKeys = @($Keybindings | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-PspProp $_ 'keys') })
+    $files = Get-PspProp (Read-WtChangeManifest -ManifestPath $ManifestPath) 'files'
+    foreach ($path in @(Get-WindowsTerminalSettingsPaths)) {
+        $wt = $null
+        try { $wt = ConvertFrom-JsonC -Text (Get-Utf8FileText $path) } catch { continue }
+        $actions = Get-PspArray $wt 'actions'
+        $section = Get-PspProp (Get-PspProp $files $path.ToLowerInvariant()) 'bindings'
+        foreach ($p in @(Get-WtChangeRecords ([PSCustomObject]@{ bindings = $section }) 'bindings')) {
+            if ($wantedKeys -notcontains $p.Name -and ($actions | Where-Object { Test-PspJsonEqual $_ $p.Value.appliedAction })) { return $true }
+        }
+        foreach ($binding in (Get-PspArray $wt 'keybindings')) {
+            $bindingKeys = [string](Get-PspProp $binding 'keys')
+            if (([string](Get-PspProp $binding 'id')).StartsWith('User.profile.', [System.StringComparison]::Ordinal) -and $bindingKeys -and $wantedKeys -notcontains $bindingKeys -and -not (Test-PspProp $section $bindingKeys)) { return $true }
+        }
+    }
+    return $false
 }
 
 # Return the profiles list of a settings object, including pre-2020 files that keep profiles as a bare list.
@@ -798,9 +926,19 @@ function Set-WtRecordedNoLogo {
             $baseCmd = if ($cmd) { $cmd } else { $null }
         }
         $newCmd = $null
-        if ($cmd -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') { $newCmd = "$cmd -NoLogo" }
-        elseif (-not $cmd -and $src) { $newCmd = $(if ($isPwsh) { 'pwsh.exe -NoLogo' } else { 'powershell.exe -NoLogo' }) }
-        elseif ($cmd -match '-NoLogo' -and -not (Get-PspProp $Section $recordKey)) {
+        # PowerShell accepts any unambiguous prefix of -NoLogo (-nol, -nolo) and a slash in place of the dash.
+        $hasNoLogo = $cmd -match '(?i)(^|\s)[-/]nol'
+        # The switch goes right after the executable so it never becomes part of a script's or command's arguments,
+        # and a command line that starts with another program (cmd.exe /k pwsh, wsl.exe) is left alone.
+        $exeMatch = [regex]::Match($cmd, '^\s*("(?:[^"]*[\\/])?(?:pwsh|powershell)(?:\.exe)?"|(?:[^\s"]*[\\/])?(?:pwsh|powershell)(?:\.exe)?)(?=\s|$)', 'IgnoreCase')
+        if ($cmd -and -not $hasNoLogo -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)' -and $exeMatch.Success) {
+            $newCmd = $exeMatch.Value + ' -NoLogo' + $cmd.Substring($exeMatch.Index + $exeMatch.Length)
+        }
+        elseif (-not $cmd -and $src) {
+            # Generated Preview, x86 and other pwsh variants keep their own executable; only the preferred 'PowerShell' entry uses pwsh.exe from PATH.
+            $newCmd = if (-not $isPwsh) { 'powershell.exe -NoLogo' } elseif ($profName -eq 'PowerShell') { 'pwsh.exe -NoLogo' } else { $null }
+        }
+        elseif ($hasNoLogo -and -not (Get-PspProp $Section $recordKey)) {
             # Adopt a -NoLogo an earlier profile version added (the pre-install copy has the profile without it) so uninstall can remove it.
             $legacyProf = $legacyList | Where-Object { & $matchProfile $_ } | Select-Object -First 1
             if ($null -ne $legacyProf) {
@@ -831,7 +969,8 @@ function Update-WindowsTerminalSettingsFile {
         [string[]]$RemoveDefaults = @(),
         # theme.json windowsTerminal section: colorScheme, cursorColor, scheme, theme, themeDefinition.
         [AllowNull()][object]$WindowsTerminal,
-        # Keybindings as objects with keys and command.
+        # Keybindings as objects with keys and command; a binding the profile set earlier that this list no longer holds is
+        # reverted as on uninstall. Leave the parameter out to keep the profile's keybindings as they are.
         [AllowNull()][object[]]$Keybindings,
         # Append -NoLogo to PowerShell profiles in profiles.list.
         [switch]$NoLogo,
@@ -842,14 +981,13 @@ function Update-WindowsTerminalSettingsFile {
     if ($null -eq $wt) { $wt = [PSCustomObject]@{} }
     $dir = Split-Path -Parent $Path
     $leaf = Split-Path -Leaf $Path
+    # Oldest first by the stamp in the name, since Copy-Item keeps the source LastWriteTime.
     $timestamped = @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.*.bak" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '\.\d{8}-\d{6}\.bak$' } | Sort-Object LastWriteTime)
+        Where-Object { $_.Name -match '\.\d{8}-\d{6}\.bak$' } | Sort-Object Name)
     $manifest = Read-WtChangeManifest -ManifestPath $ManifestPath
     $key = $Path.ToLowerInvariant()
     $entry = Get-PspProp $manifest.files $key
-    # Values first seen in this run are recorded against the file as it was before this write. A value the file
-    # already holds was probably written by an earlier profile version, so it is recorded against the pre-install copy
-    # (settings.json.psp-original, or the oldest timestamped backup left by versions without a change record).
+    # New values are recorded against the file as read; values it already holds against the pre-install copy (.psp-original, else the oldest backup).
     $baseline = Copy-PspObject $wt
     $originalCopy = "$Path.psp-original"
     $legacyBaseline = $null
@@ -875,7 +1013,7 @@ function Update-WindowsTerminalSettingsFile {
     # Rotating backup; a failed backup aborts the write.
     Copy-Item -LiteralPath $Path -Destination ('{0}.{1}.bak' -f $Path, (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force -ErrorAction Stop -Confirm:$false
     Get-ChildItem -LiteralPath $dir -Filter "$leaf.*.bak" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '\.\d{8}-\d{6}\.bak$' } | Sort-Object LastWriteTime -Descending |
+        Where-Object { $_.Name -match '\.\d{8}-\d{6}\.bak$' } | Sort-Object Name -Descending |
         Select-Object -Skip $KeepBackups | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue -Confirm:$false }
 
     $profilesNode = Get-PspProp $wt 'profiles'
@@ -942,6 +1080,9 @@ function Update-WindowsTerminalSettingsFile {
     }
     foreach ($kb in @($Keybindings | Where-Object { $null -ne $_ })) {
         Set-WtRecordedKeybinding -Root $wt -Binding $kb -Section $entry.bindings -Baseline $baseline -LegacyBaseline $legacyBaseline
+    }
+    if ($PSBoundParameters.ContainsKey('Keybindings') -and $null -ne $Keybindings) {
+        Remove-WtRetiredKeybinding -Root $wt -Keybindings $Keybindings -Section $entry.bindings -LegacyBaseline $legacyBaseline
     }
     if ($NoLogo) { Set-WtRecordedNoLogo -Root $wt -Section $entry.commandlines -Baseline $baseline -LegacyBaseline $legacyBaseline }
 
@@ -1062,27 +1203,27 @@ function Get-WtProfileBackups {
         })
 }
 
-# Specific helper to get the path to oh-my-posh executable for cache clearing (since it has a built-in cache clear command instead of a file-based cache)
+# Resolve the oh-my-posh executable, preferring direct installs over the WindowsApps alias.
 function Get-OhMyPoshExecutablePath {
     $candidatePaths = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\oh-my-posh.exe'),
-        (Join-Path $env:ProgramFiles 'oh-my-posh\bin\oh-my-posh.exe')
+        [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
+        [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Programs\oh-my-posh\oh-my-posh.exe'),
+        [System.IO.Path]::Combine($env:ProgramFiles, 'oh-my-posh\bin\oh-my-posh.exe')
     )
 
     $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Process')
     if ($pf86) {
-        $candidatePaths += (Join-Path $pf86 'oh-my-posh\bin\oh-my-posh.exe')
+        $candidatePaths += [System.IO.Path]::Combine($pf86, 'oh-my-posh\bin\oh-my-posh.exe')
     }
 
-    $resolvedPath = Get-ExternalCommandPath -CommandName 'oh-my-posh'
-    $windowsAppsRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    $resolvedPath = Find-ProfileExecutable -Name 'oh-my-posh'
+    $windowsAppsRoot = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Microsoft\WindowsApps')
     if ($resolvedPath -and $resolvedPath -notlike "$windowsAppsRoot*") {
         return $resolvedPath
     }
 
-    foreach ($candidatePath in ($candidatePaths | Select-Object -Unique)) {
-        if (-not (Test-Path -LiteralPath $candidatePath)) { continue }
+    foreach ($candidatePath in $candidatePaths) {
+        if (-not [System.IO.File]::Exists($candidatePath)) { continue }
 
         $candidateDir = Split-Path -Path $candidatePath -Parent
         $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
@@ -1093,15 +1234,43 @@ function Get-OhMyPoshExecutablePath {
         return $candidatePath
     }
 
-    # Last resort: the WindowsApps app-execution alias. MSIX/Store installs of oh-my-posh
-    # expose the CLI only through this shim - it is a 0-byte reparse point, so it is
-    # preferred last, but it launches normally and is the only entry point available.
+    # The WindowsApps alias is the only entry point for MSIX installs, so it is the last resort.
     if ($resolvedPath) { return $resolvedPath }
 
+    # Full command discovery still covers aliases and non-.exe shims when the fast probe found nothing.
+    return Get-ExternalCommandPath -CommandName 'oh-my-posh'
+}
+
+# Return the managed location of the portable oh-my-posh build (also the first candidate in Get-OhMyPoshExecutablePath).
+function Get-OhMyPoshPortablePath {
+    [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Programs\oh-my-posh\bin\oh-my-posh.exe')
+}
+
+# Return the version of an executable from its version resource, or $null when it has none and -VersionArgument is not given.
+function Get-PspExecutableVersion {
+    param([Parameter(Mandatory)][string]$Path, [string[]]$VersionArgument)
+    $text = $null
+    try { $text = [string][System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path).ProductVersion } catch { $null = $_ }
+    # The WindowsApps alias has no version resource, so the program itself is asked when -VersionArgument is given.
+    if ([string]::IsNullOrWhiteSpace($text) -and $VersionArgument) {
+        try { $text = [string](@(& $Path @VersionArgument 2>$null) | Where-Object { $_ -match '\d+\.\d+' } | Select-Object -First 1) } catch { $null = $_ }
+    }
+    $match = [regex]::Match([string]$text, '\d+\.\d+(\.\d+){0,2}')
+    $version = $null
+    if ($match.Success -and [version]::TryParse($match.Value, [ref]$version)) { return $version }
     return $null
 }
 
-# Return OMP install path and kind (windowsapps vs direct) for upgrade logic
+# Return $false for an oh-my-posh build older than the pinned minimum; a build whose version cannot be read is not refused.
+function Test-PspOmpVersionSafe {
+    param([Parameter(Mandatory)][string]$Path)
+    $minimum = [string](Get-PspComponentPins).OhMyPoshMinimum
+    if (-not $minimum) { return $true }
+    $version = Get-PspExecutableVersion -Path $Path -VersionArgument 'version'
+    return ($null -eq $version -or $version -ge [version]$minimum)
+}
+
+# Return OMP install path and kind (portable, windowsapps or direct) for upgrade logic; portable means installed by this profile.
 function Get-OhMyPoshInstallInfo {
     $path = Get-OhMyPoshExecutablePath
     if (-not $path) {
@@ -1112,10 +1281,99 @@ function Get-OhMyPoshInstallInfo {
     }
 
     $windowsAppsRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
-    $installKind = if ($path -like "$windowsAppsRoot*") { 'windowsapps' } else { 'direct' }
+    $portablePath = Get-OhMyPoshPortablePath
+    $portableMarker = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($portablePath), 'psp-managed.txt')
+    $installKind = if ($path -like "$windowsAppsRoot*") { 'windowsapps' }
+    elseif ([string]::Equals($path, $portablePath, [System.StringComparison]::OrdinalIgnoreCase) -and [System.IO.File]::Exists($portableMarker)) { 'portable' }
+    else { 'direct' }
     return [PSCustomObject]@{
         Path        = $path
         InstallKind = $installKind
+    }
+}
+
+# Download the pinned portable oh-my-posh build, verify its SHA-256 and Authenticode signer, and install it to the managed location.
+function Install-OhMyPoshPortable {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        # Reinstall even when the installed build already matches the pinned version.
+        [switch]$Force
+    )
+
+    # The MSIX build that winget installs pays package activation on every launch (about 30 ms per prompt), which the portable build avoids.
+    $targetPath = Get-OhMyPoshPortablePath
+    if (-not $PSCmdlet.ShouldProcess($targetPath, 'Install or update the portable oh-my-posh build')) { return $null }
+
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $asset = switch ($arch) {
+        'X64' { 'posh-windows-amd64.exe' }
+        'Arm64' { 'posh-windows-arm64.exe' }
+        default { $null }
+    }
+    if (-not $asset) {
+        Write-Warning "No portable oh-my-posh build exists for OS architecture '$arch'."
+        return $null
+    }
+
+    $ProgressPreference = 'SilentlyContinue'
+    # The version and hash come from the profile's pins, so a newer release arrives only through a profile update.
+    $pins = Get-PspComponentPins
+    $version = [string]$pins.OhMyPosh
+    $expectedHash = if ($pins.OhMyPoshSha256) { [string]$pins.OhMyPoshSha256[$asset] } else { $null }
+    if ($version -notmatch '^\d+\.\d+\.\d+$' -or $expectedHash -notmatch '^[0-9A-Fa-f]{64}$') {
+        Write-Warning "No pinned oh-my-posh build for $asset."
+        return $null
+    }
+    $tag = "v$version"
+
+    $targetDir = [System.IO.Path]::GetDirectoryName($targetPath)
+    $markerPath = [System.IO.Path]::Combine($targetDir, 'psp-managed.txt')
+    if (-not $Force -and [System.IO.File]::Exists($targetPath) -and [System.IO.File]::Exists($markerPath)) {
+        # A build newer than the pin (installed by a newer profile) is kept instead of being replaced with an older one.
+        $installedVersion = Get-PspExecutableVersion -Path $targetPath
+        if ($installedVersion -and $installedVersion -ge [version]$version) {
+            Write-PspHost "  Oh My Posh $installedVersion (portable) is already up to date." -ForegroundColor DarkGray
+            return $targetPath
+        }
+    }
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('psp-omp-' + [System.IO.Path]::GetRandomFileName())
+    try {
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $downloadedExe = Join-Path $tempDir $asset
+        Write-PspHost "  Downloading oh-my-posh $version ($asset)..." -ForegroundColor Yellow
+        Invoke-DownloadWithRetry -Uri "https://github.com/JanDeDobbeleer/oh-my-posh/releases/download/$tag/$asset" -OutFile $downloadedExe -TimeoutSec 300
+
+        # The pinned hash and a valid signature from the oh-my-posh author must both match before anything is installed.
+        $actualHash = (Get-FileHash -LiteralPath $downloadedExe -Algorithm SHA256).Hash
+        if ($actualHash -ne $expectedHash.ToUpperInvariant()) { throw "SHA256 mismatch for $asset (expected $expectedHash, got $actualHash)" }
+        $signature = Get-AuthenticodeSignature -LiteralPath $downloadedExe
+        if ($signature.Status -ne 'Valid' -or [string]$signature.SignerCertificate.Subject -notmatch '^CN=Jan Joris De Dobbeleer(,|$)') {
+            throw "Authenticode verification failed (status: $($signature.Status), signer: $($signature.SignerCertificate.Subject))"
+        }
+
+        # Renaming the current binary first lets the update succeed while another shell is running it.
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        $previousPath = $targetPath + '.old'
+        Remove-Item -LiteralPath $previousPath -Force -ErrorAction SilentlyContinue
+        if ([System.IO.File]::Exists($targetPath)) { Move-Item -LiteralPath $targetPath -Destination $previousPath -Force -ErrorAction Stop }
+        try { Move-Item -LiteralPath $downloadedExe -Destination $targetPath -Force -ErrorAction Stop }
+        catch {
+            if ([System.IO.File]::Exists($previousPath) -and -not [System.IO.File]::Exists($targetPath)) { Move-Item -LiteralPath $previousPath -Destination $targetPath -Force -ErrorAction SilentlyContinue }
+            throw
+        }
+        Remove-Item -LiteralPath $previousPath -Force -ErrorAction SilentlyContinue
+        # The marker tells the profile this build is managed, so Update-Tools keeps it current.
+        [System.IO.File]::WriteAllText($markerPath, "$tag`n", [System.Text.UTF8Encoding]::new($false))
+        Write-PspHost "  Oh My Posh $version installed (portable) at $targetPath" -ForegroundColor Green
+        return $targetPath
+    }
+    catch {
+        Write-Warning "Portable oh-my-posh install failed: $($_.Exception.Message)"
+        return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1129,7 +1387,8 @@ function Test-WingetPackageInstalled {
     if (-not $wingetPath) { return $false }
 
     try {
-        $wingetOutput = @(& $wingetPath list --id $Id --exact 2>&1)
+        # Output is captured, so winget must not stop at an agreement prompt nobody sees.
+        $wingetOutput = @(& $wingetPath list --id $Id --exact --source winget --accept-source-agreements --disable-interactivity 2>&1)
         $wingetText = (@($wingetOutput) -join [Environment]::NewLine).Trim()
         if ($LASTEXITCODE -ne 0 -or -not $wingetText) { return $false }
         if ($wingetText -match 'No installed package found') { return $false }
@@ -1160,7 +1419,7 @@ function Get-OhMyPoshMsiProductCode {
     return $null
 }
 
-# Resolve executable path for a profile tool (OMP uses Get-OhMyPoshInstallInfo, others use Get-Command)
+# Resolve executable path for a profile tool (OMP uses Get-OhMyPoshInstallInfo, others use Get-ExternalCommandPath)
 function Get-ProfileToolExecutablePath {
     param(
         [Parameter(Mandatory)]
@@ -1206,20 +1465,21 @@ function Get-ProfileToolVersionText {
     return $null
 }
 
-# Invoke oh-my-posh with explicit arguments and UTF-8 streams.
+# Invoke oh-my-posh with explicit arguments and UTF-8 streams; -NoWait returns the running call for Complete-OhMyPoshCommand.
 function Invoke-OhMyPoshCommand {
     param(
         [Parameter(Mandatory)]
         [string]$ExecutablePath,
         [Parameter(Mandatory)]
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [switch]$NoWait
     )
 
-    $process = New-Object System.Diagnostics.Process
+    $process = [System.Diagnostics.Process]::new()
     $startInfo = $process.StartInfo
     $startInfo.FileName = $ExecutablePath
     if ($startInfo.PSObject.Properties.Match('ArgumentList').Count -gt 0) {
-        $Arguments | ForEach-Object { $null = $startInfo.ArgumentList.Add($_) }
+        foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
     }
     else {
         $escapedArgs = $Arguments | ForEach-Object {
@@ -1235,12 +1495,15 @@ function Invoke-OhMyPoshCommand {
     $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $startInfo.RedirectStandardError = $true
     $startInfo.RedirectStandardOutput = $true
+    # Redirected stdin keeps oh-my-posh away from keystrokes typed ahead into the shared console.
+    $startInfo.RedirectStandardInput = $true
     $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
+    # Sharing the interactive console avoids starting a hidden conhost.exe for every prompt.
+    $startInfo.CreateNoWindow = $false
 
     if ($PWD.Provider.Name -eq 'FileSystem') {
         try {
-            if (Test-Path -LiteralPath $PWD.ProviderPath) {
+            if ([System.IO.Directory]::Exists($PWD.ProviderPath)) {
                 $startInfo.WorkingDirectory = $PWD.ProviderPath
             }
         }
@@ -1249,12 +1512,54 @@ function Invoke-OhMyPoshCommand {
         }
     }
 
-    [void]$process.Start()
+    $pending = @{
+        Process          = $process
+        StartTask        = $null
+        ExecutablePath   = $ExecutablePath
+        ArgumentText     = $Arguments -join "`n"
+        WorkingDirectory = $startInfo.WorkingDirectory
+    }
+    if ($NoWait -and $PSVersionTable.PSVersion.Major -ge 7) {
+        # A deferred call starts on a thread-pool thread to keep the first Process.Start off the load path; its small output waits in the pipe.
+        try { $pending.StartTask = [System.Threading.Tasks.Task[bool]]::Run([System.Func[bool]]$process.Start) }
+        catch { $pending.StartTask = $null }
+    }
+    if ($null -eq $pending.StartTask) {
+        # The child gets a PATH with Git for Windows' real git.exe first, swapped around Start because copying the environment costs more.
+        $childPath = Get-OhMyPoshChildPath
+        $restorePath = $null
+        if ($childPath) {
+            $restorePath = [System.Environment]::GetEnvironmentVariable('PATH')
+            [System.Environment]::SetEnvironmentVariable('PATH', $childPath)
+        }
+        try { [void]$process.Start() }
+        catch {
+            $process.Dispose()
+            throw
+        }
+        finally {
+            if ($null -ne $restorePath) { [System.Environment]::SetEnvironmentVariable('PATH', $restorePath) }
+        }
+    }
 
+    if ($NoWait) { return $pending }
+    return Complete-OhMyPoshCommand -Pending $pending
+}
+
+# Wait for a started oh-my-posh call, forward its stderr, and return its stdout, or $null after PromptTimeoutMs so the plain prompt takes over.
+function Complete-OhMyPoshCommand {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Pending
+    )
+
+    $process = $Pending.Process
     try {
+        if ($Pending.StartTask) { [void]$Pending.StartTask.GetAwaiter().GetResult() }
+        # Closing stdin right away gives oh-my-posh an immediate EOF if it ever reads input.
+        try { $process.StandardInput.Close() } catch { $null = $_ }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        # A hung segment must not hang the prompt; callers fall back to the plain prompt on $null.
         $timeoutMs = if ($script:PSP -and $script:PSP.PromptTimeoutMs) { [int]$script:PSP.PromptTimeoutMs } else { 5000 }
         if (-not $process.WaitForExit($timeoutMs)) {
             # Stop the whole tree: segments such as git run as child processes.
@@ -1277,6 +1582,41 @@ function Invoke-OhMyPoshCommand {
     finally {
         $process.Dispose()
     }
+}
+
+# Return PATH for oh-my-posh with Git for Windows' git binary directory placed just before its cmd\ launcher, or $null when that does not apply.
+function Get-OhMyPoshChildPath {
+    $currentPath = [string]$env:PATH
+    if ($script:OhMyPoshChildPathSource -ceq $currentPath) { return $script:OhMyPoshChildPath }
+    $script:OhMyPoshChildPathSource = $currentPath
+    $script:OhMyPoshChildPath = $null
+    # cmd\git.exe only launches <root>\<toolchain>\bin\git.exe, so pointing git lookups at the real binary skips one process per call.
+    if ([System.IO.Path]::DirectorySeparatorChar -ne '\') { return $null }
+    $launcher = Find-ProfileExecutable -Name 'git'
+    if (-not $launcher) { return $null }
+    $launcherDir = [System.IO.Path]::GetDirectoryName($launcher)
+    if (-not $launcherDir.EndsWith('\cmd', [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $gitRoot = $launcherDir.Substring(0, $launcherDir.Length - 4)
+    foreach ($toolchain in 'ucrt64', 'mingw64', 'clangarm64', 'mingw32') {
+        $binDir = $gitRoot + '\' + $toolchain + '\bin'
+        if (-not [System.IO.File]::Exists($binDir + '\git.exe')) { continue }
+        # Insert the binary directory right before the launcher's PATH entry, with or without its trailing backslash.
+        $padded = ';' + $currentPath + ';'
+        foreach ($entry in $launcherDir, ($launcherDir + '\')) {
+            $at = $padded.IndexOf(';' + $entry + ';', [System.StringComparison]::OrdinalIgnoreCase)
+            if ($at -lt 0) { continue }
+            $script:OhMyPoshChildPath = ($padded.Substring(0, $at + 1) + $binDir + $padded.Substring($at)).Trim(';')
+            return $script:OhMyPoshChildPath
+        }
+        return $null
+    }
+    return $null
+}
+
+# Build a snapshot of the process environment so a prefetched prompt is only reused when no variable changed.
+function Get-ProfileEnvironmentFingerprint {
+    $variables = [System.Environment]::GetEnvironmentVariables()
+    (@($variables.Keys) -join [char]1) + [char]2 + (@($variables.Values) -join [char]1)
 }
 
 # Gather context for oh-my-posh prompt rendering.
@@ -1379,10 +1719,12 @@ function Get-OhMyPoshPromptText {
         [string]$ConfigPath,
         [bool]$OriginalSuccess = $true,
         [AllowNull()]
-        [object]$OriginalLastExitCode = 0
+        [object]$OriginalLastExitCode = 0,
+        # Start the render without waiting and keep it for the next primary prompt.
+        [switch]$Prefetch
     )
 
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    if (-not [System.IO.File]::Exists($ConfigPath)) {
         throw "oh-my-posh config not found: $ConfigPath"
     }
 
@@ -1408,6 +1750,39 @@ function Get-OhMyPoshPromptText {
 
         if ($context.NonFSWD) {
             $arguments += "--pswd=$($context.NonFSWD)"
+        }
+    }
+
+    if ($Prefetch) {
+        $environment = Get-ProfileEnvironmentFingerprint
+        $script:OhMyPoshPromptPrefetch = @{
+            Pending     = Invoke-OhMyPoshCommand -ExecutablePath $ExecutablePath -Arguments $arguments -NoWait
+            Environment = $environment
+        }
+        return
+    }
+
+    # Reuse the prefetched render only when executable, arguments, working directory and environment all match.
+    $prefetched = $script:OhMyPoshPromptPrefetch
+    if ($null -ne $prefetched -and $Type -eq 'primary') {
+        $script:OhMyPoshPromptPrefetch = $null
+        $pending = $prefetched.Pending
+        $workingDirectory = ''
+        if ($PWD.Provider.Name -eq 'FileSystem' -and [System.IO.Directory]::Exists($PWD.ProviderPath)) { $workingDirectory = $PWD.ProviderPath }
+        if ($pending.ExecutablePath -eq $ExecutablePath -and
+            $pending.ArgumentText -ceq ($arguments -join "`n") -and
+            $pending.WorkingDirectory -eq $workingDirectory -and
+            $prefetched.Environment -ceq (Get-ProfileEnvironmentFingerprint)) {
+            try { return Complete-OhMyPoshCommand -Pending $pending }
+            catch { Write-Verbose "Prefetched oh-my-posh render failed; rendering again: $_" }
+        }
+        else {
+            try {
+                if ($pending.StartTask) { [void]$pending.StartTask.GetAwaiter().GetResult() }
+                if (-not $pending.Process.HasExited) { $pending.Process.Kill() }
+            }
+            catch { $null = $_ }
+            $pending.Process.Dispose()
         }
     }
 
@@ -1537,6 +1912,33 @@ function Merge-PspUserSettings {
     return $result
 }
 
+# Return what in an Oh My Posh theme object can run commands or read data on every prompt: command segments at any depth,
+# template functions such as cmd or readFile anywhere, and extends, which pulls in a config that is not checked here.
+function Get-PspOmpThemeRisk {
+    param([AllowNull()][object]$Theme)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.Stack[object]]::new()
+    if ($null -ne $Theme) { $pending.Push($Theme) }
+    while ($pending.Count -gt 0) {
+        $node = $pending.Pop()
+        if ($node -is [string]) {
+            # Template functions are lowercase calls; .Env and other fields start with a dot and are not flagged.
+            if ($node -cmatch '\{\{[^}]*(?<![.\w])(cmd|readFile|stat|glob|env|expandenv|getHostByName)\b' -and -not $reasons.Contains('template function ' + $Matches[1])) { $reasons.Add('template function ' + $Matches[1]) }
+            continue
+        }
+        if ($node -is [System.Management.Automation.PSCustomObject]) {
+            foreach ($p in $node.PSObject.Properties) {
+                if ($p.Name -eq 'extends' -and -not $reasons.Contains('extends another config')) { $reasons.Add('extends another config') }
+                if ($p.Name -eq 'type' -and [string]$p.Value -eq 'command' -and -not $reasons.Contains('command segment')) { $reasons.Add('command segment') }
+                if ($null -ne $p.Value) { $pending.Push($p.Value) }
+            }
+            continue
+        }
+        if ($node -is [System.Collections.IEnumerable]) { foreach ($item in $node) { if ($null -ne $item) { $pending.Push($item) } } }
+    }
+    return , [string[]]$reasons.ToArray()
+}
+
 # Return $true when a URL is an HTTPS raw.githubusercontent.com address (the only host themes are fetched from).
 function Test-PspTrustedThemeUrl {
     param([AllowNull()][string]$Url)
@@ -1645,7 +2047,7 @@ function Update-Profile {
             }
         }
 
-        # Check if config actually changed
+        # Compare the downloaded theme.json with the cached copy by hash.
         $configChanged = $false
         $newConfigHash = $null
         $cachedConfig = Join-Path $cacheDir "theme.json"
@@ -1683,8 +2085,27 @@ function Update-Profile {
             }
         }
 
-        if (-not $profileChanged -and -not $configChanged -and -not $terminalConfigChanged -and -not $userSettingsChanged -and -not $Force -and -not $InstallMissingTools) {
+        # A Windows Terminal binding the profile no longer lists is retired on this run even when nothing else changed.
+        $retiredBindingPending = $false
+        $nothingChanged = -not ($profileChanged -or $configChanged -or $terminalConfigChanged -or $userSettingsChanged -or $Force -or $InstallMissingTools)
+        if ($nothingChanged -and (Test-Path -LiteralPath $cachedTerminalConfig)) {
+            try {
+                $pendingUser = if (Test-Path -LiteralPath $userSettingsPath) { Read-JsonFile $userSettingsPath } else { $null }
+                $pendingTerminal = Read-JsonFile $cachedTerminalConfig
+                if ((Get-PspProp (Get-PspProp $pendingUser 'windowsTerminal') 'manage') -ne $false) {
+                    $pendingBindings = @(Get-PspArray $pendingTerminal 'keybindings') + @(Get-PspArray $pendingUser 'keybindings')
+                    $retiredBindingPending = Test-WtRetiredKeybindingPending -Keybindings $pendingBindings -ManifestPath (Join-Path $cacheDir 'wt-changes.json')
+                }
+            }
+            catch { Write-Verbose "Could not check Windows Terminal for retired keybindings: $_" }
+        }
+
+        if ($nothingChanged -and -not $retiredBindingPending) {
             Write-PspHost "Profile is up to date." -ForegroundColor Green
+            # The installed files match this commit, so the weekly update check compares against it from now on.
+            if ($commit -and -not $WhatIfPreference) {
+                try { Write-Utf8FileAtomic -Path (Join-Path $cacheDir 'applied-commit.sha') -Content $commit } catch { Write-Verbose "Could not record the applied commit: $_" }
+            }
             return
         }
 
@@ -1727,6 +2148,12 @@ function Update-Profile {
 
         # Phase 3: Copy changed profiles to existing edition directories and create only the current edition directory.
         if ($profileChanged) {
+            # A download that does not parse or is not this profile (truncated, or an error page under -SkipHashCheck) is never installed.
+            $downloadParseErrors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($tempProfile, [ref]$null, [ref]$downloadParseErrors)
+            if (@($downloadParseErrors).Count -gt 0 -or -not (Test-PspProfileFile -Path $tempProfile)) {
+                throw ('the downloaded profile is not a complete copy of this profile ({0} parse error(s)); nothing was installed' -f @($downloadParseErrors).Count)
+            }
             if ($PSCmdlet.ShouldProcess($PROFILE, "Replace profile with downloaded version (hash: $newHash)")) {
                 $docsRoot = Split-Path (Split-Path $PROFILE)
                 $profileDirs = @(
@@ -1748,14 +2175,24 @@ function Update-Profile {
                 foreach ($dir in $profileDirs) {
                     $target = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
                     if (Test-Path -LiteralPath $dir) {
-                        # Back up the current profile before overwriting it, keeping the latest five
-                        # (profile.original.ps1 is never matched, so the first-install copy survives).
+                        # Back up the current profile before overwriting it, keeping the latest five timestamped copies.
                         if (Test-Path -LiteralPath $target -PathType Leaf) {
+                            # Save profile.original.ps1 first, since rotation can delete the oldest backup (the user's pre-install profile).
+                            $originalBackup = Join-Path $dir 'profile.original.ps1'
+                            if (-not (Test-Path -LiteralPath $originalBackup)) {
+                                $originalSource = Get-PspOriginalProfileSource -Directory $dir
+                                if ($originalSource) {
+                                    try { Copy-Item -LiteralPath $originalSource -Destination $originalBackup -ErrorAction Stop }
+                                    catch { Write-Warning "Could not save the pre-install profile to ${originalBackup}: $_" }
+                                }
+                            }
                             try {
                                 $backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
                                 Copy-Item -LiteralPath $target -Destination (Join-Path $dir "oldprofile.$backupStamp.ps1") -Force -ErrorAction Stop
-                                Get-ChildItem -LiteralPath $dir -Filter 'oldprofile*.ps1' -ErrorAction SilentlyContinue |
-                                    Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+                                # Only timestamped backups rotate, newest by the stamp in the name, since Copy-Item keeps the source LastWriteTime.
+                                Get-ChildItem -LiteralPath $dir -Filter 'oldprofile*.ps1' -File -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -match '^oldprofile\.\d{8}-\d{6}\.ps1$' } |
+                                    Sort-Object Name -Descending | Select-Object -Skip 5 |
                                     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
                             }
                             catch { Write-Warning "Could not back up $target before update: $_" }
@@ -1847,12 +2284,16 @@ function Update-Profile {
             $themeName = [string]$config.theme.name
             $themeUrl = [string](Get-PspProp $config.theme 'url')
             $themeSha256 = [string](Get-PspProp $config.theme 'sha256')
+            # A theme that can run commands on every prompt needs theme.allowCommands in user-settings.json.
+            $allowThemeCommands = [bool](Get-PspProp $config.theme 'allowCommands')
             $localThemePath = Join-Path $cacheDir "$themeName.omp.json"
             $currentThemeReady = $false
             if (Test-Path -LiteralPath $localThemePath) {
                 try {
-                    if ($null -eq (Read-JsonFile $localThemePath)) { throw 'Theme file is empty' }
-                    $currentThemeReady = -not $themeSha256 -or ((Get-FileHash -LiteralPath $localThemePath -Algorithm SHA256).Hash -eq $themeSha256.ToUpperInvariant())
+                    $localTheme = Read-JsonFile $localThemePath
+                    if ($null -eq $localTheme) { throw 'Theme file is empty' }
+                    $currentThemeReady = (-not $themeSha256 -or ((Get-FileHash -LiteralPath $localThemePath -Algorithm SHA256).Hash -eq $themeSha256.ToUpperInvariant())) -and
+                    ($allowThemeCommands -or (Get-PspOmpThemeRisk -Theme $localTheme).Count -eq 0)
                 }
                 catch {
                     Write-Warning "Existing OMP theme '$themeName' is invalid at '$localThemePath': $_"
@@ -1871,10 +2312,15 @@ function Update-Profile {
                     $tempThemePath = Join-Path $cacheDir ("{0}.{1}.download" -f $themeName, [System.IO.Path]::GetRandomFileName())
                     try {
                         Invoke-DownloadWithRetry -Uri $themeUrl -OutFile $tempThemePath
-                        if ($null -eq (Read-JsonFile $tempThemePath)) { throw 'Downloaded theme file is empty' }
+                        $downloadedTheme = Read-JsonFile $tempThemePath
+                        if ($null -eq $downloadedTheme) { throw 'Downloaded theme file is empty' }
                         if ($themeSha256) {
                             $actualThemeHash = (Get-FileHash -LiteralPath $tempThemePath -Algorithm SHA256).Hash
                             if ($actualThemeHash -ne $themeSha256.ToUpperInvariant()) { throw "Theme hash mismatch (expected $themeSha256, got $actualThemeHash)" }
+                        }
+                        $themeRisks = Get-PspOmpThemeRisk -Theme $downloadedTheme
+                        if ($themeRisks.Count -gt 0 -and -not $allowThemeCommands) {
+                            throw ("theme '{0}' can run commands on every prompt ({1}). Set theme.allowCommands = true in user-settings.json to use it" -f $themeName, ($themeRisks -join ', '))
                         }
                         Move-Item -LiteralPath $tempThemePath -Destination $localThemePath -Force
                         Write-PspHost "OMP theme '$themeName' updated." -ForegroundColor Green
@@ -1920,15 +2366,22 @@ function Update-Profile {
                     }
                 }
             }
+            # The new profile code checks the theme and the Oh My Posh build again and rebuilds the tuned theme on its next start.
+            foreach ($ompCache in 'omp-secondary-prompt.txt', 'omp-theme-fast.json') {
+                $cachePath = Join-Path $cacheDir $ompCache
+                if ((Test-Path -LiteralPath $cachePath) -and $PSCmdlet.ShouldProcess($cachePath, 'Invalidate Oh My Posh prompt cache')) {
+                    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
 
         # Phase 6: Synchronize every installed Windows Terminal variant through the change-recording writer.
         $terminalOverridesChanged = $userSettingsChanged -and ($overrides.WindowsTerminal -or $overrides.Defaults -or $overrides.Keybindings)
+        $manifestPath = Join-Path $cacheDir 'wt-changes.json'
         if (-not $overrides.Managed) {
             Write-PspHost "Windows Terminal settings left alone (windowsTerminal.manage = false, or user-settings.json could not be parsed)." -ForegroundColor DarkGray
         }
-        elseif (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
-            $manifestPath = Join-Path $cacheDir 'wt-changes.json'
+        elseif (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged -or $retiredBindingPending) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
             foreach ($wtSettingsPath in @(Get-WindowsTerminalSettingsPaths)) {
                 try {
                     $wtArgs = @{
@@ -1936,9 +2389,10 @@ function Update-Profile {
                         ManifestPath    = $manifestPath
                         Defaults        = Get-PspProp $terminalConfig 'defaults'
                         WindowsTerminal = Get-PspProp $config 'windowsTerminal'
-                        Keybindings     = Get-PspArray $terminalConfig 'keybindings'
                         NoLogo          = $true
                     }
+                    # Keybindings sync only from a loaded terminal-config.json, which also retires bindings it no longer lists.
+                    if ($null -ne $terminalConfig) { $wtArgs.Keybindings = Get-PspArray $terminalConfig 'keybindings' }
                     if (Update-WindowsTerminalSettingsFile @wtArgs) {
                         Write-PspHost "Windows Terminal settings updated: $wtSettingsPath" -ForegroundColor Green
                     }
@@ -1957,12 +2411,25 @@ function Update-Profile {
             $names = @($missing | ForEach-Object { $_.Name }) + @(if ($psfzfMissing) { 'PSFzf (module)' })
             Write-PspHost ("Not installed: {0}. Run 'Update-Profile -InstallMissingTools' to install them (winget accepts the source and package agreements for you)." -f ($names -join ', ')) -ForegroundColor DarkYellow
         }
-        elseif ($InstallMissingTools -and (Get-Command winget -ErrorAction Ignore)) {
+        elseif ($InstallMissingTools -and ((Get-Command winget -ErrorAction Ignore) -or @($missing | Where-Object { $_.UpgradeStrategy -eq 'portable' }).Count -gt 0)) {
+            $hasWinget = [bool](Get-Command winget -ErrorAction Ignore)
             $installedTools = @()
             foreach ($tool in $missing) {
+                # Oh My Posh comes from its verified portable release first; winget stays the fallback.
+                if ($tool.UpgradeStrategy -eq 'portable' -and $PSCmdlet.ShouldProcess($tool.Name, 'Install the portable build (SHA256 and signer checked)')) {
+                    if (Install-OhMyPoshPortable -Confirm:$false) {
+                        $installedTools += $tool
+                        continue
+                    }
+                    Write-PspHost "  Falling back to winget for $($tool.Name)." -ForegroundColor Yellow
+                }
+                if (-not $hasWinget) {
+                    Write-Warning "  winget not found; skipping $($tool.Name)."
+                    continue
+                }
                 if ($PSCmdlet.ShouldProcess($tool.Name, "Install via winget (accepts the winget source and package agreements)")) {
                     Write-PspHost "  Installing $($tool.Name)..." -ForegroundColor Yellow
-                    winget install -e --id $tool.Id --accept-source-agreements --accept-package-agreements
+                    winget install -e --id $tool.Id --source winget --accept-source-agreements --accept-package-agreements
                     if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
                         Write-PspHost "  $($tool.Name) installed." -ForegroundColor Green
                         $installedTools += $tool
@@ -1980,7 +2447,7 @@ function Update-Profile {
                 $psfzfVersion = (Get-PspComponentPins).PSFzf
                 if ($PSCmdlet.ShouldProcess("PSFzf $psfzfVersion", 'Install PowerShell module from the PowerShell Gallery')) {
                     try {
-                        Install-Module -Name PSFzf -RequiredVersion $psfzfVersion -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                        Install-Module -Name PSFzf -RequiredVersion $psfzfVersion -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
                         Write-PspHost "  PSFzf $psfzfVersion installed." -ForegroundColor Green
                     }
                     catch { Write-Warning "  Failed to install PSFzf: $_" }
@@ -2110,17 +2577,17 @@ function Update-PowerShell {
         }
     }
 }
-# Update installed profile tools via winget, while preserving direct/MSI Oh My Posh installs.
+# Update installed profile tools via winget and the profile-managed portable Oh My Posh build, preserving other direct/MSI installs.
 function Update-Tools {
     <#
     .SYNOPSIS
-    Upgrade winget-managed tools.
+    Upgrade winget-managed tools and the portable Oh My Posh build.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    if (-not (Get-Command winget -ErrorAction Ignore)) {
-        Write-Warning "winget not found. Update-Tools only supports winget-managed upgrades."
-        return
+    $hasWinget = [bool](Get-Command winget -ErrorAction Ignore)
+    if (-not $hasWinget) {
+        Write-Warning "winget not found. Only the portable Oh My Posh build can be updated."
     }
 
     $installed = foreach ($tool in $script:ProfileTools) {
@@ -2144,22 +2611,47 @@ function Update-Tools {
         $tool = $toolEntry.Tool
         $toolPath = $toolEntry.ExecutablePath
 
-        if ($tool.UpgradeStrategy -eq 'preserve-direct' -and $tool.Cmd -eq 'oh-my-posh') {
+        if ($tool.UpgradeStrategy -eq 'portable' -and $tool.Cmd -eq 'oh-my-posh') {
             $ompInstall = Get-OhMyPoshInstallInfo
-            if ($ompInstall.InstallKind -eq 'direct') {
+            # A direct install older than the minimum stays, and the portable build installed here is what the prompt uses instead.
+            $ompTooOld = $ompInstall.InstallKind -eq 'direct' -and -not (Test-PspOmpVersionSafe -Path $ompInstall.Path)
+            if ($ompInstall.InstallKind -eq 'direct' -and -not $ompTooOld) {
                 Write-PspHost "Skipping $($tool.Name) update to preserve direct/MSI install at $($ompInstall.Path)." -ForegroundColor DarkGray
                 $preserved++
                 continue
             }
+            if ($ompTooOld) {
+                Write-Warning ('{0} at {1} is older than {2} and runs code taken from folder names (CVE-2026-73505); the portable build is installed for the prompt. Update or remove that install.' -f $tool.Name, $ompInstall.Path, (Get-PspComponentPins).OhMyPoshMinimum)
+            }
+            # The managed portable build updates in place and replaces an MSIX install.
+            if (-not $PSCmdlet.ShouldProcess($tool.Name, 'Install or update the portable build')) { continue }
+            $oldVer = Get-ProfileToolVersionText -Tool $tool -ExecutablePath $toolPath
+            Write-PspHost "Updating $($tool.Name) (portable build)..." -ForegroundColor Cyan
+            $portablePath = Install-OhMyPoshPortable -Confirm:$false
+            if ($portablePath) {
+                $newVer = Get-ProfileToolVersionText -Tool $tool -ExecutablePath $portablePath
+                if ($ompInstall.InstallKind -eq 'windowsapps' -or $newVer -ne $oldVer) {
+                    Write-PspHost "  $($tool.Name): $oldVer -> $newVer (portable)" -ForegroundColor Green
+                    $upgraded++
+                }
+                if ($ompInstall.InstallKind -eq 'windowsapps') {
+                    Write-PspHost '  The MSIX build is no longer used. Remove it with: winget uninstall -e --id JanDeDobbeleer.OhMyPosh' -ForegroundColor DarkGray
+                }
+                continue
+            }
+            if ($ompInstall.InstallKind -ne 'windowsapps' -or -not $hasWinget) {
+                $failed++
+                continue
+            }
+            Write-PspHost '  Falling back to a winget upgrade of the MSIX build.' -ForegroundColor Yellow
         }
+        elseif (-not $hasWinget) { continue }
 
         if (-not $PSCmdlet.ShouldProcess($tool.Name, 'winget upgrade')) { continue }
-        # Capture pre-upgrade version
         $oldVer = Get-ProfileToolVersionText -Tool $tool -ExecutablePath $toolPath
         Write-PspHost "Updating $($tool.Name)..." -ForegroundColor Cyan
-        winget upgrade --id $tool.Id --accept-source-agreements --accept-package-agreements
+        winget upgrade --id $tool.Id --exact --source winget --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -eq 0) {
-            # Refresh PATH after install.
             Update-SessionPathFromRegistry
             $newToolPath = Get-ProfileToolExecutablePath -Tool $tool
             $newVer = if ($newToolPath) { Get-ProfileToolVersionText -Tool $tool -ExecutablePath $newToolPath } else { $null }
@@ -2174,13 +2666,20 @@ function Update-Tools {
                 Write-PspHost "  $($tool.Name): already up to date ($oldVer)" -ForegroundColor DarkGray
             }
         }
+        # winget answers 0x8A150014 for a tool it did not install (scoop, choco, by hand), which stays as it is.
+        elseif ($LASTEXITCODE -eq -1978335212) {
+            Write-PspHost "  $($tool.Name): not installed through winget, preserved ($toolPath)." -ForegroundColor DarkGray
+            $preserved++
+        }
+        # 0x8A15002B means no newer version applies.
         elseif ($LASTEXITCODE -ne -1978335189) { $failed++ }
+    }
+    # The warning comes first because the restart ends this session.
+    if ($failed -gt 0) {
+        Write-Warning "$failed tool(s) failed to update. Check the output above."
     }
     if ($upgraded -gt 0) {
         Restart-TerminalToApply -Message "Tools updated. Restarting terminal..."
-    }
-    if ($failed -gt 0) {
-        Write-Warning "$failed tool(s) failed to update. Check the output above."
     }
     if ($upgraded -eq 0 -and $failed -eq 0) {
         if ($preserved -gt 0) {
@@ -2208,6 +2707,8 @@ function Restart-TerminalToApply {
     if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
         $dir = [Environment]::GetFolderPath('UserProfile')
     }
+    # Windows Terminal splits its command line at every ';', so a folder containing one is not passed to wt -d.
+    if ($dir.Contains(';')) { $dir = [Environment]::GetFolderPath('UserProfile') }
     $shellExe = Get-PspShellPath
     Write-PspHost $Message -ForegroundColor Green
     Start-Sleep -Seconds 2
@@ -2316,7 +2817,7 @@ function cdb {
     }
     # Pop the consumed entries (0..N-1).
     for ($i = 0; $i -lt $N; $i++) { $script:PSP.PwdHistory.RemoveAt(0) }
-    # Suppress auto-push on the Set-Location that follows - we already cleaned up the stack.
+    # Skip the history push for this Set-Location; the stack is already trimmed.
     $script:PSP.SuppressPwdHistoryPush = $true
     Set-Location -LiteralPath $target
 }
@@ -2378,7 +2879,8 @@ function New-PspRcScriptBlock {
     $offset = 0
     if ($ast.ParamBlock) { $offset = $ast.ParamBlock.Extent.EndOffset }
     foreach ($statement in $ast.UsingStatements) { $offset = [Math]::Max($offset, $statement.Extent.EndOffset) }
-    $prelude = "`$PSScriptRoot = '{0}'; `$PSCommandPath = '{1}'; " -f ((Split-Path -Parent $Path) -replace "'", "''"), ($Path -replace "'", "''")
+    # EscapeSingleQuotedStringContent also doubles the typographic quotes that PowerShell accepts as single quotes.
+    $prelude = "`$PSScriptRoot = '{0}'; `$PSCommandPath = '{1}'; " -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent((Split-Path -Parent $Path)), [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path)
     if ($offset -gt 0) { $prelude = "; $prelude" }
     [scriptblock]::Create($Text.Insert($offset, $prelude))
 }
@@ -2403,9 +2905,10 @@ function Invoke-PromptStage {
         }
         $script:PSP.LastPwd = $current
         Invoke-ProfileHook -EventName 'OnCd'
-        if (-not $script:PSP.Features.perDirProfiles) { return }
-        $rc = Join-Path $current '.psprc.ps1'
-        if (-not (Test-Path -LiteralPath $rc -PathType Leaf)) { return }
+        # Only file system folders can hold a .psprc.ps1; the direct file check keeps this cheap on every directory change.
+        if (-not $script:PSP.Features.perDirProfiles -or $PWD.Provider.Name -ne 'FileSystem') { return }
+        $rc = [System.IO.Path]::Combine($current, '.psprc.ps1')
+        if (-not [System.IO.File]::Exists($rc)) { return }
         $trusted = $script:PSP.TrustedDirs | Where-Object { $_ -ieq $current } | Select-Object -First 1
         if (-not $trusted) {
             Write-PspHost ".psprc.ps1 found in this directory. Review it, then run Add-TrustedDirectory to auto-load it." -ForegroundColor Yellow
@@ -2431,6 +2934,17 @@ function Invoke-PromptStage {
     }
 }
 
+# End the garbage collection pause that started with the profile load; later collections run as usual.
+function Exit-PspNoGcRegion {
+    if (-not $script:PspNoGcRegion) { return }
+    $script:PspNoGcRegion = $false
+    try {
+        # A load that allocated more than the reservation has already left the region on its own.
+        if ([System.Runtime.GCSettings]::LatencyMode -eq [System.Runtime.GCLatencyMode]::NoGCRegion) { [System.GC]::EndNoGCRegion() }
+    }
+    catch { $null = $_ }
+}
+
 # Return the plain prompt text, also used when oh-my-posh fails or times out.
 function Get-PspPlainPrompt {
     if ($script:PSP.IsAdmin) { "[" + (Get-Location) + "] # " } else { "[" + (Get-Location) + "] $ " }
@@ -2439,6 +2953,7 @@ function Get-PspPlainPrompt {
 function prompt {
     Invoke-PromptStage
     Get-PspPlainPrompt
+    Exit-PspNoGcRegion
 }
 
 $Host.UI.RawUI.WindowTitle = "PowerShell {0}{1}" -f $PSVersionTable.PSVersion.ToString(), $script:PSP.AdminSuffix
@@ -2482,7 +2997,7 @@ function Resolve-PreferredEditor {
     return $script:ResolvedEditor
 }
 
-# Open files with preferred editor (alias: edit)
+# Open files in the preferred editor.
 function edit {
     <#
     .SYNOPSIS
@@ -2645,8 +3160,14 @@ function admin {
     $shell = Get-PspShellPath
     $wt = Get-Command wt.exe -CommandType Application -ErrorAction Ignore | Select-Object -First 1
     if ($args.Count -gt 0) {
-        $escaped = $args | ForEach-Object { if ($_ -match '\s') { "'$($_ -replace "'","''")'" } else { $_ } }
-        $command = $escaped -join ' '
+        # Every value becomes a quoted literal behind the call operator, so characters such as ; or | never start a second elevated command.
+        $parts = foreach ($a in $args) {
+            $s = [string]$a
+            if ($s -match '^-[A-Za-z][\w-]*:?$') { $s }
+            elseif ($s -match '^(-[A-Za-z][\w-]*:)(.*)$') { $Matches[1] + "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Matches[2]) + "'" }
+            else { "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($s) + "'" }
+        }
+        $command = '& ' + ($parts -join ' ')
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
         if ($wt) {
             Start-Process -FilePath $wt.Source -Verb runAs -ArgumentList (ConvertTo-NativeArgumentLine @($shell, '-NoExit', '-EncodedCommand', $encoded))
@@ -2664,11 +3185,10 @@ function admin {
 }
 
 Set-Alias -Name su -Value admin
-# Return system uptime through WMI on PS5 or Get-Uptime on PS7.
 function Get-SystemBootTime {
     <#
     .SYNOPSIS
-    Return system uptime through WMI on PS5 or Get-Uptime on PS7.
+    Return the system boot time through WMI on PS5 or Get-Uptime -Since on PS7.
     #>
     if ($PSVersionTable.PSVersion.Major -eq 5) {
         $lastBoot = (Get-WmiObject win32_operatingsystem | Select-Object -First 1).LastBootUpTime
@@ -2767,7 +3287,7 @@ function extract {
 function hb {
     <#
     .SYNOPSIS
-    Upload to hastebin.
+    Upload a file to a public paste (bin.christitus.com).
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([Parameter(Position = 0)][string]$Path, [switch]$Force)
@@ -2778,21 +3298,29 @@ function hb {
 
     $uri = "https://bin.christitus.com/documents"
     $sizeKb = [math]::Round((Get-Item -LiteralPath $Path).Length / 1KB, 1)
-    if (-not $Force -and -not $PSCmdlet.ShouldProcess($uri, "Publish '$Path' (${sizeKb} KB) to a PUBLIC paste")) { return }
+    $action = "Publish '$Path' (${sizeKb} KB) to a PUBLIC paste"
+    # -Force skips the prompt, but -WhatIf still prevents the upload.
+    if ($WhatIfPreference) { $null = $PSCmdlet.ShouldProcess($uri, $action); return }
+    if (-not $Force -and -not $PSCmdlet.ShouldProcess($uri, $action)) { return }
     if ($Force) { Write-Warning "Uploading '$Path' (${sizeKb} KB) to a PUBLIC paste: $uri" }
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Body $Content -ErrorAction Stop -TimeoutSec 10 -UseBasicParsing
         $hasteKey = $response.key
         $url = "https://bin.christitus.com/$hasteKey"
-        Set-Clipboard $url
-        Write-Output "$url copied to clipboard."
     }
     catch {
         if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
         Write-Error "Failed to upload the document. Error: $_"
+        return
     }
+    # The paste is public once uploaded, so its URL is printed even when the clipboard is unavailable (for example over SSH).
+    try {
+        Set-Clipboard $url -ErrorAction Stop
+        Write-Output "$url copied to clipboard."
+    }
+    catch { Write-Output "$url (could not copy to the clipboard: $($_.Exception.Message))" }
 }
-# Grep Utility (PS5-compatible, no dependencies)
+# Search files or pipeline input with ripgrep when installed, otherwise Select-String.
 function grep {
     <#
     .SYNOPSIS
@@ -2846,21 +3374,25 @@ function sed($file, $find, $replace) {
     sed .\config.ini "old" "new"
     Replace every "old" with "new", keeping the encoding; the original is saved as config.ini.bak.
     #>
-    if (-not $file -or -not (Test-Path -LiteralPath $file)) {
+    if (-not $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) {
         Write-Error "File not found: $file"
         return
     }
     if ($null -eq $find -or $find -eq '') { Write-Error "Usage: sed <file> <find> <replace>"; return }
     if ($null -eq $replace) { $replace = '' }
-    $resolved = (Resolve-Path -LiteralPath $file).Path
+    # ProviderPath is the plain file system path, also when the location is a PSDrive the .NET file APIs do not know.
+    $resolved = (Resolve-Path -LiteralPath $file).ProviderPath
     $bytes = [System.IO.File]::ReadAllBytes($resolved)
     if ($bytes.Length -eq 0) { Write-Warning "File is empty: $file"; return }
     $encoding = Get-PspTextEncoding -Bytes $bytes
     $bomLength = $encoding.GetPreamble().Length
     $content = $encoding.GetString($bytes, $bomLength, $bytes.Length - $bomLength)
+    $updated = $content.Replace([string]$find, [string]$replace)
+    # A file without the text is left as it is, with no rewrite and no .bak.
+    if ($updated -ceq $content) { Write-PspHost "No occurrences of '$find' in $file." -ForegroundColor DarkGray; return }
     # Keep a single .bak of the pre-edit content, like sed -i.bak; no backup means no edit.
     Copy-Item -LiteralPath $resolved -Destination "$resolved.bak" -Force -ErrorAction Stop
-    [System.IO.File]::WriteAllText($resolved, $content.replace("$find", $replace), $encoding)
+    [System.IO.File]::WriteAllText($resolved, $updated, $encoding)
 }
 
 # Show the full path of a command
@@ -2887,7 +3419,7 @@ function file {
     param([Parameter(Mandatory)][string]$Path)
     $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "file: cannot open '$Path' (No such file or directory)"; return }
-    $fullPath = $resolved.Path
+    $fullPath = $resolved.ProviderPath
     $item = Get-Item -LiteralPath $fullPath
     if ($item.PSIsContainer) { Write-PspHost "$($fullPath): directory"; return }
     $size = $item.Length
@@ -3113,8 +3645,6 @@ function trash {
 # Return $true when the Recycle Bin can be used: Windows recycles only in an interactive desktop session and deletes permanently otherwise.
 function Test-PspRecycleBinSession { [Environment]::UserInteractive }
 
-### Quality of Life Aliases
-
 # Navigation Shortcuts
 function docs {
     <#
@@ -3138,10 +3668,9 @@ function dtop {
 }
 
 # Enhanced Listing (eza - modern ls replacement with icons and git status)
-if (Get-Command eza -CommandType Application -ErrorAction Ignore) {
-    # la/ll/lt expose eza under distinct names; the built-in ls alias (Get-ChildItem) is left intact
-    # so scripts run later in this session keep the standard listing. Pass the icon setting as
-    # --icons=WHEN: eza takes an optional value there, so a bare --icons swallows a following path.
+if (Find-ProfileExecutable -Name 'eza') {
+    # la/ll/lt leave the built-in ls alias (Get-ChildItem) intact.
+    # Pass --icons=WHEN to eza, since a bare --icons swallows the next path.
     function la {
         <#
         .SYNOPSIS
@@ -3166,35 +3695,34 @@ if (Get-Command eza -CommandType Application -ErrorAction Ignore) {
 }
 else {
     if ($script:PSP.IsInteractive) { Write-Warning "eza not found. Install it with: winget install -e --id eza-community.eza" }
-    # Fallback listing when eza not installed
+    # Fallback listing when eza is not installed; arguments such as a path pass through like the eza versions.
     function la {
         <#
         .SYNOPSIS
-        Eza listing with hidden.
+        Listing with hidden items (Get-ChildItem fallback).
         #>
-        Get-ChildItem -Force | Format-Table -AutoSize
+        Get-ChildItem -Force @args | Format-Table -AutoSize
     }
     function ll {
         <#
         .SYNOPSIS
-        Eza long + git listing.
+        Long listing with hidden items (Get-ChildItem fallback).
         #>
-        Get-ChildItem -Force | Format-Table Mode, LastWriteTime, Length, Name -AutoSize
+        Get-ChildItem -Force @args | Format-Table Mode, LastWriteTime, Length, Name -AutoSize
     }
     function lt {
         <#
         .SYNOPSIS
-        Eza tree listing.
+        Recursive listing to depth 2 (Get-ChildItem fallback).
         #>
-        Get-ChildItem -Recurse -Depth 2 | Format-Table -AutoSize
+        Get-ChildItem -Recurse -Depth 2 @args | Format-Table -AutoSize
     }
 }
 
 # Syntax-highlighted file viewer (bat - modern cat replacement)
 if (-not $env:BAT_THEME) { $env:BAT_THEME = "TwoDark" }
-if (Get-Command bat -CommandType Application -ErrorAction Ignore) {
-    # bcat exposes bat under a distinct name; the built-in cat alias (Get-Content) is left intact so
-    # scripts run later in this session keep reading raw file contents.
+if (Find-ProfileExecutable -Name 'bat') {
+    # bcat leaves the built-in cat alias (Get-Content) intact.
     function bcat {
         <#
         .SYNOPSIS
@@ -3211,9 +3739,9 @@ else {
 function gs {
     <#
     .SYNOPSIS
-    Git status.
+    Git status; extra arguments pass through.
     #>
-    git status
+    git status @args
 }
 
 # Git add all
@@ -3225,8 +3753,7 @@ function ga {
     git add .; if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed (exit $LASTEXITCODE)" }
 }
 
-# Git commit with message. Named gcmsg, not gc, so the built-in gc alias (Get-Content) stays intact
-# for scripts run later in this session.
+# Named gcmsg so the built-in gc alias (Get-Content) stays intact.
 function gcmsg {
     <#
     .SYNOPSIS
@@ -3243,18 +3770,18 @@ function gcmsg {
 function gpush {
     <#
     .SYNOPSIS
-    Git push.
+    Git push; extra arguments such as a remote, branch or -u pass through.
     #>
-    git push
+    git push @args
 }
 
 # Git pull (gl is a built-in alias, so this is named gpull)
 function gpull {
     <#
     .SYNOPSIS
-    Git pull.
+    Git pull; extra arguments such as --rebase pass through.
     #>
-    git pull
+    git pull @args
 }
 
 # Jump to github directory via zoxide
@@ -3320,8 +3847,11 @@ function flushdns {
     .SYNOPSIS
     Clear DNS cache.
     #>
-    Clear-DnsClientCache
-    Write-PspHost "DNS has been flushed"
+    try {
+        Clear-DnsClientCache -ErrorAction Stop
+        Write-PspHost "DNS has been flushed"
+    }
+    catch { Write-Error "Could not flush the DNS cache (an elevated shell may be required): $($_.Exception.Message)" }
 }
 
 # Network Diagnostics
@@ -3351,7 +3881,7 @@ function ports {
     }
 }
 
-# Check if a specific port is open on a host (defaults to localhost)
+# Check whether a TCP port is open on a host.
 function checkport {
     <#
     .SYNOPSIS
@@ -3439,6 +3969,36 @@ function checksum {
     }
 }
 
+# Copy text so that Windows keeps it out of clipboard history and cloud sync (the formats password managers set).
+function Set-PspSensitiveClipboard {
+    param([Parameter(Mandatory)][string]$Text)
+    # The WinForms clipboard needs a single-threaded apartment, which PowerShell 7's own thread is not.
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $runspace.Open()
+    $shell = [powershell]::Create()
+    try {
+        $shell.Runspace = $runspace
+        $null = $shell.AddScript({
+                param($Value)
+                Add-Type -AssemblyName System.Windows.Forms
+                $data = New-Object System.Windows.Forms.DataObject
+                $data.SetText($Value, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+                $data.SetData('ExcludeClipboardContentFromMonitorProcessing', (New-Object System.IO.MemoryStream (, [byte[]](0, 0, 0, 0))))
+                $data.SetData('CanIncludeInClipboardHistory', (New-Object System.IO.MemoryStream (, [byte[]](0, 0, 0, 0))))
+                $data.SetData('CanUploadToCloudClipboard', (New-Object System.IO.MemoryStream (, [byte[]](0, 0, 0, 0))))
+                # True keeps the text on the clipboard after this runspace closes.
+                [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+            }).AddArgument($Text)
+        $null = $shell.Invoke()
+        if ($shell.HadErrors) { throw $shell.Streams.Error[0].Exception }
+    }
+    finally {
+        $shell.Dispose()
+        $runspace.Dispose()
+    }
+}
+
 # Generate a random password of specified length (default 20) and copy to clipboard
 function genpass {
     <#
@@ -3471,12 +4031,18 @@ function genpass {
     $password = $result.ToString()
     # Use the host as a fallback when the clipboard is unavailable without writing the password to the success stream.
     try {
-        Set-Clipboard $password -ErrorAction Stop
-        Write-PspHost "Password copied to clipboard." -ForegroundColor Green
+        Set-PspSensitiveClipboard -Text $password
+        Write-PspHost "Password copied to clipboard (kept out of clipboard history)." -ForegroundColor Green
     }
     catch {
-        Write-Warning "Clipboard unavailable ($($_.Exception.Message)); showing the password once below:"
-        Write-PspHost $password -ForegroundColor Yellow
+        try {
+            Set-Clipboard $password -ErrorAction Stop
+            Write-PspHost "Password copied to clipboard; Windows clipboard history may keep it." -ForegroundColor Yellow
+        }
+        catch {
+            Write-Warning "Clipboard unavailable ($($_.Exception.Message)); showing the password once below:"
+            Write-PspHost $password -ForegroundColor Yellow
+        }
     }
     # Keep the plaintext out of the success stream and terminal scrollback.
     return
@@ -3607,7 +4173,7 @@ function vtscan {
         }
     }
     $boundary = [guid]::NewGuid().ToString('N')
-    $fileBytes = [System.IO.File]::ReadAllBytes($resolved.Path)
+    $fileBytes = [System.IO.File]::ReadAllBytes($resolved.ProviderPath)
     $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1')
     $safeName = $file.Name -replace '["\r\n]', '_'
     $header = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$safeName`"`r`nContent-Type: application/octet-stream`r`n`r`n"
@@ -3636,7 +4202,7 @@ function vtscan {
     }
 }
 
-if (-not (Get-Command vt.exe -CommandType Application -ErrorAction Ignore)) {
+if (-not (Find-ProfileExecutable -Name 'vt.exe')) {
     # Fallback when vt-cli not installed: show install instructions
     function vt {
         <#
@@ -3650,7 +4216,7 @@ if (-not (Get-Command vt.exe -CommandType Application -ErrorAction Ignore)) {
 }
 
 # Docker Shortcuts (conditional)
-if (Get-Command docker -CommandType Application -ErrorAction Ignore) {
+if (Find-ProfileExecutable -Name 'docker') {
     # dps/dpa/dimg: list containers and images
     function dps {
         <#
@@ -3697,14 +4263,21 @@ if (Get-Command docker -CommandType Application -ErrorAction Ignore) {
         try { docker exec -it $Container $Shell }
         finally { Pop-TabTitle $old }
     }
-    # dstop: stop all running containers; dprune: system prune. Both confirm first (-Confirm:$false skips).
+    # dstop: stop the named containers, or every running one when none are named; dprune: system prune. Both confirm first (-Confirm:$false skips).
     function dstop {
         <#
         .SYNOPSIS
-        Stop all running containers.
+        Stop named containers, or all running ones.
+        .EXAMPLE
+        dstop web db
+        Stop the containers named web and db.
         #>
         [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
-        param()
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Container)
+        if ($Container) {
+            if ($PSCmdlet.ShouldProcess(($Container -join ', '), 'docker stop')) { docker stop @Container }
+            return
+        }
         $running = @(docker ps -q)
         if (-not $running) { Write-PspHost "No running containers."; return }
         if ($PSCmdlet.ShouldProcess("$($running.Count) running container(s)", 'docker stop')) { docker stop $running }
@@ -3721,7 +4294,7 @@ if (Get-Command docker -CommandType Application -ErrorAction Ignore) {
 }
 
 # Define the WSL wrapper and helpers only when wsl.exe is available.
-if (Get-Command wsl.exe -CommandType Application -ErrorAction Ignore) {
+if (Find-ProfileExecutable -Name 'wsl.exe') {
     # Show the WSL distro in the tab title and invoke wsl.exe without recursion.
     function wsl {
         <#
@@ -3798,7 +4371,8 @@ if (Get-Command wsl.exe -CommandType Application -ErrorAction Ignore) {
         $normalized = $Path -replace '\\', '/'
         $wslArgs = @()
         if ($Distro) { $wslArgs += '-d', $Distro }
-        $wslArgs += 'wslpath', '-a', '--', $normalized
+        # -e runs wslpath without the distro's shell, so $(...) or backticks in a path are never evaluated.
+        $wslArgs += '-e', 'wslpath', '-a', '--', $normalized
         $result = (& wsl.exe @wslArgs 2>&1)
         if ($LASTEXITCODE -ne 0) { Write-Error ($result -join ' '); return }
         ($result | Select-Object -First 1).ToString().Trim()
@@ -3818,7 +4392,7 @@ if (Get-Command wsl.exe -CommandType Application -ErrorAction Ignore) {
         $normalized = $Path -replace '\\', '/'
         $wslArgs = @()
         if ($Distro) { $wslArgs += '-d', $Distro }
-        $wslArgs += 'wslpath', '-w', '--', $normalized
+        $wslArgs += '-e', 'wslpath', '-w', '--', $normalized
         $result = (& wsl.exe @wslArgs 2>&1)
         if ($LASTEXITCODE -ne 0) { Write-Error ($result -join ' '); return }
         ($result | Select-Object -First 1).ToString().Trim()
@@ -3835,13 +4409,15 @@ if (Get-Command wsl.exe -CommandType Application -ErrorAction Ignore) {
         if ($Distro) {
             if ($PSCmdlet.ShouldProcess($Distro, 'wsl --terminate')) {
                 & wsl.exe --terminate $Distro
-                Write-PspHost "Terminated: $Distro" -ForegroundColor Green
+                if ($LASTEXITCODE -eq 0) { Write-PspHost "Terminated: $Distro" -ForegroundColor Green }
+                else { Write-Error "wsl --terminate $Distro failed (exit $LASTEXITCODE)." }
             }
         }
         else {
             if ($PSCmdlet.ShouldProcess('all WSL distros', 'wsl --shutdown')) {
                 & wsl.exe --shutdown
-                Write-PspHost "All WSL distros stopped." -ForegroundColor Green
+                if ($LASTEXITCODE -eq 0) { Write-PspHost "All WSL distros stopped." -ForegroundColor Green }
+                else { Write-Error "wsl --shutdown failed (exit $LASTEXITCODE)." }
             }
         }
     }
@@ -3986,12 +4562,15 @@ function svc {
     } while ($Live)
 }
 
-# Reload profile in current session (useful after editing profile_user.ps1 or user-settings.json)
+# Reload the profile; only a dot-sourced call (. reload) brings new and changed functions into the session.
 function reload {
     <#
     .SYNOPSIS
-    Reload the profile in-place.
+    Reload the profile; run as '. reload' to refresh functions too.
     #>
+    if ($MyInvocation.InvocationName -ne '.') {
+        Write-Warning "Functions only reload when dot-sourced: run '. reload' or '. $PROFILE'. Global settings are refreshed now."
+    }
     . $PROFILE
 }
 
@@ -4035,7 +4614,13 @@ function Test-ProfileHealth {
     # Managed tools
     foreach ($tool in $script:ProfileTools) {
         $path = Get-ProfileToolExecutablePath -Tool $tool
-        if ($path) {
+        if ($path -and $tool.Cmd -eq 'oh-my-posh' -and -not (Test-PspOmpVersionSafe -Path $path)) {
+            $results += [pscustomobject]@{ Category = 'Tools'; Check = $tool.Name; Status = 'FAIL'; Detail = ('{0} is older than {1} and runs code taken from folder names (CVE-2026-73505), so the prompt does not use it; run Update-Tools or update that install' -f $path, (Get-PspComponentPins).OhMyPoshMinimum) }
+        }
+        elseif ($path -and $tool.Cmd -eq 'oh-my-posh' -and (Get-OhMyPoshInstallInfo).InstallKind -eq 'windowsapps') {
+            $results += [pscustomobject]@{ Category = 'Tools'; Check = $tool.Name; Status = 'WARN'; Detail = "$path (MSIX build adds ~30 ms per prompt; run Update-Tools to switch to the portable build)" }
+        }
+        elseif ($path) {
             $results += [pscustomobject]@{ Category = 'Tools'; Check = $tool.Name; Status = 'OK'; Detail = $path }
         }
         else {
@@ -4230,11 +4815,11 @@ function Test-ProfileHealth {
 }
 Set-Alias -Name psp-doctor -Value Test-ProfileHealth -Scope Script
 
-# Clear regenerable profile and Oh My Posh caches before a terminal restart; settings, plugins and install state are kept.
+# Clear regenerable profile and Oh My Posh caches before a terminal restart; settings, plugins, install state and theme files are kept.
 function Clear-ProfileCache {
     <#
     .SYNOPSIS
-    Reset caches except user settings.
+    Reset caches; settings and theme files are kept.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
@@ -4244,10 +4829,10 @@ function Clear-ProfileCache {
         Write-PspHost "No cache directory found." -ForegroundColor Yellow
         return
     }
-    # State files are not caches: uninstall needs the telemetry marker and the Windows Terminal change record.
-    $preservedNames = @('user-settings.json', 'user-settings.json.bak', 'plugins', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'applied-commit.sha', 'logs')
+    # State files (uninstall needs them) and the downloaded theme/config (only setup or Update-Profile restore them) are kept.
+    $preservedNames = @('user-settings.json', 'user-settings.json.bak', 'plugins', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'applied-commit.sha', 'logs', 'theme.json', 'terminal-config.json')
     # bg-*.png are resized background images that Windows Terminal points at.
-    $items = @(Get-ChildItem -LiteralPath $cacheDir -Force -ErrorAction SilentlyContinue | Where-Object { $preservedNames -notcontains $_.Name -and $_.Name -notlike 'bg-*.png' })
+    $items = @(Get-ChildItem -LiteralPath $cacheDir -Force -ErrorAction SilentlyContinue | Where-Object { $preservedNames -notcontains $_.Name -and $_.Name -notlike 'bg-*.png' -and $_.Name -notlike '*.omp.json' })
     if ($items.Count -eq 0) {
         if ($PSCmdlet.ShouldProcess('Oh My Posh caches', 'Clear')) { Clear-OhMyPoshCaches -Quiet }
         Write-PspHost "Cache is already clean." -ForegroundColor Green
@@ -4278,7 +4863,7 @@ function Invoke-ProfileWizard {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
         [switch]$Resume,
-        # Accepted for compatibility: setup.ps1 no longer needs elevation, so the wizard always runs in this session.
+        # Ignored; the wizard always runs unelevated, in a child PowerShell in this window.
         [switch]$NoElevate,
         [ValidatePattern('^[A-Fa-f0-9]{64}$')]
         [string]$ExpectedSha256,
@@ -4356,7 +4941,7 @@ function Invoke-ProfileWizard {
         & (Get-PspShellPath) @shellArgs
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0) {
-            Write-PspHost "Wizard complete. Reload your shell (run 'reload') to apply changes." -ForegroundColor Green
+            Write-PspHost "Wizard complete. Run '. reload' or open a new terminal to apply changes." -ForegroundColor Green
         }
         else {
             Write-Warning "Wizard exited with code $exitCode. Review the output above."
@@ -4461,8 +5046,8 @@ function Uninstall-Profile {
                 catch { Write-Warning "  Could not revert recorded changes in ${wtSettingsPath}: $($_.Exception.Message)" }
             }
             else {
-                # Installed by a version without the change record: restore the oldest copy and keep the current file.
-                $source = @($profileBackups | Where-Object { $_.Name -like '*.psp-original' }) + @($profileBackups | Where-Object { $_.Name -like '*.bak' } | Sort-Object LastWriteTime) | Select-Object -First 1
+                # No change record: restore the oldest backup and keep the current file next to it.
+                $source = @($profileBackups | Where-Object { $_.Name -like '*.psp-original' }) + @($profileBackups | Where-Object { $_.Name -like '*.bak' } | Sort-Object Name) | Select-Object -First 1
                 if ($source -and $PSCmdlet.ShouldProcess($wtSettingsPath, "Restore Windows Terminal settings from $($source.Name)")) {
                     $safety = '{0}.pre-uninstall-{1}.json' -f $wtSettingsPath, (Get-Date -Format 'yyyyMMdd-HHmmss')
                     try {
@@ -4547,6 +5132,7 @@ function Uninstall-Profile {
     }
 
     # Phase 3b: Temporary profile artifacts
+    # Every temp name the profile and setup.ps1 create; psp-wizard-state.json is where older setups kept the wizard state.
     $tempArtifactPatterns = @(
         'psp-wizard-state.json'
         'psp-profile-*.ps1'
@@ -4554,6 +5140,10 @@ function Uninstall-Profile {
         'psp-terminal-*.json'
         'psp-setup-*'
         'psp-reconfigure-*'
+        'psp-omp-*'
+        'psp-sums-*'
+        'psp-font-*'
+        'psp-wlan-*'
     )
     foreach ($pattern in $tempArtifactPatterns) {
         $orphans = Get-ChildItem -LiteralPath $env:TEMP -Filter $pattern -Force -ErrorAction SilentlyContinue
@@ -4569,7 +5159,7 @@ function Uninstall-Profile {
     if ($PSCmdlet.ShouldProcess('Oh My Posh caches', 'Clear')) { Clear-OhMyPoshCaches -Quiet }
 
     # Phase 4: PSFzf module - opt-in with -RemoveTools, since it is one of the managed tools.
-    $isCiOrAgent = (($env:CI -or $env:AI_AGENT) -and -not $Force)
+    $isCiOrAgent = ((([bool]$env:CI -and $env:CI -ne 'false' -and $env:CI -ne '0') -or $env:AI_AGENT) -and -not $Force)
     $psfzfPresent = [bool](Get-Module -ListAvailable -Name PSFzf)
     if ($psfzfPresent -and -not $RemoveTools) {
         $preserved += 'PSFzf module (use -RemoveTools to remove)'
@@ -4626,6 +5216,23 @@ function Uninstall-Profile {
                 $ompMsiProductCode = $null
 
                 if ($tool.Cmd -eq 'oh-my-posh') {
+                    # Remove the profile-managed portable build first; winget/MSI installs are handled below.
+                    $portableOmp = Get-OhMyPoshPortablePath
+                    $portableOmpDir = [System.IO.Path]::GetDirectoryName($portableOmp)
+                    $portableOmpMarker = [System.IO.Path]::Combine($portableOmpDir, 'psp-managed.txt')
+                    if ([System.IO.File]::Exists($portableOmpMarker) -and $PSCmdlet.ShouldProcess($portableOmp, 'Remove portable Oh My Posh build')) {
+                        foreach ($portableFile in @($portableOmp, ($portableOmp + '.old'), $portableOmpMarker)) {
+                            Remove-Item -LiteralPath $portableFile -Force -ErrorAction SilentlyContinue
+                        }
+                        foreach ($emptyDir in @($portableOmpDir, [System.IO.Path]::GetDirectoryName($portableOmpDir))) {
+                            if ([System.IO.Directory]::Exists($emptyDir) -and @([System.IO.Directory]::GetFileSystemEntries($emptyDir)).Count -eq 0) {
+                                Remove-Item -LiteralPath $emptyDir -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                        if ([System.IO.File]::Exists($portableOmp)) { Write-Warning "  Could not remove $portableOmp (in use?)." }
+                        else { Write-PspHost '  Removed portable Oh My Posh build' -ForegroundColor Green }
+                        $toolPath = Get-ProfileToolExecutablePath -Tool $tool
+                    }
                     if ($wingetManaged) {
                         $removalMode = 'winget'
                     }
@@ -4692,11 +5299,9 @@ function Uninstall-Profile {
     }
     else { $preserved += 'Managed tools (use -RemoveTools to uninstall)' }
 
-    # Phase 6: Nerd Fonts (opt-in). Shell font installs land per-user on Windows 10/11 unless
-    # elevated, so both scopes are swept; only the machine-wide one needs admin.
+    # Phase 6: Nerd Fonts (opt-in); both the per-user and the machine-wide store are swept, and only the latter needs admin.
     if ($RemoveFonts) {
-        # Derive the uninstall font filter from what setup actually installed: a wizard font choice
-        # in user-settings.json wins over terminal-config.json, which wins over the install default.
+        # The font filter follows what setup installed: user-settings.json, then terminal-config.json, then the default.
         $fontDisplayName = 'CaskaydiaCove NF'
         try {
             # Read before the cache cleanup removed it.
@@ -4708,11 +5313,9 @@ function Uninstall-Profile {
             $fontDisplayName = [string]$userSettings.defaults.font.face
         }
         $tokens = @($fontDisplayName -split '\s+' | Where-Object { $_ })
-        # Registry entries keep the display form ("CaskaydiaCove NF Bold (TrueType)")...
+        # Registry names use the display form ("CaskaydiaCove NF Bold (TrueType)").
         $regNamePattern = ($tokens | ForEach-Object { [regex]::Escape($_) }) -join '.*'
-        # ...but on disk the same family is written "CaskaydiaCoveNerdFont-Bold.ttf", so the
-        # abbreviated "NF" never matches a filename. Match family prefix + the NerdFont marker,
-        # which also keeps this away from Microsoft's own Cascadia Code files.
+        # File names use the family plus a NerdFont marker ("CaskaydiaCoveNerdFont-Bold.ttf"), which also excludes Microsoft's own Cascadia Code.
         $fileNamePattern = '^' + [regex]::Escape($tokens[0]) + '.*NerdFont'
         $fontExtensions = @('.ttf', '.otf')
 
@@ -4728,8 +5331,7 @@ function Uninstall-Profile {
         $fontMatches = 0
         $removedFontCount = 0
         $skippedMachineScope = $false
-        # Under -WhatIf nothing is actually deleted, so the orphan sweep would re-list every file
-        # the registry pass already claimed. Track them to keep the plan honest.
+        # Files the registry pass already handled are tracked so -WhatIf does not list them twice.
         $handledFontFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($scope in $fontScopes) {
             if ($scope.NeedsAdmin -and -not $isElevated) {
@@ -4747,8 +5349,9 @@ function Uninstall-Profile {
             if ($regEntries) {
                 foreach ($prop in @($regEntries.PSObject.Properties | Where-Object { $_.Name -match $regNamePattern })) {
                     $fontFile = [string]$prop.Value
-                    # An entry without a file, or one pointing outside this scope's store, is left alone.
-                    if (-not $fontFile) { continue }
+                    # An entry without a file, one whose file is not a Nerd Font build (so a font such as Cascadia Code or Consolas is never
+                    # unregistered), or one pointing outside this scope's store, is left alone.
+                    if (-not $fontFile -or [System.IO.Path]::GetFileName($fontFile) -notmatch $fileNamePattern) { continue }
                     # Machine entries often store a bare filename; per-user ones store a full path.
                     if (-not [System.IO.Path]::IsPathRooted($fontFile)) { $fontFile = Join-Path $scope.Dir $fontFile }
                     $inScope = $false
@@ -4765,7 +5368,8 @@ function Uninstall-Profile {
                         $fontMatches++
                         if ($PSCmdlet.ShouldProcess($fontFile, 'Remove font file')) {
                             Remove-Item -LiteralPath $fontFile -Force -ErrorAction SilentlyContinue
-                            $removedFontCount++
+                            # A font file in use stays on disk, so only files that are really gone are counted.
+                            if (-not (Test-Path -LiteralPath $fontFile)) { $removedFontCount++ }
                         }
                     }
                     if ($PSCmdlet.ShouldProcess($prop.Name, "Remove $($scope.Name) font registry entry")) {
@@ -4781,7 +5385,7 @@ function Uninstall-Profile {
                 $fontMatches++
                 if ($PSCmdlet.ShouldProcess($orphan.FullName, 'Remove font file')) {
                     Remove-Item -LiteralPath $orphan.FullName -Force -ErrorAction SilentlyContinue
-                    $removedFontCount++
+                    if (-not (Test-Path -LiteralPath $orphan.FullName)) { $removedFontCount++ }
                 }
             }
         }
@@ -4811,13 +5415,19 @@ function Uninstall-Profile {
         $originalRestored = $false
         $hasOriginal = Test-Path -LiteralPath $originalBackup
         if ($hasOriginal -and (Test-PspProfileFile -Path $originalBackup)) {
-            # Setup versions before 1.0.0 could save an installed copy of this profile as the original; it is not the user's.
+            # A profile.original.ps1 that is a copy of this profile is not the user's profile.
             $hasOriginal = $false
             if ($PSCmdlet.ShouldProcess($originalBackup, 'Remove profile.original.ps1 (a copy of this profile, not the pre-install one)')) {
                 Remove-Item -LiteralPath $originalBackup -Force -ErrorAction SilentlyContinue
             }
         }
-        if ($hasOriginal) {
+        # Only this profile is replaced or removed: a profile the user put there since (or an earlier uninstall restored) stays.
+        $profileIsOurs = Test-PspProfileFile -Path $mainProfile
+        $mainExists = Test-Path -LiteralPath $mainProfile
+        if ($mainExists -and -not $profileIsOurs) {
+            $preserved += $(if ($hasOriginal) { "$mainProfile (not this profile, so profile.original.ps1 was not copied over it; both are kept)" } else { "$mainProfile (not this profile)" })
+        }
+        elseif ($hasOriginal) {
             # Restore the pre-install profile saved on first install instead of leaving none behind.
             if ($PSCmdlet.ShouldProcess($mainProfile, 'Restore original profile saved before first install')) {
                 try {
@@ -4832,14 +5442,13 @@ function Uninstall-Profile {
                 }
             }
         }
-        elseif (Test-Path -LiteralPath $mainProfile) {
+        elseif ($mainExists) {
             if ($PSCmdlet.ShouldProcess($mainProfile, 'Remove profile file')) {
                 Remove-Item -LiteralPath $mainProfile -Force -ErrorAction SilentlyContinue
                 Write-PspHost "  Removed $mainProfile" -ForegroundColor DarkGray
             }
         }
-        # Older profile copies made on each install or update. Without profile.original.ps1 the oldest may be
-        # the profile from before the first install, so they are only removed when that is not the case.
+        # The oldest copy may be the user's pre-install profile, so copies go only after a restore or with -RemoveUserData.
         $oldCopies = @(Get-ChildItem -LiteralPath $dir -Filter 'oldprofile*.ps1' -File -ErrorAction SilentlyContinue)
         if ($oldCopies.Count -gt 0) {
             if ($originalRestored -or $RemoveUserData) {
@@ -4902,7 +5511,6 @@ function weather {
     #>
     param([string]$City)
     $encoded = if ($City) { [System.Uri]::EscapeDataString($City) } else { '' }
-    # Try wttr.in first, fall back to Open-Meteo if unreachable
     $url = if ($encoded) { "https://wttr.in/${encoded}?format=3" } else { "https://wttr.in/?format=3" }
     try {
         $r = Invoke-RestMethod $url -TimeoutSec 10 -Headers @{ 'User-Agent' = 'curl' } -UseBasicParsing
@@ -4936,6 +5544,8 @@ function weather {
         $temp = $wx.current.temperature_2m
         $unit = if ($wx.current_units -and $wx.current_units.temperature_2m) { $wx.current_units.temperature_2m } else { 'C' }
         Write-PspHost "$($loc.name): ${temp}${unit}" -ForegroundColor Cyan
+        # Open-Meteo's terms (CC BY 4.0) ask for this credit next to the data.
+        Write-PspHost 'Weather data by Open-Meteo.com' -ForegroundColor DarkGray
     }
     catch {
         if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
@@ -5009,6 +5619,9 @@ function speedtest {
     .SYNOPSIS
     Download speed test.
     #>
+
+    # Windows PowerShell's progress bar slows the download it is measuring.
+    $ProgressPreference = 'SilentlyContinue'
     Write-PspHost "Testing download speed..." -ForegroundColor Cyan
     $url = "https://speed.cloudflare.com/__down?bytes=25000000"
     $start = Get-Date
@@ -5062,13 +5675,14 @@ function eventlog {
 }
 
 # SSH & Remote
-if (Get-Command ssh -CommandType Application -ErrorAction Ignore) {
+if (Find-ProfileExecutable -Name 'ssh') {
     # Add short SSH timeout and keepalive defaults without overriding user options.
     function ssh {
         <#
         .SYNOPSIS
         Ssh.exe wrapper with fast-fail timeout + keepalive.
         #>
+
         # Match both spaced and compact OpenSSH -o option forms.
         $argText = ($args -join ' ')
         # Use the first positional SSH argument as the tab title and as the host for config lookup.
@@ -5085,9 +5699,7 @@ if (Get-Command ssh -CommandType Application -ErrorAction Ignore) {
             break
         }
 
-        # Add timeout/keepalive defaults only where neither the command line nor the host's effective
-        # config already set them, so the user's ~/.ssh/config is never overridden. ssh -G reports an
-        # unset ConnectTimeout as "none" and an unset ServerAliveInterval as "0".
+        # Add timeout/keepalive defaults only when neither the command line nor ssh -G sets them (none/0 mean unset).
         $effective = @{}
         if ($target) {
             try {
@@ -5196,6 +5808,10 @@ function killport {
             Write-Warning "Port $Port belongs to $($proc.ProcessName) (PID $procId), a core Windows process; stopping it can crash or restart Windows. Skipping."
             continue
         }
+        if ($procId -eq $PID) {
+            Write-Warning "Port $Port belongs to this PowerShell session (PID $procId) - skipping."
+            continue
+        }
         if ($proc -and $PSCmdlet.ShouldProcess("$($proc.ProcessName) (PID $procId) on port $Port", 'Stop process')) {
             Write-PspHost "Stopping $($proc.ProcessName) (PID $procId) on port $Port" -ForegroundColor Cyan
             try {
@@ -5230,14 +5846,14 @@ function Stop-ListeningPort {
     }
     $selected = @()
     if (Get-Command fzf -ErrorAction Ignore) {
-        # Format each row into a single fzf line; parse selection back to PID via last column.
+        # Format each row as one fzf line; the PID is read back from the third column.
         $lines = $rows | ForEach-Object {
             ('{0,-7} {1,-20} {2,-8} {3}' -f $_.Port, $_.Address, $_.PID, $_.Process)
         }
         $picked = $lines | fzf --multi --header='Tab to multi-select, Enter to kill' --prompt='killport> '
         if (-not $picked) { Write-PspHost 'Nothing selected.' -ForegroundColor DarkGray; return }
         foreach ($line in @($picked)) {
-            # PID is the third whitespace-separated column in our formatted line.
+            # PID is the third whitespace-separated column.
             $cols = $line -split '\s+' | Where-Object { $_ }
             if ($cols.Count -ge 3) {
                 $selected += ($rows | Where-Object { [string]$_.PID -eq $cols[2] } | Select-Object -First 1)
@@ -5251,6 +5867,10 @@ function Stop-ListeningPort {
     foreach ($row in $selected) {
         if ($row.PID -le 4 -or $script:ProtectedProcessNames -contains $row.Process) {
             Write-Warning "Skipping core Windows process $($row.Process) (PID $($row.PID)) on port $($row.Port)."
+            continue
+        }
+        if ($row.PID -eq $PID) {
+            Write-Warning "Skipping this PowerShell session (PID $($row.PID)) on port $($row.Port)."
             continue
         }
         if ($PSCmdlet.ShouldProcess("PID $($row.PID) ($($row.Process)) on port $($row.Port)", 'Stop process')) {
@@ -5369,11 +5989,11 @@ function Find-FileLocker {
     }
 }
 
-# Escalate process termination from Stop-Process to taskkill for names, IDs, or pipeline input.
+# Escalate process termination from Stop-Process to taskkill /F (with /T for -Tree) for names, IDs, or pipeline input.
 function Stop-StuckProcess {
     <#
     .SYNOPSIS
-    Escalating kill: Stop-Process -> taskkill /F -> /F /T.
+    Escalating kill: Stop-Process, then taskkill /F (/T with -Tree).
     #>
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'ByName')]
     param(
@@ -5401,9 +6021,13 @@ function Stop-StuckProcess {
         foreach ($procId in $targets) {
             $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
             if (-not $p) { Write-PspHost "PID $procId already gone." -ForegroundColor DarkGray; continue }
-            # Never escalate termination for core processes or system PIDs.
+            # Never escalate termination for core processes, system PIDs or this session.
             if ($procId -le 4 -or $script:ProtectedProcessNames -contains $p.ProcessName) {
                 Write-Warning "Refusing to stop protected system process: $($p.ProcessName) (PID $procId)."
+                continue
+            }
+            if ($procId -eq $PID) {
+                Write-Warning "Skipping the current PowerShell session (PID $procId)."
                 continue
             }
             $label = "$($p.ProcessName) (PID $procId)"
@@ -5430,7 +6054,6 @@ function Stop-StuckProcess {
     }
 }
 
-# Terminate file lockers before retrying deletion.
 # Delete a locked file or folder: list the processes holding it, confirm each one, stop them, then retry the delete.
 function Remove-LockedItem {
     <#
@@ -5446,7 +6069,7 @@ function Remove-LockedItem {
         [switch]$Recurse,
         # Also end child processes of each locker (taskkill /T); off by default because it can close unrelated windows.
         [switch]$Tree,
-        [switch]$KillSystem  # include PID 0/4 lockers (usually pointless, always dangerous)
+        [switch]$KillSystem  # Ignored: system processes are never stopped.
     )
     $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "Path not found: $Path"; return }
@@ -5468,8 +6091,8 @@ function Remove-LockedItem {
     Write-PspHost "Lockers found:" -ForegroundColor Cyan
     $lockers | Format-Table PID, Name, WindowTitle | Out-Host
     foreach ($l in $lockers) {
-        if (-not $KillSystem -and ($l.PID -le 4 -or $l.Name -eq 'System')) {
-            Write-Warning "Skipping system process $($l.Name) (PID $($l.PID)). Use -KillSystem to override (usually pointless)."
+        if ($l.PID -le 4 -or $l.Name -eq 'System') {
+            Write-Warning "Skipping system process $($l.Name) (PID $($l.PID)); system processes are never stopped."
             continue
         }
         # One confirmation per process, now that the user can see what holds the lock.
@@ -5523,7 +6146,7 @@ function http {
             Write-PspHost "Binary response ($contentTypeHeader), $($response.RawContentLength) bytes" -ForegroundColor Yellow
         }
         elseif ($contentTypeHeader -and $contentTypeHeader -match 'json') {
-            $response.Content | ConvertFrom-Json | ConvertTo-Json -Depth 10
+            ConvertTo-ProfilePrettyJson -Text $response.Content
         }
         else {
             $response.Content
@@ -5552,28 +6175,50 @@ function http {
     }
 }
 
+# Re-indent JSON text while keeping a top-level array an array in both editions.
+function ConvertTo-ProfilePrettyJson {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        return (ConvertTo-Json -InputObject (ConvertFrom-Json -InputObject $Text -NoEnumerate) -Depth 10)
+    }
+    # Windows PowerShell serializes a parsed top-level array as value/Count unless it is rewrapped.
+    $parsed = ConvertFrom-Json -InputObject $Text
+    if ($parsed -is [array]) { return (ConvertTo-Json -InputObject @($parsed) -Depth 10) }
+    ConvertTo-Json -InputObject $parsed -Depth 10
+}
+
 # Pretty-print JSON from a file or pipeline input.
 function prettyjson {
     <#
     .SYNOPSIS
     Pretty-print JSON.
+    .EXAMPLE
+    Get-Content .\data.json | prettyjson
+    Re-indent JSON read from the pipeline; a file path works too.
     #>
     param(
         [Parameter(Position = 0)]
-        [string]$File
+        [string]$File,
+        # Pipeline lines are joined before parsing, so multi-line JSON from Get-Content works.
+        [Parameter(ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$InputObject
     )
-    try {
-        $jsonInput = @($input)
-        if ($jsonInput.Count -gt 0) {
-            ($jsonInput -join "`n") | ConvertFrom-Json | ConvertTo-Json -Depth 10
+    begin { $jsonInput = [System.Collections.Generic.List[string]]::new() }
+    process { if ($PSBoundParameters.ContainsKey('InputObject')) { $jsonInput.Add($InputObject) } }
+    end {
+        try {
+            if ($jsonInput.Count -gt 0) {
+                ConvertTo-ProfilePrettyJson -Text ($jsonInput -join "`n")
+            }
+            elseif ($File) {
+                if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { Write-Error "File not found: $File"; return }
+                ConvertTo-ProfilePrettyJson -Text (Get-Utf8FileText $File)
+            }
+            else { Write-Error 'Usage: prettyjson <file> or <pipeline> | prettyjson' }
         }
-        elseif ($File) {
-            if (-not (Test-Path -LiteralPath $File)) { Write-Error "File not found: $File"; return }
-            Get-Utf8FileText $File | ConvertFrom-Json | ConvertTo-Json -Depth 10
-        }
-        else { Write-Error 'Usage: prettyjson <file> or <pipeline> | prettyjson' }
+        catch { Write-Error "Invalid JSON: $_" }
     }
-    catch { Write-Error "Invalid JSON: $_" }
 }
 
 # JWT decode (strips Bearer prefix, decodes header + payload without verification)
@@ -5844,18 +6489,27 @@ function ipinfo {
     }
 }
 
-# Quick timestamped backup of a file
+# Quick timestamped backup of a file or folder, placed next to the original.
 function bak {
     <#
     .SYNOPSIS
     Timestamped backup.
+    .EXAMPLE
+    bak .\config.json
+    Copy config.json to config.json.<yyyyMMdd-HHmmss>.bak; a folder is copied with its contents.
     #>
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { Write-Error "File not found: $Path"; return }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { Write-Error "File not found: $Path"; return }
+    if ($item.PSIsContainer -and -not $item.Parent) { Write-Error "bak: a drive root cannot be backed up."; return }
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $dest = "$Path.$timestamp.bak"
-    Copy-Item -LiteralPath $Path -Destination $dest -Force
-    Write-PspHost "Backup: $dest" -ForegroundColor Green
+    # The copy sits next to the original even when the path ends in a separator, and folders keep their contents.
+    $dest = '{0}.{1}.bak' -f $item.FullName.TrimEnd('\', '/'), $timestamp
+    try {
+        Copy-Item -LiteralPath $item.FullName -Destination $dest -Force -Recurse:$item.PSIsContainer -ErrorAction Stop
+        Write-PspHost "Backup: $dest" -ForegroundColor Green
+    }
+    catch { Write-Error "Backup failed: $($_.Exception.Message)" }
 }
 
 # Repeat a command at intervals (like Linux watch)
@@ -5967,7 +6621,6 @@ function Invoke-Clipboard {
         return
     }
 
-    # Insert clipboard contents into the prompt buffer without execution.
     try {
         if ($script:PSP.IsInteractive -and (Get-Module PSReadLine -ErrorAction SilentlyContinue)) {
             [Microsoft.PowerShell.PSConsoleReadLine]::Insert($clipboardText)
@@ -6001,7 +6654,7 @@ Register-ArgumentCompleter -CommandName journal -ParameterName LogName -ScriptBl
         Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
         Where-Object { $_.LogName -like "$wordToComplete*" } |
         Select-Object -First 25 |
-        ForEach-Object { [System.Management.Automation.CompletionResult]::new("'$($_.LogName)'", $_.LogName, 'ParameterValue', $_.LogName) }
+        ForEach-Object { [System.Management.Automation.CompletionResult]::new(("'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($_.LogName) + "'"), $_.LogName, 'ParameterValue', $_.LogName) }
     }
     catch { $null = $_ }
 }
@@ -6035,13 +6688,6 @@ Register-ArgumentCompleter -CommandName nscan -ParameterName Mode -ScriptBlock {
     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
 }
 
-# Defender scan modes
-Register-ArgumentCompleter -CommandName defscan -ParameterName Mode -ScriptBlock {
-    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
-    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
-    @('Quick', 'Full') | Where-Object { $_ -like "$wordToComplete*" } |
-    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
-}
 
 # Lint mode presets
 Register-ArgumentCompleter -CommandName lint -ParameterName Mode -ScriptBlock {
@@ -6063,10 +6709,10 @@ Register-ArgumentCompleter -CommandName Remove-TrustedDirectory -ParameterName P
     $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
     if (-not $script:PSP) { return }
     $script:PSP.TrustedDirs | Where-Object { $_ -like "*$wordToComplete*" } |
-    ForEach-Object { [System.Management.Automation.CompletionResult]::new("'$_'", $_, 'ParameterValue', $_) }
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new(("'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($_) + "'"), $_, 'ParameterValue', $_) }
 }
 
-# Set-TerminalBackground: StretchMode / Alignment with human-readable descriptions
+# Set-TerminalBackground -StretchMode with descriptions; parameters with only a ValidateSet complete natively.
 Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName StretchMode -ScriptBlock {
     param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
     $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
@@ -6080,13 +6726,6 @@ Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName St
     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_.Key, $_.Key, 'ParameterValue', $_.Value) }
 }
 
-Register-ArgumentCompleter -CommandName Set-TerminalBackground -ParameterName Alignment -ScriptBlock {
-    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
-    $null = $commandName, $parameterName, $commandAst, $fakeBoundParameters
-    @('center', 'left', 'top', 'right', 'bottom', 'topLeft', 'topRight', 'bottomLeft', 'bottomRight') |
-    Where-Object { $_ -like "$wordToComplete*" } |
-    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
-}
 
 # Complete WSL distro names when wsl.exe is available.
 Register-ArgumentCompleter -CommandName Enter-WslHere, ConvertTo-WslPath, ConvertTo-WindowsPath, Stop-Wsl, Get-WslIp, Get-WslFile, Show-WslTree, Open-WslExplorer -ParameterName Distro -ScriptBlock {
@@ -6258,7 +6897,9 @@ function mtr {
         for ($j = 0; $j -lt $Count; $j++) {
             try {
                 $p = Test-Connection -ComputerName $hop -Count 1 -ErrorAction Stop
-                if ($p) {
+                # PowerShell 7 returns a TimedOut status object instead of throwing, so only a successful reply counts.
+                $replied = $p -and (-not $p.PSObject.Properties['Status'] -or [string]$p.Status -eq 'Success') -and (-not $p.PSObject.Properties['StatusCode'] -or [int]$p.StatusCode -eq 0)
+                if ($replied) {
                     $lat = if ($p.PSObject.Properties['ResponseTime']) { [int]$p.ResponseTime } elseif ($p.PSObject.Properties['Latency']) { [int]$p.Latency } else { 0 }
                     $times += $lat
                 }
@@ -6297,8 +6938,11 @@ function fwallow {
     if ($Port) { $splat.LocalPort = $Port }
     $portText = if ($Port) { " port $Port" } else { '' }
     if (-not $PSCmdlet.ShouldProcess($Name, "Add firewall allow rule ($Direction $Protocol$portText)")) { return }
-    New-NetFirewallRule @splat | Out-Null
-    Write-PspHost ("Allow rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Green
+    try {
+        New-NetFirewallRule @splat -ErrorAction Stop | Out-Null
+        Write-PspHost ("Allow rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Green
+    }
+    catch { Write-Error "Could not add firewall rule '$Name': $($_.Exception.Message)" }
 }
 
 # Create an elevated firewall block rule after confirmation.
@@ -6319,8 +6963,11 @@ function fwblock {
     if ($Port) { $splat.LocalPort = $Port }
     $portText = if ($Port) { " port $Port" } else { '' }
     if (-not $PSCmdlet.ShouldProcess($Name, "Add firewall block rule ($Direction $Protocol$portText)")) { return }
-    New-NetFirewallRule @splat | Out-Null
-    Write-PspHost ("Block rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Yellow
+    try {
+        New-NetFirewallRule @splat -ErrorAction Stop | Out-Null
+        Write-PspHost ("Block rule added: {0} ({1} {2}{3})" -f $Name, $Direction, $Protocol, $portText) -ForegroundColor Yellow
+    }
+    catch { Write-Error "Could not add firewall rule '$Name': $($_.Exception.Message)" }
 }
 
 # Cybersec
@@ -6457,8 +7104,8 @@ function defscan {
         if ($Path) {
             $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
             if (-not $resolved) { Write-Error "Path not found: $Path"; return }
-            Write-PspHost ("Custom scan: {0}" -f $resolved.Path) -ForegroundColor Cyan
-            Start-MpScan -ScanType CustomScan -ScanPath $resolved.Path
+            Write-PspHost ("Custom scan: {0}" -f $resolved.ProviderPath) -ForegroundColor Cyan
+            Start-MpScan -ScanType CustomScan -ScanPath $resolved.ProviderPath
         }
         else {
             $scanType = if ($Mode -eq 'Full') { 'FullScan' } else { 'QuickScan' }
@@ -6484,6 +7131,7 @@ function pwnd {
     pwnd
     Prompt for a password without echo and check it against Have I Been Pwned.
     #>
+
     # Omit -Candidate to be prompted: a password typed as an argument stays in scrollback and Get-History.
     param([string]$Candidate)
     if (-not $Candidate) {
@@ -6592,7 +7240,7 @@ function entropy {
     param([Parameter(Mandatory)][string]$Path)
     $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "File not found: $Path"; return }
-    $bytes = [System.IO.File]::ReadAllBytes($resolved.Path)
+    $bytes = [System.IO.File]::ReadAllBytes($resolved.ProviderPath)
     if ($bytes.Length -eq 0) { Write-PspHost 'Empty file.' -ForegroundColor Yellow; return }
     $counts = New-Object 'int[]' 256
     foreach ($b in $bytes) { $counts[$b]++ }
@@ -6614,8 +7262,7 @@ function entropy {
 
 # Developer
 
-# Serve a directory through Python or npx. Loopback only by default: both servers
-# listen on every interface unless told otherwise. Use -Bind 0.0.0.0 to share on the LAN.
+# Serve a directory through Python or npx on loopback by default; -Bind 0.0.0.0 shares it on the LAN.
 function serve {
     <#
     .SYNOPSIS
@@ -6633,26 +7280,32 @@ function serve {
     if (-not $resolved) { Write-Error "Path not found: $Path"; return }
     $oldTitle = Push-TabTitle "serve :$Port"
     try {
+        # Neither server imports or runs code from the served folder: python -I keeps it off sys.path, and npx starts in TEMP
+        # so a node_modules\.bin\http-server in that folder is never picked up.
         # The Microsoft Store 'python' alias exists even when Python is not installed; it only opens the Store.
         $hasPython = $false
         if (Get-Command python -CommandType Application -ErrorAction Ignore) {
-            $null = & python -c "import http.server" 2>$null
+            $null = & python -I -c "import http.server" 2>$null
             $hasPython = $LASTEXITCODE -eq 0
         }
         if ($hasPython) {
             Write-PspHost ("Serving {0} on http://{1}:{2} (Ctrl+C to stop)" -f $resolved.Path, $Bind, $Port) -ForegroundColor Cyan
-            Push-Location -LiteralPath $resolved.Path
-            try { & python -m http.server $Port --bind $Bind }
-            finally { Pop-Location }
+            & python -I -m http.server $Port --bind $Bind --directory $resolved.ProviderPath
             return
         }
         if (Get-Command npx -ErrorAction Ignore) {
             # Pinned so npx never fetches and runs whatever version was published last.
             $httpServer = 'http-server@' + (Get-PspComponentPins).HttpServer
             Write-PspHost ("Serving {0} via npx {1} on http://{2}:{3}" -f $resolved.Path, $httpServer, $Bind, $Port) -ForegroundColor Cyan
-            Push-Location -LiteralPath $resolved.Path
-            try { & npx --yes $httpServer -p $Port -a $Bind }
-            finally { Pop-Location }
+            Push-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+            # Install scripts of http-server and its dependencies never run.
+            $savedIgnoreScripts = $env:npm_config_ignore_scripts
+            $env:npm_config_ignore_scripts = 'true'
+            try { & npx --yes $httpServer $resolved.ProviderPath -p $Port -a $Bind }
+            finally {
+                $env:npm_config_ignore_scripts = $savedIgnoreScripts
+                Pop-Location
+            }
             return
         }
         Write-Error 'Install python or node/npx first. E.g. winget install Python.Python.3.12'
@@ -6703,16 +7356,37 @@ function gcof {
     }
 }
 
-# Load exported or quoted .env values into the current session.
+# Return $true for environment variable names that change which programs run, what they load, or where they connect.
+function Test-PspSensitiveEnvName {
+    param([Parameter(Mandatory)][string]$Name)
+    $Name -match ('^(PATH|PATHEXT|PSModulePath|PSExecutionPolicyPreference|ComSpec|SystemRoot|SystemDrive|windir|TEMP|TMP|' +
+        'APPDATA|LOCALAPPDATA|USERPROFILE|HOME|HOMEDRIVE|HOMEPATH|ProgramData|ProgramFiles|ProgramW6432|CommonProgramFiles|CommonProgramW6432|ALLUSERSPROFILE|PUBLIC|XDG_\w+|' +
+        'GIT_\w+|SSH_ASKPASS|EDITOR|VISUAL|PAGER|BROWSER|BASH_ENV|\w*_PRELOAD|' +
+        'NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|NPM_CONFIG_\w+|PIP_\w+|' +
+        'PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PYTHONUSERBASE|PYTHONEXECUTABLE|PYTHONWARNINGS|PYTHONBREAKPOINT|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB|' +
+        'CLASSPATH|DOTNET_(STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT\w*)|(COR|CORECLR)_(ENABLE_PROFILING|PROFILER\w*)|' +
+        '\w*_OPTS|\w*_OPTIONS|\w*_WRAPPER|\w*_CONFIG|\w*_CONFIG_(FILE|DIR)|(CARGO|RUSTUP|DOCKER|NUGET|YARN|BUNDLE|GEM|MSBUILD)_\w+|' +
+        'KUBECONFIG|AWS_SHARED_CREDENTIALS_FILE|GOOGLE_APPLICATION_CREDENTIALS|OPENSSL_CONF|GOFLAGS|CC|CXX|LESSOPEN|LESSCLOSE|SSLKEYLOGFILE|' +
+        '(HTTPS?|ALL|NO|FTP)_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)$')
+}
+
+# Load exported or quoted .env values into the current session; names that change how programs run need -AllowSensitive.
 function envload {
     <#
     .SYNOPSIS
     Load .env file.
+    .EXAMPLE
+    envload
+    Load .env from the current folder; PATH, NODE_OPTIONS, GIT_* and similar names are skipped with a warning.
+    .EXAMPLE
+    envload .\dev.env -AllowSensitive
+    Also set the names that change which programs run, what they load, or where they connect.
     #>
-    param([string]$Path = '.env')
+    param([string]$Path = '.env', [switch]$AllowSensitive)
     $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "File not found: $Path"; return }
-    $loaded = 0
+    $loaded = [System.Collections.Generic.List[string]]::new()
+    $skipped = [System.Collections.Generic.List[string]]::new()
     Get-Content -LiteralPath $resolved.ProviderPath -Encoding UTF8 | ForEach-Object {
         $line = $_.Trim()
         if (-not $line -or $line.StartsWith('#')) { return }
@@ -6722,11 +7396,17 @@ function envload {
             elseif ($v.Length -ge 2 -and $v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1, $v.Length - 2) }
             # Unquoted values end at an inline comment, as in dotenv.
             else { $v = ($v -replace '\s+#.*$', '').Trim() }
+            # A hostile .env could otherwise run code through PATH, NODE_OPTIONS, GIT_SSH_COMMAND and the like.
+            if (-not $AllowSensitive -and (Test-PspSensitiveEnvName -Name $k)) { $skipped.Add($k); return }
             Set-Item -LiteralPath "env:$k" -Value $v
-            $loaded++
+            $loaded.Add($k)
         }
     }
-    Write-PspHost ("Loaded {0} variable(s) from {1}" -f $loaded, $resolved.Path) -ForegroundColor Green
+    if ($skipped.Count -gt 0) {
+        Write-Warning ("Skipped {0} variable(s) that change which programs run, what they load, or where they connect: {1}. Re-run with -AllowSensitive to load them." -f $skipped.Count, ($skipped -join ', '))
+    }
+    $names = if ($loaded.Count -gt 0) { ': ' + ($loaded -join ', ') } else { '' }
+    Write-PspHost ("Loaded {0} variable(s) from {1}{2}" -f $loaded.Count, $resolved.Path, $names) -ForegroundColor Green
 }
 
 # Look up command examples through an installed tldr client or tldr-pages.
@@ -6743,6 +7423,8 @@ function tldr {
             $url = "https://raw.githubusercontent.com/tldr-pages/tldr/main/pages/$platform/$cmd.md"
             $page = Invoke-RestMethod -Uri $url -TimeoutSec 10 -ErrorAction Stop -UseBasicParsing
             Write-PspHost $page -ForegroundColor White
+            # tldr-pages are CC BY 4.0, which asks for the source.
+            Write-PspHost "Source: tldr-pages (CC BY 4.0), $url" -ForegroundColor DarkGray
             return
         }
         catch { continue }
@@ -6807,7 +7489,8 @@ function mkvenv {
     else { $null }
     if (-not $python) { Write-Error 'python not found on PATH (winget install Python.Python.3.12)'; return }
     Write-PspHost ("Creating venv at ./{0}..." -f $Name) -ForegroundColor Cyan
-    & $python -m venv $Name
+    # Isolated mode keeps a venv.py in the current folder from shadowing the standard library module.
+    & $python -I -m venv $Name
     if ($LASTEXITCODE -ne 0) { Write-Error 'venv creation failed'; return }
     $venvRoot = Resolve-Path -LiteralPath $Name
     $activate = Join-Path $venvRoot 'Scripts\Activate.ps1'
@@ -6912,11 +7595,13 @@ function lint {
         return
     }
     Import-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
-    $splat = @{ Path = $Path; Recurse = $true }
+    # Settings are always built here: without -Settings, PSScriptAnalyzer loads the analyzed folder's own settings file,
+    # and a CustomRulePath there would run that folder's code.
+    $settings = @{}
     switch ($Mode) {
-        'Strict' { $splat.Severity = @('Error', 'Warning', 'Information') }
+        'Strict' { $settings.Severity = @('Error', 'Warning', 'Information') }
         'Security' {
-            $splat.IncludeRule = @(
+            $settings.IncludeRules = @(
                 'PSAvoidUsingPlainTextForPassword',
                 'PSAvoidUsingUsernameAndPasswordParams',
                 'PSUsePSCredentialType',
@@ -6926,7 +7611,7 @@ function lint {
             )
         }
         'CI' {
-            $splat.ExcludeRule = @(
+            $settings.ExcludeRules = @(
                 'PSAvoidUsingWriteHost',
                 'PSAvoidUsingWMICmdlet',
                 'PSUseShouldProcessForStateChangingFunctions',
@@ -6936,6 +7621,7 @@ function lint {
             )
         }
     }
+    $splat = @{ Path = $Path; Recurse = $true; Settings = $settings }
     if ($Fix) { $splat.Fix = $true }
     $results = Invoke-ScriptAnalyzer @splat
     if (-not $results) { Write-PspHost 'No issues found.' -ForegroundColor Green; return }
@@ -7017,7 +7703,7 @@ function Test-Profile {
     Write-PspHost ("  Profile Exists:    {0}" -f (Test-Path $PROFILE))
     $userOverride = Join-Path (Split-Path $PROFILE) 'profile_user.ps1'
     Write-PspHost ("  profile_user.ps1:  {0}" -f $(if (Test-Path $userOverride) { 'present' } else { 'absent' }))
-    $cache = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
+    $cache = Get-PspCacheDir
     Write-PspHost ("  Cache Dir:         {0}" -f $cache)
     if (Test-Path $cache) {
         $cacheFiles = Get-ChildItem $cache -File -ErrorAction SilentlyContinue
@@ -7031,7 +7717,8 @@ function Test-Profile {
     Write-PspHost ''
     Write-PspHost 'Managed Tools:' -ForegroundColor Cyan
     foreach ($tool in $script:ProfileTools) {
-        $found = Get-Command $tool.Cmd -ErrorAction Ignore
+        # The same lookup as psp-doctor, which also finds the portable Oh My Posh build that is not on PATH.
+        $found = Get-ProfileToolExecutablePath -Tool $tool
         $status = if ($found) { 'OK' } else { 'MISSING' }
         $color = if ($found) { 'Green' } else { 'Yellow' }
         Write-PspHost ("  {0,-14} {1}" -f $tool.Cmd, $status) -ForegroundColor $color
@@ -7041,7 +7728,7 @@ function Test-Profile {
     Write-PspHost ("  Profile Version:   {0}" -f $script:PSP.Version)
     Write-PspHost ("  Interactive:       {0}" -f $script:PSP.IsInteractive)
     Write-PspHost ("  Admin:             {0}" -f $script:PSP.IsAdmin)
-    Write-PspHost ("  CI:                {0}" -f [bool]$env:CI)
+    Write-PspHost ("  CI:                {0}" -f ([bool]$env:CI -and $env:CI -ne 'false' -and $env:CI -ne '0'))
     Write-PspHost ("  AI_AGENT:          {0}" -f [bool]$env:AI_AGENT)
 }
 
@@ -7160,6 +7847,7 @@ function Test-ProfileHistorySafeLine {
         '(?i)connectionstring'
         '(?i)credential'
         '(?i)bearer'
+        '(?i)asplaintext'                                 # ConvertTo-SecureString -AsPlainText, which PSReadLine's own filter also catches
         '(?i)\b(VTCLI_APIKEY|VT_API_KEY)\b'
         # Scrub pwnd and jwtd invocations anywhere in a command line while excluding embedded verb names.
         '(?i)\bpwnd\s'
@@ -7173,7 +7861,10 @@ function Test-ProfileHistorySafeLine {
         '\bASIA[0-9A-Z]{16}\b'                            # AWS temporary access key id
         '(?i)\bxox[baprs]-[A-Za-z0-9-]{10,}'              # Slack token
         '\bAIza[0-9A-Za-z_\-]{35}\b'                      # Google API key
-        '\bsk-[A-Za-z0-9]{20,}'                           # OpenAI-style secret key
+        '\bsk-[A-Za-z0-9_-]{20,}'                         # OpenAI/Anthropic-style secret key (sk-proj-, sk-ant-, ...)
+        '\bglpat-[A-Za-z0-9_-]{20,}'                      # GitLab personal access token
+        '(?i)\bAccountKey=|\bSharedAccessSignature=|[?&]sig=[A-Za-z0-9%+/=]{20,}'  # Azure storage key and SAS
+        '(?i)_(pass|pwd)\b'                               # *_PASS / *_PWD variables and arguments
         '(?i)\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}'      # Stripe secret/restricted key (underscore style)
         '-----BEGIN[A-Z ]*PRIVATE KEY-----'              # PEM private key material
         '(?i)://[^/\s:@]+:[^/\s:@]+@'                     # credentials embedded in a URL (user:pass@host)
@@ -7199,8 +7890,139 @@ function Set-PspFeatureOverride {
     }
 }
 
-# Configure PSReadLine from theme defaults and user color overrides.
+# Import PSFzf on first chord use and let Set-PsFzfOption replace the loader bindings with PSFzf's handlers.
+function Import-ProfileFzfModule {
+    if ($null -ne $script:ProfileFzfLoaded) { return $script:ProfileFzfLoaded }
+    $script:ProfileFzfLoaded = $false
+    try {
+        Import-Module PSFzf -Global -ErrorAction Stop
+        Set-PsFzfOption -PSReadlineChordProvider 'Ctrl+t' -PSReadlineChordReverseHistory 'Ctrl+r'
+        $script:ProfileFzfLoaded = $true
+    }
+    catch { Write-Verbose "PSFzf could not be imported: $_" }
+    return $script:ProfileFzfLoaded
+}
+
+# Generate and load a cached native completion script on first Tab, then answer the pending request with it.
+function Invoke-ProfileLazyCompleter {
+    param($WordToComplete, $CommandAst, $CursorPosition)
+
+    $commandName = $null
+    try { $commandName = [System.IO.Path]::GetFileNameWithoutExtension([string]$CommandAst.GetCommandName()) }
+    catch { return }
+    if (-not $commandName -or -not $script:ProfileLazyCompleters) { return }
+    $spec = $script:ProfileLazyCompleters[$commandName]
+    if (-not $spec -or $spec.Attempted) { return }
+    $spec.Attempted = $true
+
+    $exePath = Find-ProfileExecutable -Name $commandName
+    if (-not $exePath) { return }
+    $cachePath = Join-Path (Get-PspCacheDir) $spec.Cache
+    $ready = [System.IO.File]::Exists($cachePath) -and ([System.IO.FileInfo]::new($cachePath).Length -gt 0)
+    if (-not $ready) {
+        try {
+            $output = & $exePath @($spec.Args) 2>$null | Out-String
+            if ($output -and $output.Trim().Length -gt 0) {
+                [System.IO.File]::WriteAllText($cachePath, $output, [System.Text.UTF8Encoding]::new($false))
+                $ready = $true
+            }
+        }
+        catch { $null = $_ }
+    }
+    if (-not $ready) { return }
+
+    # A dynamic module keeps the script's helper functions reachable from the completer it registers.
+    try {
+        $module = New-Module -Name ('PSP.Completion.' + $commandName) -ScriptBlock { param($Path) . $Path } -ArgumentList $cachePath
+    }
+    catch {
+        # Corrupt cache; delete it so the next Tab regenerates it.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $spec.Attempted = $false
+        return
+    }
+    # Cobra-generated scripts (kubectl, gh, docker) keep their completer in ${__<command>CompleterBlock}.
+    $completer = & $module { param($Name) Get-Variable -Name ('__' + $Name + 'CompleterBlock') -ValueOnly -ErrorAction Ignore } $commandName
+    if ($completer -is [scriptblock]) { & $completer $WordToComplete $CommandAst $CursorPosition }
+}
+
+# Return OMP theme JSON without the git data that costs an extra git process per prompt (upstream icon/URL, stash count), or $null when nothing changes.
+function ConvertTo-ProfileFastOmpTheme {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Json
+    )
+
+    # Each rewrite is kept only when the property disappears from the template, so unusual constructs are left untouched.
+    $rewrites = @(
+        @{
+            # A stash block is removed only when it contains no nested if/range/with/end, so templates never end up unbalanced.
+            Pattern  = '(?s)\{\{-?\s*if\s+(?:gt\s+\.StashCount\s+\d+|\.StashCount)\s*-?\}\}(?:(?!\{\{-?\s*(?:if|range|with|end)\b).)*\{\{-?\s*end\s*-?\}\}'
+            Property = '\.StashCount\b'
+        }
+        @{
+            Pattern  = '\{\{-?\s*(?:url\s+\.UpstreamIcon\s+\.UpstreamURL|\.UpstreamIcon)\s*-?\}\}'
+            Property = '\.Upstream(?:Icon|URL)\b'
+        }
+    )
+    $theme = $Json | ConvertFrom-Json -ErrorAction Stop
+    $changed = $false
+    foreach ($block in @($theme.blocks)) {
+        foreach ($segment in @($block.segments)) {
+            if (-not $segment -or $segment.type -ne 'git') { continue }
+            foreach ($optionsName in 'options', 'properties') {
+                $optionsProperty = $segment.PSObject.Properties[$optionsName]
+                if ($optionsProperty -and $optionsProperty.Value -and $optionsProperty.Value.PSObject.Properties['fetch_upstream_icon'] -and $optionsProperty.Value.fetch_upstream_icon -eq $true) {
+                    $optionsProperty.Value.fetch_upstream_icon = $false
+                    $changed = $true
+                }
+            }
+            foreach ($templateName in 'template', 'templates') {
+                if (-not $segment.PSObject.Properties[$templateName] -or -not $segment.$templateName) { continue }
+                $templatesChanged = $false
+                $newTemplates = @(foreach ($template in @($segment.$templateName)) {
+                        if ($template -is [string]) {
+                            foreach ($rewrite in $rewrites) {
+                                if ($template -match $rewrite.Property) {
+                                    $rewritten = $template -replace $rewrite.Pattern, ''
+                                    if ($rewritten -notmatch $rewrite.Property) {
+                                        $template = $rewritten
+                                        $templatesChanged = $true
+                                    }
+                                }
+                            }
+                        }
+                        $template
+                    })
+                if ($templatesChanged) {
+                    $segment.$templateName = if ($templateName -eq 'template') { $newTemplates[0] } else { $newTemplates }
+                    $changed = $true
+                }
+            }
+        }
+    }
+    if (-not $changed) { return $null }
+    return ($theme | ConvertTo-Json -Depth 32)
+}
+
+# Route PSReadLine history through the profile's secret filter first, then through PSReadLine's own filter where it exists (2.2+).
+function Register-ProfileHistoryHandler {
+    $script:ProfileHistoryDefaultFilter = $null -ne [Microsoft.PowerShell.PSConsoleReadLine].GetMethod('GetDefaultAddToHistoryOption')
+    Set-PSReadLineOption -AddToHistoryHandler {
+        param($line)
+        if (-not (Test-ProfileHistorySafeLine -Line $line)) { return $false }
+        if ($script:ProfileHistoryDefaultFilter) { return [Microsoft.PowerShell.PSConsoleReadLine]::GetDefaultAddToHistoryOption($line) }
+        return $true
+    }
+}
+
+# Configure PSReadLine from theme defaults and user color overrides; theme.json and user-settings.json are parsed once here and reused at load.
 $_pspReadlineColors = $null
+$_pspThemeConfig = $null
+$_pspRlUser = $null
+$_pspRlUserError = $null
+try { $_pspRlUser = Read-JsonFile (Join-Path $cacheDir 'user-settings.json') }
+catch { $_pspRlUserError = $_ }
 try {
     $_pspThemeConfig = Read-JsonFile (Join-Path $cacheDir 'theme.json')
     if ($_pspThemeConfig) {
@@ -7212,7 +8034,6 @@ try {
         }
     }
     # Merge user-settings.json.psreadline.colors on top so wizard/manual overrides win.
-    $_pspRlUser = Read-JsonFile (Join-Path $cacheDir 'user-settings.json')
     if ($_pspRlUser) {
         # Apply feature toggles before initializing their load-time consumers.
         Set-PspFeatureOverride $_pspRlUser
@@ -7304,54 +8125,39 @@ if ($script:PSP.IsInteractive -and (Get-Module PSReadLine)) {
     }
 
     # Enable PSFzf history and file search unless disabled in user-settings.json.
-    if ($script:PSP.Features.psfzf -and (Get-Command fzf -CommandType Application -ErrorAction Ignore)) {
-        if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -CommandType Application -ErrorAction Ignore)) {
+    if ($script:PSP.Features.psfzf -and (Find-ProfileExecutable -Name 'fzf')) {
+        if (-not $env:FZF_DEFAULT_COMMAND -and (Find-ProfileExecutable -Name 'rg')) {
             $env:FZF_DEFAULT_COMMAND = 'rg --files --hidden --glob "!.git"'
         }
         if (-not $env:FZF_DEFAULT_OPTS) {
             $env:FZF_DEFAULT_OPTS = '--height=40% --layout=reverse'
         }
-        if (Get-Module -ListAvailable -Name PSFzf) {
-            Import-Module PSFzf -ErrorAction SilentlyContinue
-            if (Get-Module PSFzf) {
-                Set-PsFzfOption -PSReadlineChordProvider 'Ctrl+t' -PSReadlineChordReverseHistory 'Ctrl+r'
+        if (Test-ProfileModuleInstalled -Name 'PSFzf') {
+            # Importing PSFzf is slow, so these chords import it on first press and then hand over to PSFzf's own handlers.
+            $script:ProfileFzfLoaded = $null
+            Set-PSReadLineKeyHandler -Chord 'Ctrl+t' -BriefDescription 'FzfProviderSelect' -Description 'Run fzf for the current provider (imports PSFzf on first use)' -ScriptBlock {
+                if (Import-ProfileFzfModule) { Invoke-FzfPsReadlineHandlerProvider }
+            }
+            Set-PSReadLineKeyHandler -Chord 'Ctrl+r' -BriefDescription 'FzfReverseHistory' -Description 'Search history with fzf (imports PSFzf on first use)' -ScriptBlock {
+                param($key, $arg)
+                if (Import-ProfileFzfModule) { Invoke-FzfPsReadlineHandlerHistory }
+                else { [Microsoft.PowerShell.PSConsoleReadLine]::ReverseSearchHistory($key, $arg) }
             }
         }
     }
 
-    # Filter sensitive commands from history
-    Set-PSReadLineOption -AddToHistoryHandler {
-        param($line)
-        return (Test-ProfileHistorySafeLine -Line $line)
-    }
+    # Filter sensitive commands from history.
+    Register-ProfileHistoryHandler
 
-    # Cache native completion scripts to avoid launching each tool during shell startup.
-    $_pspNativeCompleters = @(
-        @{ Cmd = 'kubectl'; Cache = 'kubectl-completion.ps1'; Args = @('completion', 'powershell') }
-        @{ Cmd = 'gh';      Cache = 'gh-completion.ps1';      Args = @('completion', '-s', 'powershell') }
-        @{ Cmd = 'docker';  Cache = 'docker-completion.ps1';  Args = @('completion', 'powershell') }
-    )
-    foreach ($_pspNc in $_pspNativeCompleters) {
-        if (-not (Get-Command $_pspNc.Cmd -CommandType Application -ErrorAction Ignore)) { continue }
-        $_pspNcCachePath = Join-Path $cacheDir $_pspNc.Cache
-        $_pspNcReady = (Test-Path -LiteralPath $_pspNcCachePath) -and ((Get-Item -LiteralPath $_pspNcCachePath -ErrorAction SilentlyContinue).Length -gt 0)
-        if (-not $_pspNcReady) {
-            try {
-                $_pspNcOutput = & $_pspNc.Cmd @($_pspNc.Args) 2>$null | Out-String
-                if ($_pspNcOutput -and $_pspNcOutput.Trim().Length -gt 0) {
-                    [System.IO.File]::WriteAllText($_pspNcCachePath, $_pspNcOutput, [System.Text.UTF8Encoding]::new($false))
-                    $_pspNcReady = $true
-                }
-            }
-            catch { $null = $_ }
-        }
-        if ($_pspNcReady) {
-            try { . $_pspNcCachePath }
-            catch {
-                # Corrupt cache; delete so next load regenerates.
-                Remove-Item -LiteralPath $_pspNcCachePath -Force -ErrorAction SilentlyContinue
-            }
-        }
+    # One stub completer generates, caches and loads each native completion script on first Tab instead of at every startup.
+    $script:ProfileLazyCompleters = @{
+        kubectl = @{ Cache = 'kubectl-completion.ps1'; Args = @('completion', 'powershell'); Attempted = $false }
+        gh      = @{ Cache = 'gh-completion.ps1'; Args = @('completion', '-s', 'powershell'); Attempted = $false }
+        docker  = @{ Cache = 'docker-completion.ps1'; Args = @('completion', 'powershell'); Attempted = $false }
+    }
+    Register-ArgumentCompleter -Native -CommandName @($script:ProfileLazyCompleters.Keys) -ScriptBlock {
+        param($wordToComplete, $commandAst, $cursorPosition)
+        Invoke-ProfileLazyCompleter -WordToComplete $wordToComplete -CommandAst $commandAst -CursorPosition $cursorPosition
     }
 
     # Prepend active environment, cloud, Kubernetes, and job indicators to the tab title.
@@ -7413,7 +8219,7 @@ $_pspScriptblock = {
 Register-ArgumentCompleter -Native -CommandName git, npm, deno -ScriptBlock $_pspScriptblock
 
 # dotnet completion (only if dotnet is installed)
-if (Get-Command dotnet -CommandType Application -ErrorAction Ignore) {
+if (Find-ProfileExecutable -Name 'dotnet') {
     $_pspDotnetScriptblock = {
         param($wordToComplete, $commandAst, $cursorPosition)
         dotnet complete --position $cursorPosition $commandAst.ToString() |
@@ -7428,26 +8234,23 @@ if (Get-Command dotnet -CommandType Application -ErrorAction Ignore) {
 if ($script:PSP.IsInteractive) {
     $_pspOmpExecutablePath = Get-OhMyPoshExecutablePath
     if ($_pspOmpExecutablePath) {
-        # Read the selected theme from cached config; user-settings.json can override the theme name.
+        # Read the selected theme from the theme.json parsed for PSReadLine; user-settings.json can override the theme name.
         $_pspThemeName = $null
-        try {
-            $_pspCfg = Read-JsonFile (Join-Path $cacheDir 'theme.json')
-            if ($_pspCfg -and $_pspCfg.theme -and $_pspCfg.theme.name) { $_pspThemeName = $_pspCfg.theme.name }
+        if ($_pspThemeConfig -and $_pspThemeConfig.theme -and $_pspThemeConfig.theme.name) { $_pspThemeName = $_pspThemeConfig.theme.name }
+        if ($_pspRlUser -and $_pspRlUser.theme -and $_pspRlUser.theme.name) { $_pspThemeName = $_pspRlUser.theme.name }
+        # The name becomes a file name in the cache folder, so path characters are rejected.
+        if ($_pspThemeName -and [string]$_pspThemeName -notmatch '^[A-Za-z0-9._-]+$') {
+            Write-Warning "Ignoring OMP theme with an invalid name: $_pspThemeName"
+            $_pspThemeName = $null
         }
-        catch { Write-Verbose "Failed to parse theme.json: $_" }
-        try {
-            $_pspUserCfg = Read-JsonFile (Join-Path $cacheDir 'user-settings.json')
-            if ($_pspUserCfg -and $_pspUserCfg.theme -and $_pspUserCfg.theme.name) { $_pspThemeName = $_pspUserCfg.theme.name }
-        }
-        catch { Write-Verbose "Failed to parse user-settings.json: $_" }
 
         if (-not $_pspThemeName) {
             Write-Warning "No cached OMP theme is configured. Run Update-Profile or setup.ps1 to restore theme.json."
         }
 
         $_pspLocalThemePath = if ($_pspThemeName) { Join-Path $cacheDir "$_pspThemeName.omp.json" } else { $null }
-        if ($_pspLocalThemePath -and -not (Test-Path -LiteralPath $_pspLocalThemePath)) {
-            # Startup recovery is limited to local theme files.
+        if ($_pspLocalThemePath -and -not [System.IO.File]::Exists($_pspLocalThemePath)) {
+            # Move a theme file left in the profile folder into the cache.
             $_pspOldThemePath = Join-Path (Split-Path $PROFILE) "$_pspThemeName.omp.json"
             if (Test-Path -LiteralPath $_pspOldThemePath) {
                 try { Move-Item -LiteralPath $_pspOldThemePath -Destination $_pspLocalThemePath -Force -ErrorAction Stop }
@@ -7455,21 +8258,92 @@ if ($script:PSP.IsInteractive) {
             }
         }
 
-        if ($_pspLocalThemePath -and (Test-Path -LiteralPath $_pspLocalThemePath)) {
+        # Reuse the cached config choice and continuation prompt while the theme, the OMP binary, the profile version and the settings in the key
+        # are unchanged; a hit also skips revalidation, including the OMP version check.
+        $_pspSecondaryCachePath = [System.IO.Path]::Combine($cacheDir, 'omp-secondary-prompt.txt')
+        $_pspFastThemePath = [System.IO.Path]::Combine($cacheDir, 'omp-theme-fast.json')
+        # A theme that can run commands on every prompt loads only with theme.allowCommands set.
+        $_pspAllowThemeCommands = [bool](Get-PspProp (Get-PspProp $_pspRlUser 'theme') 'allowCommands')
+        $_pspOmpMinimum = [string](Get-PspComponentPins).OhMyPoshMinimum
+        $_pspOmpRefused = $false
+        $_pspThemeExists = $_pspLocalThemePath -and [System.IO.File]::Exists($_pspLocalThemePath)
+        $_pspSecondaryCacheKey = $null
+        $_pspSecondaryPrompt = $null
+        $_pspEffectiveConfigPath = $null
+        # A second pass reads the cache again after a binary that is too old was swapped for the managed portable build.
+        foreach ($_pspOmpPass in 1, 2) {
+            if ($_pspThemeExists) {
+                try {
+                    $_pspThemeFile = [System.IO.FileInfo]::new($_pspLocalThemePath)
+                    $_pspSecondaryCacheKey = '{0}|{1}|{2}|{3}|{4}|fastGitPrompt={5}|allowCommands={6}|profile={7}|ompMinimum={8}' -f $_pspLocalThemePath, $_pspThemeFile.LastWriteTimeUtc.Ticks, $_pspThemeFile.Length, $_pspOmpExecutablePath, [System.IO.File]::GetLastWriteTimeUtc($_pspOmpExecutablePath).Ticks, [bool]$script:PSP.Features.fastGitPrompt, $_pspAllowThemeCommands, $script:PSP.Version, $_pspOmpMinimum
+                    if ([System.IO.File]::Exists($_pspSecondaryCachePath)) {
+                        # Ordinal comparison avoids loading culture-aware collation during startup.
+                        $_pspSecondaryCacheText = [System.IO.File]::ReadAllText($_pspSecondaryCachePath)
+                        if ($_pspSecondaryCacheText.StartsWith($_pspSecondaryCacheKey + "`n", [System.StringComparison]::Ordinal)) {
+                            # The line after the key is the config path to render with; the rest is the continuation prompt.
+                            $_pspCachedBody = $_pspSecondaryCacheText.Substring($_pspSecondaryCacheKey.Length + 1)
+                            $_pspPathEnd = $_pspCachedBody.IndexOf([char]10)
+                            if ($_pspPathEnd -gt 0 -and [System.IO.File]::Exists($_pspCachedBody.Substring(0, $_pspPathEnd))) {
+                                $_pspEffectiveConfigPath = $_pspCachedBody.Substring(0, $_pspPathEnd)
+                                $_pspSecondaryPrompt = $_pspCachedBody.Substring($_pspPathEnd + 1)
+                            }
+                        }
+                    }
+                }
+                catch {
+                    $_pspSecondaryPrompt = $null
+                    $_pspEffectiveConfigPath = $null
+                }
+            }
+            if (-not $_pspThemeExists -or $null -ne $_pspEffectiveConfigPath -or $_pspOmpPass -eq 2 -or (Test-PspOmpVersionSafe -Path $_pspOmpExecutablePath)) { break }
+            # Builds older than the minimum run template code taken from folder names (CVE-2026-73505), so they never render the prompt.
+            $_pspOmpPortablePath = Get-OhMyPoshPortablePath
+            if (-not [string]::Equals($_pspOmpPortablePath, $_pspOmpExecutablePath, [System.StringComparison]::OrdinalIgnoreCase) -and [System.IO.File]::Exists($_pspOmpPortablePath) -and (Test-PspOmpVersionSafe -Path $_pspOmpPortablePath)) {
+                $_pspOmpExecutablePath = $_pspOmpPortablePath
+                continue
+            }
+            Write-Warning ('Oh My Posh at ''{0}'' is older than {1} and runs code taken from folder names (CVE-2026-73505), so the plain prompt is used. Run Update-Tools to install the portable build, or update that install.' -f $_pspOmpExecutablePath, $_pspOmpMinimum)
+            $_pspOmpRefused = $true
+            break
+        }
+
+        if ($null -eq $_pspEffectiveConfigPath -and $_pspThemeExists -and -not $_pspOmpRefused) {
+            $_pspThemeContent = $null
             try {
-                if ($null -eq (Read-JsonFile $_pspLocalThemePath)) { throw 'Theme file is empty' }
+                $_pspThemeContent = Get-Utf8FileText $_pspLocalThemePath
+                $_pspThemeObject = ConvertFrom-JsonC -Text $_pspThemeContent
+                if ($null -eq $_pspThemeObject) { throw 'Theme file is empty' }
+                $_pspThemeRisks = Get-PspOmpThemeRisk -Theme $_pspThemeObject
+                if (-not $_pspAllowThemeCommands -and $_pspThemeRisks.Count -gt 0) {
+                    throw ("it can run commands on every prompt ({0}); set theme.allowCommands = true in user-settings.json to use it" -f ($_pspThemeRisks -join ', '))
+                }
+                $_pspEffectiveConfigPath = $_pspLocalThemePath
             }
             catch {
                 Write-Warning "Configured OMP theme is invalid at '$_pspLocalThemePath': $_"
                 $_pspLocalThemePath = $null
             }
+            # fastGitPrompt renders from a tuned copy so the original theme file stays untouched.
+            if ($_pspEffectiveConfigPath -and $script:PSP.Features.fastGitPrompt) {
+                try {
+                    $_pspFastTheme = ConvertTo-ProfileFastOmpTheme -Json $_pspThemeContent
+                    if ($_pspFastTheme) {
+                        [System.IO.File]::WriteAllText($_pspFastThemePath, $_pspFastTheme, [System.Text.UTF8Encoding]::new($false))
+                        $_pspEffectiveConfigPath = $_pspFastThemePath
+                    }
+                }
+                catch { Write-Verbose "Keeping the original OMP theme; fast git tuning failed: $_" }
+            }
+            if ($_pspEffectiveConfigPath -ne $_pspFastThemePath -and [System.IO.File]::Exists($_pspFastThemePath)) {
+                Remove-Item -LiteralPath $_pspFastThemePath -Force -ErrorAction SilentlyContinue
+            }
         }
 
-        if ($_pspLocalThemePath -and (Test-Path -LiteralPath $_pspLocalThemePath)) {
+        if ($_pspLocalThemePath -and $_pspEffectiveConfigPath -and [System.IO.File]::Exists($_pspEffectiveConfigPath)) {
             try {
-                # Render with the validated local theme.
+                # Render with the validated (and possibly tuned) local theme.
                 $script:OhMyPoshExecutablePath = $_pspOmpExecutablePath
-                $script:OhMyPoshConfigPath = $_pspLocalThemePath
+                $script:OhMyPoshConfigPath = $_pspEffectiveConfigPath
                 $script:OhMyPoshLastHistoryId = $null
                 $env:VIRTUAL_ENV_DISABLE_PROMPT = 1
                 $env:PYENV_VIRTUALENV_DISABLE_PROMPT = 1
@@ -7480,12 +8354,17 @@ if ($script:PSP.IsInteractive) {
 
                 try {
                     if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
-                        $_pspSecondaryPrompt = Get-OhMyPoshPromptText `
-                            -Type 'secondary' `
-                            -ExecutablePath $script:OhMyPoshExecutablePath `
-                            -ConfigPath $script:OhMyPoshConfigPath
+                        if ($null -eq $_pspSecondaryPrompt) {
+                            $_pspSecondaryPrompt = @(Get-OhMyPoshPromptText `
+                                    -Type 'secondary' `
+                                    -ExecutablePath $script:OhMyPoshExecutablePath `
+                                    -ConfigPath $script:OhMyPoshConfigPath) -join "`n"
+                            if ($_pspSecondaryCacheKey -and -not [string]::IsNullOrWhiteSpace($_pspSecondaryPrompt)) {
+                                [System.IO.File]::WriteAllText($_pspSecondaryCachePath, $_pspSecondaryCacheKey + "`n" + $_pspEffectiveConfigPath + "`n" + $_pspSecondaryPrompt, [System.Text.UTF8Encoding]::new($false))
+                            }
+                        }
                         if (-not [string]::IsNullOrWhiteSpace($_pspSecondaryPrompt)) {
-                            Set-PSReadLineOption -ContinuationPrompt ($_pspSecondaryPrompt -join "`n")
+                            Set-PSReadLineOption -ContinuationPrompt $_pspSecondaryPrompt
                         }
                     }
                 }
@@ -7527,6 +8406,23 @@ if ($script:PSP.IsInteractive) {
                     }
                     finally {
                         $global:LASTEXITCODE = $originalLastExitCode
+                        Exit-PspNoGcRegion
+                    }
+                }
+
+                # Render the first prompt while the rest of the profile loads; a fresh session has no history for the context to consume.
+                $script:OhMyPoshPromptPrefetch = $null
+                if (-not (Get-History -Count 1 -ErrorAction Ignore)) {
+                    try {
+                        Get-OhMyPoshPromptText `
+                            -Type 'primary' `
+                            -ExecutablePath $script:OhMyPoshExecutablePath `
+                            -ConfigPath $script:OhMyPoshConfigPath `
+                            -Prefetch
+                    }
+                    catch {
+                        $script:OhMyPoshPromptPrefetch = $null
+                        Write-Verbose "Failed to prefetch the first oh-my-posh prompt: $_"
                     }
                 }
             }
@@ -7534,76 +8430,70 @@ if ($script:PSP.IsInteractive) {
                 Write-Warning "Failed to initialize oh-my-posh with '$_pspLocalThemePath': $_"
             }
         }
-        elseif ($_pspThemeName) {
+        elseif ($_pspThemeName -and -not $_pspOmpRefused) {
             Write-Warning "Configured OMP theme '$_pspThemeName' was not found locally at '$_pspLocalThemePath'. Run Update-Profile or setup.ps1 to restore it."
         }
     }
     else {
-        Write-Warning "oh-my-posh not found. Install the MSI build or use: winget install JanDeDobbeleer.OhMyPosh"
+        Write-Warning "oh-my-posh not found. Run 'Update-Profile -InstallMissingTools' or setup.ps1 to install the portable build."
     }
+}
+
+# Write zoxide's PowerShell init script to the cache under a version header; $false when zoxide timed out or printed nothing.
+function New-PspZoxideCache {
+    param([Parameter(Mandatory)][string]$ExecutablePath, [Parameter(Mandatory)][string]$CachePath)
+    $versionText = Invoke-WithTimeout -ScriptBlock {
+        param($exePath)
+        (& $exePath --version 2>$null | Out-String).Trim()
+    } -ArgumentList @($ExecutablePath) -TimeoutSec 5
+    $initScript = Invoke-WithTimeout -ScriptBlock {
+        param($exePath)
+        (& $exePath init --cmd z powershell | Out-String)
+    } -ArgumentList @($ExecutablePath) -TimeoutSec 10
+    if (-not $initScript) { return $false }
+    $version = if ($versionText) { $versionText } else { 'unknown' }
+    [System.IO.File]::WriteAllText($CachePath, ("# ZOXIDE_CACHE_VERSION: $version`n" + (@($initScript) -join "`n")), [System.Text.UTF8Encoding]::new($false))
+    return $true
 }
 
 # zoxide initialization (interactive only, cached for fast startup)
 if ($script:PSP.IsInteractive) {
-    $_pspZoxideExecutablePath = Get-ExternalCommandPath -CommandName 'zoxide'
+    $_pspZoxideExecutablePath = Find-ProfileExecutable -Name 'zoxide'
     if ($_pspZoxideExecutablePath) {
-        $_pspZoxideCachePath = Join-Path $cacheDir "zoxide-init.ps1"
-        # Reuse a non-empty zoxide cache and time out regeneration.
+        $_pspZoxideCachePath = [System.IO.Path]::Combine($cacheDir, 'zoxide-init.ps1')
+        # Reuse a zoxide cache whose first line is the version header (an empty file has none) and time out regeneration.
         $_pspCacheValid = $false
-        if (Test-Path $_pspZoxideCachePath) {
+        if ([System.IO.File]::Exists($_pspZoxideCachePath)) {
             try {
-                $_pspFileSize = (Get-Item $_pspZoxideCachePath).Length
-                if ($_pspFileSize -gt 0) {
-                    $_pspCacheContent = Get-Content $_pspZoxideCachePath -First 1 -ErrorAction Stop
-                    if ($_pspCacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $_pspCacheValid = $true }
-                }
+                $_pspZoxideReader = [System.IO.StreamReader]::new($_pspZoxideCachePath)
+                try { $_pspCacheContent = $_pspZoxideReader.ReadLine() }
+                finally { $_pspZoxideReader.Dispose() }
+                if ($_pspCacheContent -match '^# ZOXIDE_CACHE_VERSION: .+') { $_pspCacheValid = $true }
             }
             catch { Write-Verbose "Zoxide cache read failed (will regenerate)." }
             if (-not $_pspCacheValid) { Remove-Item $_pspZoxideCachePath -Force -ErrorAction SilentlyContinue }
         }
+        $_pspZoxideGenerated = $false
         if (-not $_pspCacheValid) {
-            $_pspZoxideVersionResult = Invoke-WithTimeout -ScriptBlock {
-                param($exePath)
-                (& $exePath --version 2>$null | Out-String).Trim()
-            } -ArgumentList @($_pspZoxideExecutablePath) -TimeoutSec 5
-            $_pspZoxideVersion = if ($_pspZoxideVersionResult) { $_pspZoxideVersionResult } else { 'unknown' }
-            $_pspInitScript = Invoke-WithTimeout -ScriptBlock {
-                param($exePath)
-                (& $exePath init --cmd z powershell | Out-String)
-            } -ArgumentList @($_pspZoxideExecutablePath) -TimeoutSec 10
-            if ($_pspInitScript) {
-                $_pspZoxideInitStr = @($_pspInitScript) -join "`n"
-                $_pspZoxideHeader = "# ZOXIDE_CACHE_VERSION: $_pspZoxideVersion"
-                $_pspUtf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                [System.IO.File]::WriteAllText($_pspZoxideCachePath, ($_pspZoxideHeader + "`n" + $_pspZoxideInitStr), $_pspUtf8NoBom)
-            }
-            else {
+            $_pspZoxideGenerated = $true
+            if (-not (New-PspZoxideCache -ExecutablePath $_pspZoxideExecutablePath -CachePath $_pspZoxideCachePath)) {
                 Write-Warning "zoxide init timed out or produced no output. Cache not written."
             }
         }
-        try {
-            . $_pspZoxideCachePath
-        }
-        catch {
-            Remove-Item $_pspZoxideCachePath -Force -ErrorAction SilentlyContinue
-            $_pspZoxideVersionResult = Invoke-WithTimeout -ScriptBlock {
-                param($exePath)
-                (& $exePath --version 2>$null | Out-String).Trim()
-            } -ArgumentList @($_pspZoxideExecutablePath) -TimeoutSec 5
-            $_pspZoxideVersion = if ($_pspZoxideVersionResult) { $_pspZoxideVersionResult } else { 'unknown' }
-            $_pspInitScript = Invoke-WithTimeout -ScriptBlock {
-                param($exePath)
-                (& $exePath init --cmd z powershell | Out-String)
-            } -ArgumentList @($_pspZoxideExecutablePath) -TimeoutSec 10
-            if ($_pspInitScript) {
-                $_pspZoxideInitStr = @($_pspInitScript) -join "`n"
-                $_pspZoxideHeader = "# ZOXIDE_CACHE_VERSION: $_pspZoxideVersion"
-                $_pspUtf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                [System.IO.File]::WriteAllText($_pspZoxideCachePath, ($_pspZoxideHeader + "`n" + $_pspZoxideInitStr), $_pspUtf8NoBom)
-                try { . $_pspZoxideCachePath } catch { Write-Warning "Failed to initialize zoxide: $_" }
+        if ([System.IO.File]::Exists($_pspZoxideCachePath)) {
+            try {
+                . $_pspZoxideCachePath
             }
-            else {
-                Write-Warning "Failed to initialize zoxide: $_"
+            catch {
+                # A cache left by an older zoxide is generated again once; one generated during this start is only reported.
+                $_pspZoxideError = $_
+                Remove-Item -LiteralPath $_pspZoxideCachePath -Force -ErrorAction SilentlyContinue
+                if (-not $_pspZoxideGenerated -and (New-PspZoxideCache -ExecutablePath $_pspZoxideExecutablePath -CachePath $_pspZoxideCachePath)) {
+                    try { . $_pspZoxideCachePath } catch { Write-Warning "Failed to initialize zoxide: $_" }
+                }
+                else {
+                    Write-Warning "Failed to initialize zoxide: $_pspZoxideError"
+                }
             }
         }
     }
@@ -7634,7 +8524,7 @@ function Get-ProfileCommand {
     $cmds | Sort-Object Category, Name
 }
 
-# Walk through command categories interactively on first run.
+# Walk through the command categories interactively.
 function Start-ProfileTour {
     <#
     .SYNOPSIS
@@ -7914,6 +8804,8 @@ function Set-TerminalBackground {
             Write-Warning "Live apply to WT settings.json failed for $wtSettingsPath`: $($_.Exception.Message)"
         }
     }
+    # -WhatIf has only listed the writes, so there is nothing to confirm.
+    if ($WhatIfPreference) { return }
     if ($Clear) { Write-PspHost 'Terminal background cleared.' -ForegroundColor Yellow }
     else {
         Write-PspHost ("Terminal background: {0} (opacity {1}, {2}, {3})" -f $resolved, (Get-PspProp $userDefaults 'backgroundImageOpacity'),
@@ -7991,13 +8883,12 @@ function Save-TrustedDirectories {
     return $true
 }
 
-# Help Function (PS5-compatible - $PSStyle only exists in PS7.2+)
+# Print the command reference, in plain text when NO_COLOR is set (https://no-color.org) or $PSStyle is missing (before PowerShell 7.2).
 function Show-Help {
     <#
     .SYNOPSIS
     Show this help message.
     #>
-    # Plain text when NO_COLOR is set (https://no-color.org) or on Windows PowerShell 5.1, which has no $PSStyle.
     if ($null -ne $PSStyle -and [string]::IsNullOrEmpty($env:NO_COLOR)) {
         $c = $PSStyle.Foreground.Cyan; $g = $PSStyle.Foreground.Green
         $y = $PSStyle.Foreground.Yellow; $m = $PSStyle.Foreground.Magenta; $r = $PSStyle.Reset
@@ -8016,10 +8907,10 @@ ${g}edit${r} <file> - Open file in preferred editor.
 ${g}Update-Profile${r} [-Ref <tag|commit>] - Sync profile, theme, caches, and WT settings (hash-checked). Use -Force to re-apply.
     -InstallMissingTools also installs missing tools with winget (accepting the source and package agreements) and the pinned PSFzf.
 ${g}Update-PowerShell${r} - Check for new PowerShell releases.
-${g}Update-Tools${r} - Update winget-managed tools; direct/MSI Oh My Posh installs are preserved.
+${g}Update-Tools${r} - Update winget-managed tools and the portable Oh My Posh build (replaces an MSIX install); other direct installs are preserved.
 ${g}Invoke-ProfileWizard${r} / ${g}Reconfigure-Profile${r} - Re-run the install wizard (theme, scheme, font, features).
 ${g}Show-Help${r} - Show this help message.
-${g}reload${r} - Reload the PowerShell profile.
+${g}. reload${r} - Reload the PowerShell profile (dot-source it so functions refresh too).
 ${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear the user temp folder and legacy IE cache (asks first); adds Windows\Temp and Prefetch.
 ${g}duration${r} - Elapsed time of the last command.
@@ -8102,7 +8993,7 @@ ${g}bak${r} <file> - Quick timestamped backup.
 ${c}Docker${r} (when installed)
 ${g}dps${r} / ${g}dpa${r} - Running / all containers.  ${g}dimg${r} - Images.
 ${g}dlogs${r} <container> - Follow logs.  ${g}dex${r} <container> [shell] - Exec into container.
-${g}dstop${r} - Stop all running containers.  ${g}dprune${r} - System prune. Both ask first.
+${g}dstop${r} [names] - Stop named containers, or all running ones.  ${g}dprune${r} - System prune. Both ask first.
 
 ${c}SSH & Remote${r} (ssh/keygen when installed)
 ${g}ssh${r} <user@host> - Wraps ssh.exe with ConnectTimeout=10 + keepalive so hangs respond to Ctrl+C.
@@ -8145,7 +9036,7 @@ ${c}Developer+${r}
 ${g}serve${r} [port] [path] [-Bind addr] - One-line HTTP server (python, or a pinned http-server via npx; loopback only by default).
 ${g}gitignore${r} <lang...> - Generate .gitignore from gitignore.io.
 ${g}gcof${r} - Fuzzy git branch checkout (fzf).
-${g}envload${r} [path] - Load .env file into current session.
+${g}envload${r} [path] [-AllowSensitive] - Load .env file into current session (PATH, NODE_OPTIONS, GIT_* and similar are skipped unless -AllowSensitive).
 ${g}tldr${r} <cmd> - Quick command-example lookup (tldr-pages).
 ${g}repeat${r} <count> { cmd } [-UntilSuccess] [-DelaySeconds n] - Repeat a scriptblock.
 ${g}mkvenv${r} [name] - Create and activate a Python venv.
@@ -8202,11 +9093,11 @@ Extend the profile without forking:
 $script:_seedCommands = @(
     @{ Name = 'Update-Profile'; Category = 'Profile'; Synopsis = 'Sync profile, theme, caches, WT settings from a branch, tag or commit' }
     @{ Name = 'Update-PowerShell'; Category = 'Profile'; Synopsis = 'Check for new PowerShell releases' }
-    @{ Name = 'Update-Tools'; Category = 'Profile'; Synopsis = 'Upgrade winget-managed tools' }
+    @{ Name = 'Update-Tools'; Category = 'Profile'; Synopsis = 'Upgrade winget-managed tools and the portable Oh My Posh build' }
     @{ Name = 'Edit-Profile'; Category = 'Profile'; Synopsis = 'Open profile in preferred editor' }
     @{ Name = 'Show-Help'; Category = 'Profile'; Synopsis = 'Show this help message' }
-    @{ Name = 'reload'; Category = 'Profile'; Synopsis = 'Reload the profile in-place' }
-    @{ Name = 'Clear-ProfileCache'; Category = 'Profile'; Synopsis = 'Reset caches except user settings' }
+    @{ Name = 'reload'; Category = 'Profile'; Synopsis = "Reload the profile; run as '. reload' to refresh functions too" }
+    @{ Name = 'Clear-ProfileCache'; Category = 'Profile'; Synopsis = 'Reset caches; settings and theme files are kept' }
     @{ Name = 'Clear-Cache'; Category = 'Profile'; Synopsis = 'Clear user/system temp caches' }
     @{ Name = 'Uninstall-Profile'; Category = 'Profile'; Synopsis = 'Remove profile, caches, WT changes' }
     @{ Name = 'Invoke-ProfileWizard'; Category = 'Profile'; Synopsis = 'Re-run install wizard (alias: Reconfigure-Profile)' }
@@ -8301,15 +9192,15 @@ $script:_seedCommands = @(
     @{ Name = 'killport'; Category = 'Developer'; Synopsis = 'Kill process on TCP port' }
     @{ Name = 'Stop-ListeningPort'; Category = 'Developer'; Synopsis = 'Interactive picker for listening ports (alias: killports)' }
     @{ Name = 'Find-FileLocker'; Category = 'Sysadmin'; Synopsis = 'Show processes holding a file/folder lock' }
-    @{ Name = 'Stop-StuckProcess'; Category = 'Sysadmin'; Synopsis = 'Escalating kill: Stop-Process -> taskkill /F -> /F /T' }
+    @{ Name = 'Stop-StuckProcess'; Category = 'Sysadmin'; Synopsis = 'Escalating kill: Stop-Process, then taskkill /F (/T with -Tree)' }
     @{ Name = 'Remove-LockedItem'; Category = 'Sysadmin'; Synopsis = 'Find lockers, kill, and delete (combo)' }
     @{ Name = 'http'; Category = 'Developer'; Synopsis = 'HTTP requests with auto JSON format' }
     @{ Name = 'prettyjson'; Category = 'Developer'; Synopsis = 'Pretty-print JSON' }
-    @{ Name = 'hb'; Category = 'Developer'; Synopsis = 'Upload to hastebin' }
+    @{ Name = 'hb'; Category = 'Developer'; Synopsis = 'Upload a file to a public paste (bin.christitus.com)' }
     @{ Name = 'timer'; Category = 'Developer'; Synopsis = 'Measure execution time' }
     @{ Name = 'watch'; Category = 'Developer'; Synopsis = 'Repeat command every n seconds' }
     @{ Name = 'serve'; Category = 'Developer'; Synopsis = 'One-line HTTP server' }
-    @{ Name = 'envload'; Category = 'Developer'; Synopsis = 'Load .env file' }
+    @{ Name = 'envload'; Category = 'Developer'; Synopsis = 'Load .env file (sensitive names need -AllowSensitive)' }
     @{ Name = 'tldr'; Category = 'Developer'; Synopsis = 'Quick command examples' }
     @{ Name = 'repeat'; Category = 'Developer'; Synopsis = 'Repeat scriptblock N times' }
     @{ Name = 'mkvenv'; Category = 'Developer'; Synopsis = 'Create + activate Python venv' }
@@ -8341,7 +9232,7 @@ $script:_seedCommands = @(
     @{ Name = 'dimg'; Category = 'Docker'; Synopsis = 'List images' }
     @{ Name = 'dlogs'; Category = 'Docker'; Synopsis = 'Follow container logs' }
     @{ Name = 'dex'; Category = 'Docker'; Synopsis = 'Exec into container' }
-    @{ Name = 'dstop'; Category = 'Docker'; Synopsis = 'Stop all running containers' }
+    @{ Name = 'dstop'; Category = 'Docker'; Synopsis = 'Stop named containers, or all running ones' }
     @{ Name = 'dprune'; Category = 'Docker'; Synopsis = 'docker system prune' }
     @{ Name = 'cpy'; Category = 'Clipboard'; Synopsis = 'Copy text to clipboard' }
     @{ Name = 'pst'; Category = 'Clipboard'; Synopsis = 'Paste from clipboard' }
@@ -8360,12 +9251,11 @@ foreach ($_pspEntry in $script:_seedCommands) {
 }
 Remove-Variable -Name _seedCommands -Scope Script -ErrorAction SilentlyContinue
 
-# Load user settings before PowerShell overrides and plugins.
-$script:UserSettings = $null
-try { $script:UserSettings = Read-JsonFile (Join-Path $cacheDir 'user-settings.json') }
-catch { Write-Warning "user-settings.json unreadable: $($_.Exception.Message)" }
+# Load user settings before PowerShell overrides and plugins, reusing the parse from the PSReadLine setup.
+$script:UserSettings = $_pspRlUser
+if ($_pspRlUserError) { Write-Warning "user-settings.json unreadable: $($_pspRlUserError.Exception.Message)" }
 if ($script:UserSettings) {
-    # Authoritative feature apply (also covers the case where the early PSReadLine-block apply was skipped/failed).
+    # Apply feature toggles again in case the PSReadLine block skipped them.
     Set-PspFeatureOverride $script:UserSettings
     # Trusted directories carry the SHA-256 of the .psprc.ps1 that was approved; entries without one need a new approval.
     $_pspTrust = Get-PspTrustState $script:UserSettings
@@ -8395,8 +9285,8 @@ if ($script:UserSettings) {
                 }
                 catch { Write-Warning "commandOverride '$_pspOvName' failed: $($_.Exception.Message)" }
             }
-            # Visible notice every interactive load so JSON-sourced code execution is not invisible.
-            if ($_pspAppliedOverrides.Count -gt 0 -and $script:PSP.IsInteractive -and $script:PSP.Features.startupMessage) {
+            # Shown on every interactive load, also with the startup message off, because the opt-in sits in the same file as the overrides.
+            if ($_pspAppliedOverrides.Count -gt 0 -and $script:PSP.IsInteractive) {
                 Write-PspHost ("commandOverrides active ({0}): {1}" -f $_pspAppliedOverrides.Count, ($_pspAppliedOverrides -join ', ')) -ForegroundColor Yellow
             }
         }
@@ -8404,23 +9294,30 @@ if ($script:UserSettings) {
 }
 
 # Load persistent PowerShell overrides after JSON settings and before plugins.
-$_pspUserProfile = Join-Path (Split-Path $PROFILE) "profile_user.ps1"
-if (Test-Path -LiteralPath $_pspUserProfile) {
+$_pspUserProfile = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($PROFILE), 'profile_user.ps1')
+if ([System.IO.File]::Exists($_pspUserProfile)) {
     try { . $_pspUserProfile }
     catch { Write-Warning "Failed to load profile_user.ps1: $_" }
 }
 
-# Dot-source plugins with script scope while isolating errors per file.
-$_pspPluginDir = Join-Path $cacheDir 'plugins'
-if (-not (Test-Path -LiteralPath $_pspPluginDir)) {
+# Dot-source plugins in name order with script scope while isolating errors per file.
+$_pspPluginDir = [System.IO.Path]::Combine($cacheDir, 'plugins')
+if (-not [System.IO.Directory]::Exists($_pspPluginDir)) {
     try { New-Item -ItemType Directory -Path $_pspPluginDir -Force | Out-Null } catch { $null = $_ }
 }
-if (Test-Path -LiteralPath $_pspPluginDir) {
-    foreach ($_pspPlugin in (Get-ChildItem -LiteralPath $_pspPluginDir -Filter *.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
-        try { . $_pspPlugin.FullName }
+if ([System.IO.Directory]::Exists($_pspPluginDir)) {
+    $_pspPluginFiles = @()
+    try { $_pspPluginFiles = [System.IO.Directory]::GetFiles($_pspPluginDir, '*.ps1') } catch { $null = $_ }
+    # Culture-aware, case-insensitive ordering matches Sort-Object Name.
+    if ($_pspPluginFiles.Count -gt 1) { [System.Array]::Sort($_pspPluginFiles, [System.StringComparer]::CurrentCultureIgnoreCase) }
+    foreach ($_pspPlugin in $_pspPluginFiles) {
+        # The Windows *.ps1 pattern also matches .ps1xml; hidden and system files stay skipped, as with Get-ChildItem.
+        if (-not $_pspPlugin.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (([System.IO.File]::GetAttributes($_pspPlugin) -band ([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)) -ne 0) { continue }
+        try { . $_pspPlugin }
         catch {
             if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
-            Write-Warning "Plugin '$($_pspPlugin.Name)' failed to load: $($_.Exception.Message)"
+            Write-Warning "Plugin '$([System.IO.Path]::GetFileName($_pspPlugin))' failed to load: $($_.Exception.Message)"
         }
     }
 }
@@ -8448,7 +9345,7 @@ if ($script:PSP.IsInteractive -and $script:PSP.Features.updateCheck) {
                     Write-PspHost ("Update-check enabled. Baseline: {0}. You'll see a notification here when main moves past this commit." -f $_pspUcLatest.Substring(0, 7)) -ForegroundColor DarkGray
                 }
                 elseif ($_pspUcStored -ne $_pspUcLatest) {
-                    Write-PspHost ("Update available: main is at {0}... (applied {1}...). Run: Update-Profile" -f $_pspUcLatest.Substring(0, 7), $_pspUcStored.Substring(0, 7)) -ForegroundColor Yellow
+                    Write-PspHost ("Update available: main is at {0}... (applied {1}...). Run Update-Profile; it prints the bundle hash to pin with -ExpectedSha256 (or use -SkipHashCheck)." -f $_pspUcLatest.Substring(0, 7), $_pspUcStored.Substring(0, 7)) -ForegroundColor Yellow
                 }
                 # Record the check time only after a successful API response.
                 Write-Utf8FileAtomic -Path $_pspUcStampFile -Content (Get-Date).ToString('o')
@@ -8460,6 +9357,9 @@ if ($script:PSP.IsInteractive -and $script:PSP.Features.updateCheck) {
 
 # Fire OnProfileLoad hooks (user/plugin extensions).
 Invoke-ProfileHook -EventName 'OnProfileLoad'
+
+# A prompt that profile_user.ps1 or a plugin defined does not end the startup garbage collection pause, so it ends here.
+if ($script:PspNoGcRegion -and -not ([string]$Function:prompt).Contains('Exit-PspNoGcRegion')) { Exit-PspNoGcRegion }
 
 # Startup complete - show load time
 $_pspStopwatch.Stop()

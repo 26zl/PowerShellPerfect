@@ -1,7 +1,7 @@
 name: Tool Issue
 description: Report an issue with a managed tool (eza, zoxide, fzf, bat, ripgrep, Oh My Posh)
 title: "[Tool] "
-labels: ["tool-issue"]
+labels: ["bug"]
 body:
   - type: dropdown
     id: tool
@@ -21,7 +21,7 @@ body:
     id: tool-version
     attributes:
       label: Tool version
-      description: "Run `Update-Tools` or check the tool's `--version` output"
+      description: "Run the tool with `--version` (for Oh My Posh, `oh-my-posh version`)"
       placeholder: "e.g. eza 0.20.14"
     validations:
       required: true
@@ -34,6 +34,15 @@ body:
         - PowerShell 5.1
         - PowerShell 7+
         - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: psp-doctor
+    attributes:
+      label: psp-doctor output
+      description: 'Run `psp-doctor` and paste the output: it shows the profile version, the commit it was installed from, and where each tool was found. Paths include your user name; edit it out if you like.'
+      render: text
     validations:
       required: true
 

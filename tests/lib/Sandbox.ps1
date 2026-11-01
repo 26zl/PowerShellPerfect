@@ -109,7 +109,7 @@ function Remove-PspTestStubs {
 $script:PspPostLoadStubs = {
     # oh-my-posh keeps its own cache outside LOCALAPPDATA\PowerShellProfile.
     function Clear-OhMyPoshCaches { param([switch]$Quiet) }
-    # Reloading PATH from the registry would drop the sandbox's winget.cmd from the front of PATH.
+    # Registry PATH entries would add the real machine's tools behind the sandbox's stubs.
     function Update-SessionPathFromRegistry { }
     # Font removal stays inside the sandbox.
     if ($script:PSP) {

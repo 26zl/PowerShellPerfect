@@ -5,7 +5,7 @@
     ExcludeRules = @(
         # Console output is the interface of an interactive profile; Write-PspHost wraps it for NO_COLOR.
         'PSAvoidUsingWriteHost'
-        # uptime keeps a Get-WmiObject fallback for Windows PowerShell 5.1.
+        # Get-SystemBootTime uses Get-WmiObject on Windows PowerShell 5.1.
         'PSAvoidUsingWMICmdlet'
         # Short Unix-style helpers (touch, mkcd, export) change state by design; destructive commands support -WhatIf.
         'PSUseShouldProcessForStateChangingFunctions'

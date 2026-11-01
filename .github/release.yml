@@ -1,0 +1,17 @@
+# Groups the notes GitHub generates from merged pull requests (gh release create --generate-notes in workflows/release.yml).
+changelog:
+  exclude:
+    labels:
+      - dependencies
+    authors:
+      - "dependabot[bot]"
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Other changes
+      labels:
+        - "*"
