@@ -10,7 +10,8 @@
 
     No administrator rights are needed: the Nerd Font is installed for the current user and the telemetry
     opt-out is set for the current user (both machine-wide when the shell is elevated). winget installs
-    eza, zoxide, fzf, bat, ripgrep and Oh My Posh and accepts the winget source and package agreements for you.
+    eza, zoxide, fzf, bat and ripgrep and accepts the winget source and package agreements for you. Oh My Posh
+    is installed as the pinned portable release build (SHA-256 and signer checked), with winget as the fallback.
 
     Each run is logged to %LOCALAPPDATA%\PowerShellProfile\logs\setup-<timestamp>.log. Use -WhatIf to see the
     changes without making them, and Uninstall-Profile to revert them.
@@ -67,7 +68,8 @@
 
 .NOTES
     Exit codes: 0 = the profile is installed (optional tools that were skipped or failed are listed in the summary);
-    1 = nothing was applied (verification failed, unsupported system) or the profile could not be installed.
+    1 = nothing was applied (verification failed, unsupported system) or the profile could not be installed;
+    2 = the wizard was cancelled, so nothing was installed.
     When setup runs as a script block (the README install command) it sets $LASTEXITCODE instead of exiting and
     removes the variables it created in the caller's session. Invoke-Expression (irm | iex) is not supported.
 #>
@@ -137,9 +139,11 @@ $script:WizardEditor = $null
 $script:WizardTelemetryHandled = $false
 $script:TranscriptStarted = $false
 $script:ErrorReported = $false
+$script:SetupCancelled = $false
 $script:IsElevated = $false
 try { $script:IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $null = $_ }
-$script:IsCiHost = $CiMode -or [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
+# CI=false or CI=0, which some build tools tell users to set globally, does not count as CI.
+$script:IsCiHost = $CiMode -or [bool]$env:GITHUB_ACTIONS -or ([bool]$env:CI -and $env:CI -ne 'false' -and $env:CI -ne '0')
 $script:CanPrompt = [Environment]::UserInteractive -and -not $script:IsCiHost -and -not [bool]$env:AI_AGENT
 if ($script:CanPrompt) { try { $null = [Console]::KeyAvailable } catch { $script:CanPrompt = $false } }
 
@@ -177,6 +181,8 @@ function Invoke-DownloadWithRetry {
         [int]$MaxAttempts = 2,
         [int]$BackoffSec = 2
     )
+    # The progress display slows large downloads on Windows PowerShell 5.1 a lot; this scope only.
+    $ProgressPreference = 'SilentlyContinue'
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
@@ -338,6 +344,17 @@ function Initialize-InstallBundle {
         }
         Write-PspHost "Install bundle verified: $combined" -ForegroundColor Green
     }
+    elseif ($LocalRepo -and (Test-Path -LiteralPath (Join-Path $LocalRepo 'SHA256SUMS.txt') -PathType Leaf)) {
+        # Release files downloaded next to setup.ps1 come with SHA256SUMS.txt, and every bundle file must match it.
+        $localSums = @{}
+        foreach ($line in [System.IO.File]::ReadAllLines((Join-Path $LocalRepo 'SHA256SUMS.txt'))) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(\S+)$') { $localSums[$Matches[2]] = $Matches[1].ToUpperInvariant() }
+        }
+        foreach ($key in $names.Keys) {
+            if ($localSums[$names[$key]] -ne $hashes[$key]) { throw "$($names[$key]) in $LocalRepo does not match the SHA256SUMS.txt next to it." }
+        }
+        Write-PspHost "Install bundle matches the SHA256SUMS.txt in $LocalRepo." -ForegroundColor Green
+    }
     elseif ($LocalRepo) {
         Write-PspHost "Installing from local files in $LocalRepo (not hash-checked). Bundle hash of these files: $combined" -ForegroundColor DarkGray
     }
@@ -376,10 +393,15 @@ $script:SharedFunctionNames = @(
     'Get-PspUserSettingsTemplate', 'Merge-PspUserSettings', 'Test-PspTrustedThemeUrl', 'Read-UserSettingsForWrite', 'Get-PspShellPath',
     'Get-WtProfileList', 'Test-PspProfileFile', 'Get-PspOriginalProfileSource'
 )
+# Helpers newer than 1.0.0 are loaded when the verified profile defines them, so setup can still install an older release with -Ref.
+$script:OptionalSharedFunctionNames = @(
+    'Find-ProfileExecutable', 'Get-OhMyPoshPortablePath', 'Install-OhMyPoshPortable', 'Remove-WtRetiredKeybinding', 'Restore-WtRecordedKeybinding',
+    'Get-PspOmpThemeRisk', 'Get-PspExecutableVersion', 'Test-PspOmpVersionSafe'
+)
 
 # Return the source text of the shared helper functions defined at the top level of a profile file.
 function Get-SharedFunctionDefinitions {
-    param([Parameter(Mandatory)][string]$ProfilePath, [Parameter(Mandatory)][string[]]$Names)
+    param([Parameter(Mandatory)][string]$ProfilePath, [Parameter(Mandatory)][string[]]$Names, [string[]]$OptionalNames = @())
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($ProfilePath, [ref]$tokens, [ref]$parseErrors)
@@ -391,6 +413,7 @@ function Get-SharedFunctionDefinitions {
     $missing = @($Names | Where-Object { -not $defined.ContainsKey($_) })
     if ($missing.Count -gt 0) { throw "The profile does not define: $($missing -join ', ')" }
     foreach ($name in $Names) { $defined[$name] }
+    foreach ($name in $OptionalNames) { if ($defined.ContainsKey($name)) { $defined[$name] } }
 }
 
 # Define the install wizard's curated Windows Terminal color schemes.
@@ -436,9 +459,7 @@ $script:CuratedFonts = @(
     @{ Name = 'Iosevka';        Asset = 'Iosevka';        DisplayName = 'Iosevka NF';          Desc = 'Narrow monospace, space-efficient'; Sha256 = '0512C8561FDCFED03C5CAE130D1C01F279CFAD19467337F9EAB98A2B730ECC50' }
 )
 
-# Define editor choices and optional winget package IDs.
-# Defined before the wizard runs: PowerShell only registers a function once its
-# definition statement executes, so anything Start-InstallWizard calls must appear above it.
+# Editor choices and their winget IDs; this must stay above Start-InstallWizard, which uses it.
 $EditorCandidates = @(
     @{ Cmd = 'code'; Display = 'Visual Studio Code'; WingetId = 'Microsoft.VisualStudioCode' }
     @{ Cmd = 'nvim'; Display = 'Neovim'; WingetId = 'Neovim.Neovim' }
@@ -455,7 +476,7 @@ function Get-OmpThemeUrl {
     'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/{0}/themes/{1}.omp.json' -f $Ref, $Name
 }
 
-# Return one wizard choice from stdin, Out-GridView, or fzf.
+# Prompt for one wizard choice by number or partial name.
 function Select-WizardItem {
     param(
         [Parameter(Mandatory)][string]$Title,
@@ -521,8 +542,7 @@ function Save-WizardChoices {
     try { $s = Read-UserSettingsForWrite -Path $UserSettingsPath }
     catch { throw "user-settings.json could not be read ($($_.Exception.Message)). Fix or move $UserSettingsPath and run the wizard again; nothing was saved." }
 
-    # The wizard writes this file before the install steps lay down their template, which is then
-    # skipped as "already exists", so carry the header that explains what the file is for.
+    # The install steps skip their template when this file already exists, so the wizard adds the header that explains it.
     if (-not $s.PSObject.Properties['_comment']) {
         $s | Add-Member -NotePropertyName '_comment' -NotePropertyValue 'User overrides for terminal, theme, and profile behavior. Only add keys you want to override.' -Force
     }
@@ -687,6 +707,13 @@ function Resolve-WizardState {
         if ($known.Count -gt 0) { $valid.Features = $known }
     }
     $valid.CompletedSteps = @((Get-PspArray $Saved 'CompletedSteps') | Where-Object { $steps -contains [string]$_ } | ForEach-Object { [string]$_ } | Select-Object -Unique)
+    # A step whose saved answer was dropped is asked again instead of silently falling back to the default.
+    $stepOf = @{ Theme = 'Theme'; Scheme = 'Scheme'; Font = 'Font'; TabBar = 'TabBar'; Terminal = 'Terminal'; PSReadLine = 'PSReadLine'; Background = 'Background'; Editor = 'Editor'; TelemetryOptOut = 'Telemetry'; Features = 'Features' }
+    $rejected = @(foreach ($key in $stepOf.Keys) { if ($null -ne (Get-PspProp $Saved $key) -and $null -eq $valid[$key] -and $valid.CompletedSteps -contains $stepOf[$key]) { $stepOf[$key] } })
+    if ($rejected.Count -gt 0) {
+        $valid.CompletedSteps = @($valid.CompletedSteps | Where-Object { $rejected -notcontains $_ })
+        Write-PspHost ("  Saved answers that are no longer valid are asked again: {0}." -f (($rejected | Sort-Object) -join ', ')) -ForegroundColor Yellow
+    }
     return $valid
 }
 
@@ -727,7 +754,9 @@ function Select-PreferredEditor {
     }
     if (-not (Get-Command $chosen.Cmd -ErrorAction Ignore)) {
         Write-PspHost "  '$($chosen.Cmd)' is not installed." -ForegroundColor Yellow
-        $confirm = Read-Host "  Use anyway? [y/N]"
+        # Yes means Resolve-ConfiguredEditor installs it with winget later in setup.
+        $question = if ($chosen.WingetId) { '  Install it with winget during setup (this accepts its license)? [y/N]' } else { '  Use it anyway? [y/N]' }
+        $confirm = Read-Host $question
         if ($confirm -notmatch '^[Yy]') {
             Write-PspHost "  Using default instead." -ForegroundColor Yellow
             return $EditorCandidates[$defaultChoice].Cmd
@@ -1104,9 +1133,7 @@ function Install-NerdFonts {
 
         Expand-Archive -LiteralPath $zipFilePath -DestinationPath $extractPath -Force
         $destination = (New-Object -ComObject Shell.Application).Namespace(0x14)
-        # A shell font install lands machine-wide when elevated and per-user otherwise, so
-        # presence must be checked in both stores - watching only the system one makes the
-        # wait loop below time out and report failure after a perfectly good install.
+        # A shell font install lands machine-wide when elevated and per-user otherwise, so both stores are checked.
         $fontStores = @(
             (Join-Path $env:SystemRoot 'Fonts')
             (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts')
@@ -1146,9 +1173,12 @@ function Install-NerdFonts {
         return $true
     }
     catch {
-        Remove-SafeTempDirectory -Path $tempRoot -NamePrefix 'psp-font-'
         Write-PspHost "  Failed to install ${FontDisplayName}: $_" -ForegroundColor Red
         return $false
+    }
+    finally {
+        # Also runs on Ctrl+C, which skips the catch block.
+        Remove-SafeTempDirectory -Path $tempRoot -NamePrefix 'psp-font-'
     }
 }
 
@@ -1160,8 +1190,12 @@ function Install-OhMyPoshTheme {
         [string]$ThemeName,
         [Parameter(Mandatory)]
         [string]$ThemeUrl,
-        [string]$Sha256
+        [string]$Sha256,
+        # Accept a theme that can run commands on every prompt (theme.allowCommands in user-settings.json).
+        [switch]$AllowCommands
     )
+    # Profiles without Get-PspOmpThemeRisk skip the check for themes that run commands.
+    $canCheckThemeRisk = [bool](Get-Command Get-PspOmpThemeRisk -CommandType Function -ErrorAction Ignore)
     if ($ThemeName -notmatch '^[A-Za-z0-9._-]+$') {
         Write-PspHost "  Refusing theme with an invalid name: $ThemeName" -ForegroundColor Red
         return $false
@@ -1176,8 +1210,10 @@ function Install-OhMyPoshTheme {
         $alreadyValid = $false
         if (Test-Path -LiteralPath $themeFilePath -PathType Leaf) {
             try {
-                if ($null -ne (Read-JsonFile $themeFilePath)) {
-                    $alreadyValid = -not $Sha256 -or ((Get-FileHash -LiteralPath $themeFilePath -Algorithm SHA256).Hash -eq $Sha256.ToUpperInvariant())
+                $existingTheme = Read-JsonFile $themeFilePath
+                if ($null -ne $existingTheme) {
+                    $alreadyValid = (-not $Sha256 -or ((Get-FileHash -LiteralPath $themeFilePath -Algorithm SHA256).Hash -eq $Sha256.ToUpperInvariant())) -and
+                    ($AllowCommands -or -not $canCheckThemeRisk -or (Get-PspOmpThemeRisk -Theme $existingTheme).Count -eq 0)
                 }
             }
             catch { $null = $_ }
@@ -1190,10 +1226,16 @@ function Install-OhMyPoshTheme {
         if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
         $tempThemePath = Join-Path $cacheDir ("{0}.{1}.download" -f $ThemeName, [System.IO.Path]::GetRandomFileName())
         Invoke-DownloadWithRetry -Uri $ThemeUrl -OutFile $tempThemePath
-        if ($null -eq (Read-JsonFile $tempThemePath)) { throw 'Downloaded theme file is empty' }
+        $downloadedTheme = Read-JsonFile $tempThemePath
+        if ($null -eq $downloadedTheme) { throw 'Downloaded theme file is empty' }
         if ($Sha256) {
             $actual = (Get-FileHash -LiteralPath $tempThemePath -Algorithm SHA256).Hash
             if ($actual -ne $Sha256.ToUpperInvariant()) { throw "Theme hash mismatch (expected $Sha256, got $actual)" }
+        }
+        $themeRisks = @()
+        if ($canCheckThemeRisk) { $themeRisks = Get-PspOmpThemeRisk -Theme $downloadedTheme }
+        if (@($themeRisks).Count -gt 0 -and -not $AllowCommands) {
+            throw ("theme '{0}' can run commands on every prompt ({1}). Set theme.allowCommands = true in user-settings.json to use it" -f $ThemeName, (@($themeRisks) -join ', '))
         }
         Move-Item -LiteralPath $tempThemePath -Destination $themeFilePath -Force
         $tempThemePath = $null
@@ -1224,7 +1266,7 @@ function Install-WingetPackage {
         return $false
     }
     if (-not $PSCmdlet.ShouldProcess($Name, "Install with winget ($Id), accepting the winget source and package agreements")) { return $true }
-    $result = Invoke-SetupNative -FilePath $winget.Source -ArgumentList @('install', '-e', '--id', $Id, '--accept-source-agreements', '--accept-package-agreements')
+    $result = Invoke-SetupNative -FilePath $winget.Source -ArgumentList @('install', '-e', '--id', $Id, '--source', 'winget', '--accept-source-agreements', '--accept-package-agreements')
     if ($result.ExitCode -eq 0) {
         Write-PspHost "  $Name installed." -ForegroundColor Green
         return $true
@@ -1253,7 +1295,7 @@ function Resolve-ConfiguredEditor {
             $resolvedEditor = 'notepad'
         }
         elseif (Install-WingetPackage -Name $chosen.Display -Id $chosen.WingetId) {
-            # Exclude empty PATH entries that Windows could interpret as the current directory.
+            # Reload PATH so the new editor resolves.
             Update-SessionPathFromRegistry
         }
         else {
@@ -1329,13 +1371,10 @@ function Install-ProfileFiles {
             $staged = Join-Path $dir ('.psp-new-' + [System.IO.Path]::GetRandomFileName() + '.ps1')
             Copy-Item -LiteralPath $Source -Destination $staged -Force
             if (Test-Path -LiteralPath $targetProfile -PathType Leaf) {
-                # Preserve the pre-install profile once as an immutable copy that rotation never deletes
-                # and Uninstall-Profile restores; oldprofile* rotation below never matches this name.
+                # Keep the pre-install profile once as profile.original.ps1, which rotation never touches; a copy of this profile there is replaced.
                 $originalBackup = Join-Path $dir 'profile.original.ps1'
-                # Earlier versions could save an installed copy of this profile as the original; such a copy is replaced.
                 $originalIsOurs = (Test-Path -LiteralPath $originalBackup) -and (Test-PspProfileFile -Path $originalBackup)
                 if ($originalIsOurs -or -not (Test-Path -LiteralPath $originalBackup)) {
-                    # The current profile, or when that is this profile already, the oldest backup that is not.
                     $originalSource = Get-PspOriginalProfileSource -Directory $dir
                     if ($originalSource) {
                         Copy-Item -LiteralPath $originalSource -Destination $originalBackup -Force
@@ -1347,8 +1386,10 @@ function Install-ProfileFiles {
                 $backupPath = Join-Path $dir ('oldprofile.{0}.ps1' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
                 Copy-Item -LiteralPath $targetProfile -Destination $backupPath -Force
                 Write-PspHost "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
+                # Only timestamped backups rotate, newest by the stamp in the name, since Copy-Item keeps the source LastWriteTime.
                 Get-ChildItem -LiteralPath $dir -Filter 'oldprofile*.ps1' -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+                    Where-Object { $_.Name -match '^oldprofile\.\d{8}-\d{6}\.ps1$' } |
+                    Sort-Object Name -Descending | Select-Object -Skip 5 |
                     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
             }
             Move-Item -LiteralPath $staged -Destination $targetProfile -Force
@@ -1461,7 +1502,17 @@ function Invoke-SetupInstall {
                 Write-PspHost ("Installing Nerd Font: {0} v{1}..." -f $wizChoices.Font.DisplayName, $script:NerdFontVersion) -ForegroundColor Cyan
                 $script:WizardFontInstalled = Install-NerdFonts -FontName $wizChoices.Font.Asset -FontDisplayName $wizChoices.Font.DisplayName -Version $script:NerdFontVersion -Sha256 $wizChoices.Font.Sha256
                 if (-not $script:WizardFontInstalled) {
-                    Write-PspHost "  Wizard font install did not complete; step [4/10] will retry with the default font." -ForegroundColor Yellow
+                    Write-PspHost "  Wizard font install did not complete; step [4/10] installs the default font, which Windows Terminal then uses." -ForegroundColor Yellow
+                    # The saved face would point Windows Terminal at a font that is not installed, so it is dropped and the default applies.
+                    try {
+                        $savedSettings = Read-UserSettingsForWrite -Path $userSettingsPath
+                        $savedFont = Get-PspPath $savedSettings 'defaults.font'
+                        if ($savedFont -and [string](Get-PspProp $savedFont 'face') -eq $wizChoices.Font.DisplayName -and $PSCmdlet.ShouldProcess($userSettingsPath, 'Remove the font face that failed to install')) {
+                            Remove-PspProp $savedFont 'face'
+                            Write-Utf8FileAtomic -Path $userSettingsPath -Content ($savedSettings | ConvertTo-Json -Depth 20)
+                        }
+                    }
+                    catch { Write-PspHost "  Could not reset the font in user-settings.json: $_" -ForegroundColor Yellow }
                 }
             }
 
@@ -1472,8 +1523,11 @@ function Invoke-SetupInstall {
             if ($wizChoices.TelemetryOptOut -and -not (Test-TelemetryOptOutSet)) { Set-TelemetryOptOut -CacheDir $configCachePath }
         }
         catch {
-            if ($_.Exception.Message -eq 'WizardCancelled') {
-                Write-PspHost 'Continuing setup without wizard overrides.' -ForegroundColor Yellow
+            if ($_.Exception.Message -like 'WizardCancelled*') {
+                # Declining the summary, or leaving another running wizard alone, stops setup before anything is installed.
+                Write-PspHost 'Setup cancelled: nothing was installed.' -ForegroundColor Yellow
+                $script:SetupCancelled = $true
+                return $false
             }
             else {
                 Write-Warning ("Wizard failed: {0}. Continuing with defaults; run setup.ps1 -Wizard -Resume to finish it." -f $_.Exception.Message)
@@ -1510,7 +1564,7 @@ function Invoke-SetupInstall {
     }
 
     if (-not $script:IsCiHost -and -not (Get-Command winget -CommandType Application -ErrorAction Ignore)) {
-        Write-PspHost "winget (App Installer) not found - skipping optional tool installs (eza, bat, fzf, zoxide, ripgrep, Oh My Posh)." -ForegroundColor Yellow
+        Write-PspHost "winget (App Installer) not found - skipping optional tool installs (eza, bat, fzf, zoxide, ripgrep); Oh My Posh still installs as the portable build." -ForegroundColor Yellow
         Write-PspHost "  Install it later from the Microsoft Store or https://aka.ms/getwinget to add those tools." -ForegroundColor DarkYellow
     }
 
@@ -1557,10 +1611,11 @@ function Invoke-SetupInstall {
         Write-PspHost "  Skipped (non-interactive). Default: code, notepad" -ForegroundColor Yellow
     }
 
-    # OMP Install
     Write-PspHost "[3/10] Oh My Posh" -ForegroundColor Cyan
     $ompPath = Get-OhMyPoshExecutablePath
-    if ($ompPath -and $ompPath -notlike ((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps') + '*')) {
+    # An install older than the minimum stays, and the portable build installed next to it is what the prompt uses.
+    $ompTooOld = $ompPath -and -not $script:IsCiHost -and (Get-Command Test-PspOmpVersionSafe -CommandType Function -ErrorAction Ignore) -and -not (Test-PspOmpVersionSafe -Path $ompPath)
+    if ($ompPath -and $ompPath -notlike ((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps') + '*') -and -not $ompTooOld) {
         Write-PspHost "  Oh My Posh already present at $ompPath (preserved)." -ForegroundColor Green
         $ompInstalled = $true
     }
@@ -1569,15 +1624,30 @@ function Invoke-SetupInstall {
         $ompInstalled = $true
     }
     else {
-        $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
+        if ($ompTooOld) {
+            Write-PspHost ('  Oh My Posh at {0} is older than {1} and runs code taken from folder names (CVE-2026-73505); installing the portable build for the prompt. Update or remove that install.' -f $ompPath, (Get-PspComponentPins).OhMyPoshMinimum) -ForegroundColor Yellow
+        }
+        # Portable build first (hash and signer checked); winget is the fallback.
+        $ompInstalled = $false
+        if (Get-Command Install-OhMyPoshPortable -CommandType Function -ErrorAction Ignore) {
+            $ompInstalled = [bool](Install-OhMyPoshPortable -Confirm:$false)
+            if ($ompInstalled -and $ompPath -and -not $ompTooOld) {
+                Write-PspHost "  The MSIX build at $ompPath is no longer used. Remove it with: winget uninstall -e --id JanDeDobbeleer.OhMyPosh" -ForegroundColor DarkGray
+            }
+        }
+        if (-not $ompInstalled -and -not $WhatIfPreference) {
+            $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
+        }
+        elseif ($WhatIfPreference) { $ompInstalled = $true }
     }
     # Wizard OMP-theme override wins if present; otherwise use theme.json (with user-settings overrides).
     $configTheme = Get-PspProp $profileConfig 'theme'
+    $allowThemeCommands = [bool](Get-PspProp $configTheme 'allowCommands')
     if ($script:WizardOmpTheme) {
-        $themeInstalled = Install-OhMyPoshTheme -ThemeName $script:WizardOmpTheme.Name -ThemeUrl $script:WizardOmpTheme.Url -Sha256 ([string](Get-PspProp $script:WizardOmpTheme 'Sha256'))
+        $themeInstalled = Install-OhMyPoshTheme -ThemeName $script:WizardOmpTheme.Name -ThemeUrl $script:WizardOmpTheme.Url -Sha256 ([string](Get-PspProp $script:WizardOmpTheme 'Sha256')) -AllowCommands:$allowThemeCommands
     }
     elseif ((Get-PspProp $configTheme 'name') -and (Get-PspProp $configTheme 'url')) {
-        $themeInstalled = Install-OhMyPoshTheme -ThemeName ([string]$configTheme.name) -ThemeUrl ([string]$configTheme.url) -Sha256 ([string](Get-PspProp $configTheme 'sha256'))
+        $themeInstalled = Install-OhMyPoshTheme -ThemeName ([string]$configTheme.name) -ThemeUrl ([string]$configTheme.url) -Sha256 ([string](Get-PspProp $configTheme 'sha256')) -AllowCommands:$allowThemeCommands
     }
     else {
         $reason = if (-not $profileConfig) { "theme.json missing" }
@@ -1587,14 +1657,13 @@ function Invoke-SetupInstall {
         $themeInstalled = $false
     }
     # Invalidate generated init caches.
-    foreach ($cacheFile in @('zoxide-init.ps1', 'omp-init.ps1')) {
+    foreach ($cacheFile in @('zoxide-init.ps1', 'omp-init.ps1', 'omp-secondary-prompt.txt', 'omp-theme-fast.json')) {
         $cachePath = Join-Path $configCachePath $cacheFile
         if ((Test-Path -LiteralPath $cachePath) -and $PSCmdlet.ShouldProcess($cachePath, 'Remove stale init cache')) {
             Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
         }
     }
 
-    # Font Install
     Write-PspHost "[4/10] Nerd Fonts" -ForegroundColor Cyan
     $fontInstall = Get-PspProp $terminalConfig 'fontInstall'
     $fontName = [string](Get-PspProp $fontInstall 'name')
@@ -1643,7 +1712,6 @@ function Invoke-SetupInstall {
         }
     }
 
-    # zoxide Install
     Write-PspHost "[6/10] zoxide" -ForegroundColor Cyan
     $zoxideInstalled = $true
     if ($script:IsCiHost) {
@@ -1665,7 +1733,7 @@ function Invoke-SetupInstall {
             $psfzfVersion = (Get-PspComponentPins).PSFzf
             if ($PSCmdlet.ShouldProcess("PSFzf $psfzfVersion", 'Install PowerShell module from the PowerShell Gallery (CurrentUser)')) {
                 try {
-                    Install-Module -Name PSFzf -RequiredVersion $psfzfVersion -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                    Install-Module -Name PSFzf -RequiredVersion $psfzfVersion -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
                     Write-PspHost "  PSFzf $psfzfVersion installed." -ForegroundColor Green
                 }
                 catch {
@@ -1732,9 +1800,10 @@ function Invoke-SetupInstall {
                 ManifestPath    = (Join-Path $configCachePath 'wt-changes.json')
                 Defaults        = $wtDefaults
                 WindowsTerminal = $wtTheme
-                Keybindings     = Get-PspArray $terminalConfig 'keybindings'
                 NoLogo          = $true
             }
+            # Keybindings sync only from a loaded terminal-config.json, which also retires bindings it no longer lists.
+            if ($null -ne $terminalConfig) { $wtArgs.Keybindings = Get-PspArray $terminalConfig 'keybindings' }
             if (Update-WindowsTerminalSettingsFile @wtArgs) {
                 $schemeLabel = if (Get-PspProp $wtTheme 'colorScheme') { $wtTheme.colorScheme } else { '(unchanged)' }
                 Write-PspHost "  Windows Terminal configured: $wtSettingsPath (scheme: $schemeLabel)." -ForegroundColor Green
@@ -1799,6 +1868,8 @@ function Restart-SetupTerminal {
     if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
         $dir = [Environment]::GetFolderPath('UserProfile')
     }
+    # Windows Terminal splits its command line at every ';', so a folder containing one is not passed to wt -d.
+    if ($dir.Contains(';')) { $dir = [Environment]::GetFolderPath('UserProfile') }
     $shellExe = Get-PspShellPath
     $wt = Get-Command wt.exe -CommandType Application -ErrorAction Ignore | Select-Object -First 1
     if ($wt) {
@@ -1812,9 +1883,7 @@ function Restart-SetupTerminal {
     exit $ExitCode
 }
 
-# ---------------------------------------------------------------------------------------------
 # Main flow
-# ---------------------------------------------------------------------------------------------
 $exitCode = 1
 try {
     $onWindows = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows
@@ -1848,7 +1917,7 @@ try {
     }
 
     # Load the shared helpers from the verified profile into this script's scope.
-    foreach ($definition in (Get-SharedFunctionDefinitions -ProfilePath $script:Bundle.Profile -Names $script:SharedFunctionNames)) {
+    foreach ($definition in (Get-SharedFunctionDefinitions -ProfilePath $script:Bundle.Profile -Names $script:SharedFunctionNames -OptionalNames $script:OptionalSharedFunctionNames)) {
         . ([scriptblock]::Create($definition))
     }
 
@@ -1869,7 +1938,7 @@ try {
     }
 
     $installed = Invoke-SetupInstall -Bundle $script:Bundle
-    $exitCode = if ($installed -or $WhatIfPreference) { 0 } else { 1 }
+    $exitCode = if ($installed -or $WhatIfPreference) { 0 } elseif ($script:SetupCancelled) { 2 } else { 1 }
     # A failed install keeps this window open with its messages.
     if ($installed) { Restart-SetupTerminal -ExitCode $exitCode }
 }

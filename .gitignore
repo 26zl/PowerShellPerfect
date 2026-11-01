@@ -21,7 +21,10 @@ Modules/
 .vscode/
 *.code-workspace
 .idea/
+
+# Local AI agent instructions (kept out of the repository)
 CLAUDE.md
+AGENTS.md
 .claude/
 
 # OS junk

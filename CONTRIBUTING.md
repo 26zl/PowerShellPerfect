@@ -1,6 +1,6 @@
 # Contributing to PowerShellPerfect
 
-Thanks for your interest in contributing! This guide covers the dev setup, coding conventions, tests, and the PR and release process. Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+Thanks for your interest in contributing! This guide covers the dev setup, the architecture, coding conventions, tests, and the PR and release process.
 
 ## Dev Environment Setup
 
@@ -20,6 +20,16 @@ Thanks for your interest in contributing! This guide covers the dev setup, codin
    Or install this checkout with its configs and Windows Terminal settings but without tools: `pwsh -NoProfile -File tests/locallab.ps1 -Install`.
 
 3. Restart your terminal to load the profile.
+
+## Architecture and Invariants
+
+- **One profile file.** `Microsoft.PowerShell_profile.ps1` holds every command, hook and completer; `setup.ps1` installs it and runs the wizard. A measured split into a core file and lazily loaded commands saved only about 22 ms at startup, added about 48 ms to the first use of each moved command, and put a second file on every install, update and uninstall path.
+- **Load-time state.** Temporaries created while the profile loads are named `$_psp*` and removed at the end of the load, so code that runs later keeps its state in `$script:PSP` or calls a helper such as `Get-PspCacheDir`.
+- **One helper per job.** Output goes through `Write-PspHost` (honors `NO_COLOR`), JSON through `Read-JsonFile` / `ConvertFrom-JsonC`, and files through `Get-Utf8FileText` / `Write-Utf8FileAtomic`.
+- **Windows Terminal.** `settings.json` is changed only through `Update-WindowsTerminalSettingsFile`, which records each change and the value it replaced in `wt-changes.json`. `Undo-WindowsTerminalSettingsFile` reverts from that record, and `Uninstall-Profile` relies on it, so a change written any other way is not reverted.
+- **Pinned downloads.** The profile's runtime downloads (PSFzf, `http-server` for `serve`, the portable Oh My Posh build) are pinned in `Get-PspComponentPins`; setup's Nerd Fonts and preset themes are pinned in `setup.ps1`, and the default theme and font in `theme.json` and `terminal-config.json`. The `pins` job in `.github/workflows/scheduled.yml` checks them against upstream every week.
+- **setup.ps1 runs the profile's code.** After verifying the bundle it loads the helpers named in `$script:SharedFunctionNames` from the verified profile. A helper added after 1.0.0 goes in `$script:OptionalSharedFunctionNames`, which is loaded only when the profile defines it, so `setup.ps1 -Ref v1.0.0` still installs that release. See [Code Shared With setup.ps1](#code-shared-with-setupps1) for the helpers needed before verification.
+- **Startup time.** The load path runs every time a terminal opens. Keep process spawns, module imports, `Get-Command` lookups that can miss (a missing tool costs a scan of every `PATH` folder; use `Find-ProfileExecutable`) and repeated JSON parsing off it: defer them to first use or cache the result. CI runs `tests/smoke.ps1` on both editions and fails when the median load time is over its budget.
 
 ## Coding Conventions
 
@@ -54,7 +64,7 @@ All code must work under both PowerShell 5.1 and 7+. Key differences:
 ### Adding a New Tool
 
 1. Add an entry to the `$script:ProfileTools` array in `Microsoft.PowerShell_profile.ps1` with `Name`, `Id` (winget), `Cmd`, `Cache`, and `VerCmd`
-   Also set `UpgradeStrategy` (`winget` for normal tools, `preserve-direct` only when a direct/MSI install must not be pushed back through winget).
+   Also set `UpgradeStrategy`: `winget` for normal tools; `portable` is used by Oh My Posh, whose profile-managed portable build (`Install-OhMyPoshPortable`, pinned in `Get-PspComponentPins`) `Update-Tools` keeps current, replacing an MSIX install and leaving other direct installs alone.
 2. Add a numbered install step in `setup.ps1` (it cannot read `ProfileTools`)
 3. Pin anything downloaded at runtime (a version, and a SHA-256 where upstream publishes one) and add it to the pin check in `.github/workflows/scheduled.yml`
 
@@ -73,21 +83,23 @@ All code must work under both PowerShell 5.1 and 7+. Key differences:
 
 ### Adding an Argument Completer
 
-For new commands with parameters that benefit from Tab-complete (ports, log names, modes with descriptions, etc.), add a `Register-ArgumentCompleter` block near the top of the Sysadmin section. Use `$null = $commandName, $parameterName, $commandAst, $fakeBoundParameters` to mark unused `param()` entries as intentional and satisfy `PSReviewUnusedParameter`.
+For new commands with parameters that benefit from Tab-complete (ports, log names, modes with descriptions, etc.), add a `Register-ArgumentCompleter` block near the top of the Sysadmin section. Mark the `param()` entries it does not use with `$null = $commandName, $parameterName, $commandAst, $fakeBoundParameters`. `PSReviewUnusedParameter` is excluded in `PSScriptAnalyzerSettings.psd1`; the line is kept so unused completer parameters are visibly intentional.
 
 ## Tests
 
-Run the suites from a **normal (non-elevated)** shell. They redirect `LOCALAPPDATA`, `TEMP` and `$PROFILE` into disposable sandboxes and block commands that would change the machine, and they refuse to run elevated unless you pass `-AllowElevated` (meant for CI runners and disposable VMs).
+Run the suites from a **normal (non-elevated)** shell. The ones that load the profile redirect `LOCALAPPDATA`, `TEMP` and `$PROFILE` into disposable sandboxes and block commands that would change the machine. `tests/unit.ps1`, `tests/test.ps1`, `tests/ci-functional.ps1`, `tests/rawhunt.ps1` and the test steps of `tests/locallab.ps1` refuse to run elevated unless you pass `-AllowElevated` (meant for CI runners and disposable VMs); `tests/lint.ps1` and `tests/smoke.ps1` do not check.
 
 ```powershell
 pwsh -NoProfile -File tests/unit.ps1        # regression tests (also run them with: powershell -NoProfile -File tests/unit.ps1)
-pwsh -NoProfile -File tests/lint.ps1        # PSScriptAnalyzer 1.25.0 with PSScriptAnalyzerSettings.psd1
+pwsh -NoProfile -File tests/lint.ps1        # PSScriptAnalyzer 1.25.0 with PSScriptAnalyzerSettings.psd1 (installed for the current user when missing; -NoInstall fails instead)
 pwsh -NoProfile -File tests/smoke.ps1       # sandboxed load with a load-time budget
 pwsh -NoProfile -File tests/test.ps1        # the full local gate (includes the above)
 pwsh -NoProfile -File tests/ci-functional.ps1   # what the CI functional job runs (third-party endpoints mocked)
 ```
 
 `tests/rawhunt.ps1 -AllowSideEffects` is the one harness that is not sandboxed: it uses your real profile settings, live services, the clipboard and winget, and uploads a probe file to a public paste.
+
+Tests must never reach the real machine: load the profile inside a sandbox and dot-source `$PspPostLoadStubs`, which points `Uninstall-Profile -RemoveFonts` at a sandbox font store, and never create `telemetry.owned` in a sandbox before `Uninstall-Profile` runs, because uninstall then removes your real `POWERSHELL_TELEMETRY_OPTOUT` variable.
 
 **Bug fixes need a regression test.** Add a case to `tests/unit.ps1` that fails without the fix. The helpers in `tests/lib/Sandbox.ps1` (`New-PspSandbox`, `Enter-PspSandbox`, `$PspPostLoadStubs`, `Get-PspFunctionSource`) give each case a disposable environment. Inside a sandbox, `winget` is a throwing function and, for code that looks it up as an application, a `winget.cmd` first on `PATH` that fails and logs each call (`Get-PspSandboxWingetCalls`); replace it with a recording function in the case when the test needs winget to succeed.
 
@@ -101,9 +113,8 @@ CI runs on Windows Server images with an English display language. Before taggin
 2. Make your changes following the conventions above
 3. Run `tests/lint.ps1` and `tests/unit.ps1` locally and fix any warnings/errors
 4. Test on both PS5.1 and PS7+ if possible
-5. Add an entry under **Unreleased** in `CHANGELOG.md` for anything users will notice
-6. Open a PR - the template will guide you through the checklist
-7. All three CI jobs must pass before merge. The repository ruleset enforces `lint` and `install-flow` as required checks; `functional` must pass as well
+5. Open a PR - the template will guide you through the checklist; describe user-visible changes in the PR, since the release notes are generated from merged pull requests. `.github/release.yml` lists PRs labeled `enhancement` under Features, `bug` under Fixes and the rest under Other changes, and leaves out Dependabot PRs
+6. All three CI jobs must pass before merge; the repository ruleset enforces `lint`, `install-flow` and `functional` as required checks
 
 ## CI Checks
 
@@ -118,6 +129,5 @@ CI runs on push/PR to `main` with three jobs (on a pinned `windows-2025` image):
 ## Releases
 
 1. Update `Version` in `$script:PSP` in `Microsoft.PowerShell_profile.ps1` (SemVer).
-2. Move the **Unreleased** entries in `CHANGELOG.md` under a new `## [X.Y.Z] - YYYY-MM-DD` heading.
-3. Merge to `main`, then tag that commit `vX.Y.Z` and push the tag. `release.yml` checks that the tag matches `Version`, publishes the committed files with `SHA256SUMS.txt` and a build provenance attestation, and uses the CHANGELOG section as release notes.
-4. Update the version in the README install command if it names a specific release.
+2. Merge to `main`, then tag that commit `vX.Y.Z` and push the tag. `release.yml` checks that the tag matches `Version`, publishes the committed files with `SHA256SUMS.txt` and a build provenance attestation, and writes release notes with the verification steps followed by GitHub's notes generated from the merged pull requests.
+3. Update the version in the README install command if it names a specific release.

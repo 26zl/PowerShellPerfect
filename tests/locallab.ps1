@@ -27,7 +27,6 @@ param(
 if ($Wizard -and -not $FullInstall) { $FullInstall = $true }
 
 $ErrorActionPreference = 'Stop'
-# Resolve repoRoot as the parent of tests/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 . (Join-Path $repoRoot 'tests\lib\Sandbox.ps1')
@@ -48,7 +47,7 @@ function Ok { param([string]$Name, [string]$Detail = '')
     else { Write-Host "  OK    $Name" -ForegroundColor Green }
 }
 
-# --- Restore flow: find latest backup and put it back ---
+# Restore flow: find latest backup and put it back
 if ($Restore) {
     Step 'Restore live profile from backup'
     $backups = Get-ChildItem -Path $env:TEMP -Directory -Filter 'psp-locallab-backup-*' -ErrorAction SilentlyContinue |
@@ -85,14 +84,14 @@ if (-not ($SkipLint -and $SkipParse -and $SkipSmoke -and $SkipTest -and -not $Fu
 }
 $elevatedArgs = if ($AllowElevated) { @('-AllowElevated') } else { @() }
 
-# --- Validate files exist ---
+# Validate files exist
 Step 'Repo structure'
 foreach ($f in @('Microsoft.PowerShell_profile.ps1', 'setup.ps1', 'setprofile.ps1', 'theme.json', 'terminal-config.json', 'tests/ci-functional.ps1', 'tests/unit.ps1', 'PSScriptAnalyzerSettings.psd1')) {
     if (Test-Path $f) { Ok $f }
     else { Fail $f 'missing'; }
 }
 
-# --- 1. PSScriptAnalyzer (same version and settings as CI) ---
+# 1. PSScriptAnalyzer (same version and settings as CI)
 if (-not $SkipLint) {
     Step 'PSScriptAnalyzer (tests/lint.ps1)'
     # Never installs modules: without the pinned analyzer the step is skipped with the install command.
@@ -107,7 +106,7 @@ if (-not $SkipLint) {
     }
 }
 
-# --- 2. PS5 parse-check (uses real powershell.exe) ---
+# 2. PS5 parse-check (uses real powershell.exe)
 if (-not $SkipParse) {
     Step 'PS5 parse-check'
     $ps5 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -130,7 +129,7 @@ if (-not $SkipParse) {
     }
 }
 
-# --- 3. Non-interactive smoke load inside a sandbox (your profile_user.ps1 and plugins are not run) ---
+# 3. Non-interactive smoke load inside a sandbox (your profile_user.ps1 and plugins are not run)
 if (-not $SkipSmoke) {
     Step 'Smoke-test non-interactive load (sandboxed)'
     $smoke = "& { param(`$repo) . (Join-Path `$repo 'tests\lib\Sandbox.ps1'); `$sb = New-PspSandbox -Name 'locallab'; Enter-PspSandbox -Sandbox `$sb; try { `$WarningPreference = 'SilentlyContinue'; `$Error.Clear(); . (Join-Path `$repo 'Microsoft.PowerShell_profile.ps1'); if (`$Error.Count) { exit 1 } } finally { Exit-PspSandbox -Sandbox `$sb } } '$($repoRoot -replace "'", "''")'"
@@ -139,7 +138,7 @@ if (-not $SkipSmoke) {
     else { Fail 'smoke' "exit $LASTEXITCODE" }
 }
 
-# --- 4. Optional: test.ps1 local test suite (includes tests/unit.ps1) ---
+# 4. tests/test.ps1, which includes tests/unit.ps1 (skipped with -SkipTest)
 if (-not $SkipTest -and (Test-Path 'tests/test.ps1')) {
     Step 'Run tests/test.ps1 (-SkipPS5)'
     $testOutput = & pwsh -NoProfile -File tests/test.ps1 -SkipPS5 @elevatedArgs 2>&1
@@ -149,7 +148,7 @@ if (-not $SkipTest -and (Test-Path 'tests/test.ps1')) {
     else { Fail 'tests/test.ps1' "exit $LASTEXITCODE" }
 }
 
-# --- 5. Optional: ci-functional.ps1 (sandboxed, third-party endpoints mocked) ---
+# 5. With -Functional: tests/ci-functional.ps1 (sandboxed, third-party endpoints mocked)
 if ($Functional) {
     Step 'Run ci-functional.ps1'
     & pwsh -NoProfile -File tests/ci-functional.ps1 @elevatedArgs
@@ -157,7 +156,7 @@ if ($Functional) {
     else { Fail 'tests/ci-functional.ps1' "exit $LASTEXITCODE" }
 }
 
-# --- 6. Install to live profile dirs (replaces GitHub version) ---
+# 6. Install to live profile dirs (replaces GitHub version)
 if ($Install -or $FullInstall) {
     if ($script:failures.Count -gt 0) {
         Write-Host ''
@@ -204,7 +203,7 @@ if ($Install -or $FullInstall) {
     }
 }
 
-# --- Summary ---
+# Summary
 Write-Host ''
 Write-Host '=========================================' -ForegroundColor Cyan
 if ($script:failures.Count -eq 0) {
@@ -212,7 +211,7 @@ if ($script:failures.Count -eq 0) {
     if ($Install -or $FullInstall) {
         Write-Host '  Local profile is now live. Open a new pwsh to try it.' -ForegroundColor Green
     }
-    elseif (-not $Restore) {
+    else {
         Write-Host '  To install this version live:  pwsh -NoProfile -File tests/locallab.ps1 -Install' -ForegroundColor DarkGray
     }
     exit 0

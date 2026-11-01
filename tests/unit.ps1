@@ -109,7 +109,8 @@ Exit-PspSandbox -Sandbox $loadSandbox
 # Setup helpers: setup.ps1's own functions and curated data (shared helpers already came from the profile).
 foreach ($definition in (Get-PspFunctionSource -Path $setupPath -Name @(
             'Save-WizardChoices', 'Resolve-WizardState', 'Set-PreferredEditorInProfiles', 'Install-OhMyPoshTheme', 'Get-OmpThemeUrl', 'Remove-SafeTempDirectory',
-            'Start-InstallWizard', 'Select-WizardItem', 'Read-WizardYesNo', 'Select-PreferredEditor', 'Get-OmpThemeList', 'Test-TelemetryOptOutSet'))) {
+            'Start-InstallWizard', 'Select-WizardItem', 'Read-WizardYesNo', 'Select-PreferredEditor', 'Get-OmpThemeList', 'Test-TelemetryOptOutSet',
+            'Install-NerdFonts'))) {
     . ([scriptblock]::Create($definition))
 }
 $script:IsElevated = $false
@@ -119,7 +120,7 @@ foreach ($variable in '$script:CuratedSchemes', '$script:CuratedFonts', '$Editor
 
 Write-Host '-- JSON handling --' -ForegroundColor Magenta
 
-Test-Case 'ConvertFrom-JsonC removes comments and trailing commas but never touches strings (F-18)' {
+Test-Case 'ConvertFrom-JsonC removes comments and trailing commas but never touches strings' {
     $q = [char]34
     $text = "{`n  // line comment`n  ${q}url${q}: ${q}https://example.com/a//b${q}, /* block */`n  ${q}quote${q}: ${q}say \${q}hi\${q} // not a comment${q},`n  ${q}list${q}: [1, 2, 3,],`n  ${q}nested${q}: { ${q}k${q}: ${q}v${q}, },`n}"
     $o = ConvertFrom-JsonC -Text $text
@@ -129,7 +130,16 @@ Test-Case 'ConvertFrom-JsonC removes comments and trailing commas but never touc
     Assert-True ($o.nested.k -eq 'v') 'trailing comma in an object'
 }
 
-Test-Case 'Read-JsonFile reads UTF-8 with and without BOM on both editions (F-19)' {
+Test-Case 'ConvertFrom-JsonC returns the same result for plain JSON and for JSONC with comments and trailing commas' {
+    $plain = '{ "theme": { "name": "pure", "url": "https://raw.githubusercontent.com/a//b.omp.json" }, "list": [1, 2], "one": [{ "k": "v" }] }'
+    $jsonc = "{`n  // comment`n  `"theme`": { `"name`": `"pure`", /* inline */ `"url`": `"https://raw.githubusercontent.com/a//b.omp.json`", },`n  `"list`": [1, 2,],`n  `"one`": [{ `"k`": `"v`" }],`n}"
+    $a = ConvertFrom-JsonC -Text $plain
+    $b = ConvertFrom-JsonC -Text $jsonc
+    Assert-True ((ConvertTo-PspCanonicalJson $a) -eq (ConvertTo-PspCanonicalJson $b)) "plain: $(ConvertTo-PspCanonicalJson $a) jsonc: $(ConvertTo-PspCanonicalJson $b)"
+    Assert-True ($null -eq (ConvertFrom-JsonC -Text '// only a comment')) 'a comment-only text did not parse as empty'
+}
+
+Test-Case 'Read-JsonFile reads UTF-8 with and without BOM on both editions' {
     $path = Join-Path $script:Sandbox.Work 'bom.json'
     $value = 'caf' + [char]0xE9
     [System.IO.File]::WriteAllText($path, ('{ "name": "' + $value + '" }'), [System.Text.UTF8Encoding]::new($true))
@@ -146,13 +156,15 @@ Test-Case 'Merge-PspUserSettings appends user keybindings to the shipped ones as
     $result = Merge-PspUserSettings -UserSettings $user -ThemeConfig $theme -TerminalConfig $term
     $keys = @($term.keybindings | ForEach-Object { Get-PspProp $_ 'keys' })
     Assert-True ($result.Keybindings -and @($term.keybindings).Count -eq $shipped + 1) 'keybindings not merged into one flat list'
-    Assert-True ($keys -contains 'ctrl+a' -and $keys -contains 'ctrl+shift+t') "unexpected keys: $($keys -join ', ')"
+    Assert-True ($keys -contains 'ctrl+shift+t') "unexpected keys: $($keys -join ', ')"
+    # Ctrl+A belongs to the shell (beginning of line in bash, tmux prefix), so the shipped config does not bind it.
+    Assert-True ($keys -notcontains 'ctrl+a') 'terminal-config.json binds ctrl+a in Windows Terminal again'
     Assert-True (-not (Test-PspProp $theme.theme 'sha256')) 'pinned hash kept for a user-chosen theme URL'
 }
 
-Write-Host '-- Windows Terminal changes (F-01, F-05) --' -ForegroundColor Magenta
+Write-Host '-- Windows Terminal changes --' -ForegroundColor Magenta
 
-Test-Case 'Update/Undo keep later user edits and revert only what the profile changed (F-01)' {
+Test-Case 'Update/Undo keep later user edits and revert only what the profile changed' {
     $theme = Read-JsonFile (Join-Path $repoRoot 'theme.json')
     $term = Read-JsonFile (Join-Path $repoRoot 'terminal-config.json')
     $manifest = Join-Path (Get-PspCacheDir) 'wt-changes.json'
@@ -271,7 +283,7 @@ Test-Case 'Undo-WindowsTerminalSettingsFile is a high-impact command' {
     Assert-True ($binding.ConfirmImpact -eq 'High') "ConfirmImpact is $($binding.ConfirmImpact)"
 }
 
-Test-Case 'Uninstall-Profile reverts every Windows Terminal variant (F-01)' {
+Test-Case 'Uninstall-Profile reverts every Windows Terminal variant' {
     $stable = New-WtSettings
     $preview = New-WtSettings -Variant 'Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe'
     $manifest = Join-Path (Get-PspCacheDir) 'wt-changes.json'
@@ -320,7 +332,7 @@ Test-Case 'An unreadable user-settings.json leaves settings.json alone in Uninst
     Assert-True ($out -match 'could not be read') 'no warning about the unreadable file'
 }
 
-Test-Case 'Uninstall-Profile without a change record restores the oldest backup and keeps the current file (F-01)' {
+Test-Case 'Uninstall-Profile without a change record restores the oldest backup and keeps the current file' {
     $path = New-WtSettings -Json '{"profiles":{"defaults":{"opacity":75}}}'
     [System.IO.File]::WriteAllText("$path.20240101-000000.bak", '{"profiles":{"defaults":{"opacity":88}}}', $utf8)
     (Get-Item -LiteralPath "$path.20240101-000000.bak").LastWriteTime = (Get-Date).AddDays(-10)
@@ -330,7 +342,7 @@ Test-Case 'Uninstall-Profile without a change record restores the oldest backup 
     Assert-True (@(Get-ChildItem -LiteralPath (Split-Path $path) -Filter 'settings.json.pre-uninstall-*.json').Count -eq 1) 'current settings were not kept'
 }
 
-Test-Case 'windowsTerminal.manage = false leaves settings.json alone in uninstall and Set-TerminalBackground (F-05)' {
+Test-Case 'windowsTerminal.manage = false leaves settings.json alone in uninstall and Set-TerminalBackground' {
     New-Item -ItemType Directory -Path (Get-PspCacheDir) -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path (Get-PspCacheDir) 'user-settings.json'), '{ "windowsTerminal": { "manage": false } }', $utf8)
     $path = New-WtSettings -Json '{"profiles":{"defaults":{"opacity":75}}}'
@@ -357,7 +369,7 @@ Test-Case 'Set-TerminalBackground goes through the change record and -Clear reve
     Assert-True ($wt.profiles.defaults.backgroundImageOpacity -eq 0.8 -and -not (Test-PspProp $wt.profiles.defaults 'backgroundImage')) 'original values not restored'
 }
 
-Write-Host '-- Trusted .psprc.ps1 (F-02) --' -ForegroundColor Magenta
+Write-Host '-- Trusted .psprc.ps1 --' -ForegroundColor Magenta
 
 Test-Case 'A trusted .psprc.ps1 runs only while its content matches the approved hash' {
     $repo = Join-Path $script:Sandbox.Work 'repo'
@@ -459,7 +471,7 @@ Test-Case 'An approved .psprc.ps1 runs the text that was checked and sees its fo
     finally { $script:PSP.TrustedDirs.Clear(); $script:PSP.TrustedRcHashes.Clear(); $env:PSP_RC_RAN = $null }
 }
 
-Write-Host '-- Update-Profile and setup.ps1 verification (F-03, F-08) --' -ForegroundColor Magenta
+Write-Host '-- Update-Profile and setup.ps1 verification --' -ForegroundColor Magenta
 
 Test-Case 'Update-Profile stops without a hash and on a wrong hash, writing nothing' {
     Install-DownloadStub
@@ -629,7 +641,9 @@ Test-Case 'setup.ps1 loads every profile helper its shared functions call' {
     $available = @{}
     foreach ($f in $setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $available[$f.Name] = $true }
     . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupPath -Variable '$script:SharedFunctionNames')))
-    $shared = @($script:SharedFunctionNames)
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupPath -Variable '$script:OptionalSharedFunctionNames')))
+    # Optional helpers are loaded whenever the profile defines them, which the current one does.
+    $shared = @($script:SharedFunctionNames) + @($script:OptionalSharedFunctionNames)
     foreach ($n in $shared) { $available[$n] = $true }
     $missing = @()
     foreach ($n in $shared) {
@@ -642,7 +656,7 @@ Test-Case 'setup.ps1 loads every profile helper its shared functions call' {
     Assert-True ($missing.Count -eq 0) "add to `$script:SharedFunctionNames in setup.ps1: $($missing | Sort-Object -Unique)"
 }
 
-Test-Case 'setup.ps1 -LocalRepo -CiMode installs into the sandbox; -WhatIf changes nothing (F-14)' {
+Test-Case 'setup.ps1 -LocalRepo -CiMode installs into the sandbox; -WhatIf changes nothing' {
     # Downloads (the Oh My Posh theme) fail as if offline.
     Install-DownloadStub
     $wt = New-WtSettings
@@ -655,10 +669,10 @@ Test-Case 'setup.ps1 -LocalRepo -CiMode installs into the sandbox; -WhatIf chang
     }
     Assert-True ((Read-JsonFile $wt).profiles.defaults.font.face -eq 'CaskaydiaCove NF') 'terminal defaults not applied'
     Assert-True (@(Get-ChildItem -LiteralPath (Join-Path (Get-PspCacheDir) 'logs') -Filter 'setup-*.log').Count -eq 1) 'no setup log'
-    Assert-True ($out -notmatch 'Terminal-Icons') 'Terminal-Icons touched in CI mode (F-07)'
+    Assert-True ($out -notmatch 'Terminal-Icons') 'Terminal-Icons touched in CI mode'
 }
 
-Write-Host '-- Wizard input (F-06, F-21) --' -ForegroundColor Magenta
+Write-Host '-- Wizard input --' -ForegroundColor Magenta
 
 Test-Case 'Save-WizardChoices refuses an unparseable file and keeps hand-edited JSONC keys' {
     $path = Join-Path $script:Sandbox.Work 'user-settings.json'
@@ -694,7 +708,8 @@ Test-Case 'Resumed wizard state is rebuilt from the curated lists (tampered valu
     Assert-True ($null -eq $v.Editor -and $null -eq $v.TabBar -and $v.AppTheme -eq 'light') 'editor/tab bar validation'
     Assert-True ($v.Terminal.Count -eq 1 -and $v.Terminal['fontSize'] -eq 12) 'terminal values not range-checked'
     Assert-True ($v.Features.Count -eq 1 -and $v.Features['psfzf'] -eq $false) 'unknown feature kept'
-    Assert-True (@($v.CompletedSteps).Count -eq 1) 'unknown step kept'
+    # 'Theme' lost its answer, so it is asked again; 'Bogus' is not a step.
+    Assert-True (@($v.CompletedSteps).Count -eq 0) "a step without a valid answer, or an unknown step, was kept: $($v.CompletedSteps -join ', ')"
 }
 
 # Answer the wizard's Read-Host prompts from a queue; '<STOP>' simulates an interrupted run (Ctrl+C).
@@ -773,7 +788,7 @@ Test-Case 'Set-PreferredEditorInProfiles quotes the name, backs up, and leaves a
     Assert-True ((Get-Item -LiteralPath $userProfile).LastWriteTimeUtc -eq $stamp) 'unchanged file was rewritten'
 }
 
-Test-Case 'Install-OhMyPoshTheme rejects a theme whose hash differs and invalid names (F-11)' {
+Test-Case 'Install-OhMyPoshTheme rejects a theme whose hash differs and invalid names' {
     Install-DownloadStub
     $global:PspStubTheme = '{ "blocks": [] }'
     $url = Get-OmpThemeUrl -Name 'pure'
@@ -785,17 +800,17 @@ Test-Case 'Install-OhMyPoshTheme rejects a theme whose hash differs and invalid 
     $global:PspStubTheme = $null
 }
 
-Write-Host '-- Cache, uninstall leftovers and state (F-16, F-17) --' -ForegroundColor Magenta
+Write-Host '-- Cache, uninstall leftovers and state --' -ForegroundColor Magenta
 
-Test-Case 'Clear-ProfileCache keeps settings and state files' {
+Test-Case 'Clear-ProfileCache keeps settings, state and theme files' {
     $cache = Get-PspCacheDir
     New-Item -ItemType Directory -Path (Join-Path $cache 'plugins') -Force | Out-Null
-    foreach ($f in 'user-settings.json', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'bg-1a2b3c.png') {
-        [System.IO.File]::WriteAllText((Join-Path $cache $f), '{}', $utf8)
-    }
+    $files = 'user-settings.json', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json', 'terminal-config.json', 'pure.omp.json', 'omp-theme-fast.json', 'omp-secondary-prompt.txt', 'bg-1a2b3c.png'
+    foreach ($f in $files) { [System.IO.File]::WriteAllText((Join-Path $cache $f), '{}', $utf8) }
     Clear-ProfileCache -Confirm:$false 6>$null
-    foreach ($f in 'user-settings.json', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'plugins', 'bg-1a2b3c.png') { Assert-True (Test-Path -LiteralPath (Join-Path $cache $f)) "$f was removed" }
-    foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'theme.json') { Assert-True (-not (Test-Path -LiteralPath (Join-Path $cache $f))) "$f was kept" }
+    # Only Update-Profile or setup.ps1 can restore theme.json, terminal-config.json and the theme, so they are not caches.
+    foreach ($f in 'user-settings.json', 'telemetry.owned', 'wt-changes.json', 'installed.json', 'plugins', 'bg-1a2b3c.png', 'theme.json', 'terminal-config.json', 'pure.omp.json') { Assert-True (Test-Path -LiteralPath (Join-Path $cache $f)) "$f was removed" }
+    foreach ($f in 'omp-init.ps1', 'zoxide-init.ps1', 'omp-theme-fast.json', 'omp-secondary-prompt.txt') { Assert-True (-not (Test-Path -LiteralPath (Join-Path $cache $f))) "$f was kept" }
 }
 
 Test-Case 'Uninstall-Profile -RemoveUserData removes profile backups; a plain uninstall lists them' {
@@ -862,7 +877,7 @@ Test-Case 'Uninstall-Profile -All stays inside the sandbox font folder' {
     Assert-True (Test-Path -LiteralPath (Join-Path $fonts 'CascadiaCode.ttf')) 'unrelated font removed'
 }
 
-Write-Host '-- Command guards and data handling (F-10, F-19, F-22, F-23, F-24, F-25) --' -ForegroundColor Magenta
+Write-Host '-- Command guards and data handling --' -ForegroundColor Magenta
 
 Test-Case 'killport refuses protected system processes' {
     $script:Stopped = @()
@@ -940,6 +955,12 @@ Test-Case 'No variable name in the profile ends in ? (a "$Target?" string names 
     Assert-True ($bad.Count -eq 0) "line(s) $(@($bad | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ')"
 }
 
+Test-Case 'No line comment sits right under a help block, where Get-Help would add it to the synopsis' {
+    $text = [System.IO.File]::ReadAllText($profilePath)
+    $hits = @([regex]::Matches($text, '(?m)^[ \t]*#>[ \t]*\r?\n[ \t]*#(?!>)') | ForEach-Object { $text.Substring(0, $_.Index).Split("`n").Count + 1 })
+    Assert-True ($hits.Count -eq 0) "line(s) $($hits -join ', ')"
+}
+
 Test-Case 'The Oh My Posh prompt falls back without running the prompt hooks twice' {
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
@@ -958,9 +979,12 @@ Test-Case 'An Oh My Posh render that times out is stopped with its child process
     # Long enough for the child PowerShell to start ping, which then outlives it unless the whole tree is stopped.
     $script:PSP.PromptTimeoutMs = 4000
     $marker = '-n 41 -w 997 127.0.0.1'
+    # The child writes this file right before it starts ping, so a child too slow to reach ping fails the test instead of passing it.
+    $started = Join-Path $script:Sandbox.Work 'ping-started.txt'
     try {
         $shell = (Get-Process -Id $PID).Path
-        $result = Invoke-OhMyPoshCommand -ExecutablePath $shell -Arguments @('-NoProfile', '-NonInteractive', '-Command', "ping.exe $marker")
+        $result = Invoke-OhMyPoshCommand -ExecutablePath $shell -Arguments @('-NoProfile', '-NonInteractive', '-Command', "[System.IO.File]::WriteAllText('$started', 'x'); ping.exe $marker")
+        Assert-True ([System.IO.File]::Exists($started)) 'the child never reached ping before the timeout, so the tree kill was not exercised'
         Assert-True ($null -eq $result) 'a timed-out render returned output'
         Start-Sleep -Milliseconds 500
         $left = @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$marker*" })
@@ -970,7 +994,7 @@ Test-Case 'An Oh My Posh render that times out is stopped with its child process
     finally { $script:PSP.PromptTimeoutMs = $saved }
 }
 
-Test-Case 'sed keeps the file encoding and writes a .bak (F-19)' {
+Test-Case 'sed keeps the file encoding and writes a .bak' {
     $ansi = Join-Path $script:Sandbox.Work 'ansi.txt'
     $code = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage
     $enc = [System.Text.Encoding]::GetEncoding($code)
@@ -988,7 +1012,7 @@ Test-Case 'sed keeps the file encoding and writes a .bak (F-19)' {
     Assert-True (Test-Path -LiteralPath "$utf16.bak") 'no .bak written'
 }
 
-Test-Case 'env masks secret-looking values unless -ShowValues (F-23)' {
+Test-Case 'env masks secret-looking values unless -ShowValues' {
     $fake = 'gh' + 'p_' + ('A' * 36)
     $env:PSP_UNIT_TOKEN = $fake
     try {
@@ -1008,14 +1032,14 @@ Test-Case 'env masks secret-looking values unless -ShowValues (F-23)' {
     foreach ($name in 'PATH', 'PASSAGE_DIR', 'COMPASS_HOME') { Assert-True (-not (Test-PspSensitiveVariable -Name $name -Value 'C:\x')) "$name masked" }
 }
 
-Test-Case 'Format-PspTlsErrors names host and chain problems (F-22)' {
+Test-Case 'Format-PspTlsErrors names host and chain problems' {
     $both = [System.Net.Security.SslPolicyErrors]::RemoteCertificateNameMismatch -bor [System.Net.Security.SslPolicyErrors]::RemoteCertificateChainErrors
     $text = Format-PspTlsErrors -Errors $both -Domain 'example.com'
     Assert-True ($text -match 'name does not match example.com' -and $text -match 'chain not trusted') "unexpected: $text"
     Assert-True ((Format-PspTlsErrors -Errors ([System.Net.Security.SslPolicyErrors]::None) -Domain 'x') -eq '') 'clean certificate reported problems'
 }
 
-Test-Case 'extract refuses to overwrite existing files without -Force (F-24)' {
+Test-Case 'extract refuses to overwrite existing files without -Force' {
     $src = Join-Path $script:Sandbox.Work 'a.txt'
     [System.IO.File]::WriteAllText($src, 'from-zip', $utf8)
     $zip = Join-Path $script:Sandbox.Work 'a.zip'
@@ -1034,7 +1058,7 @@ Test-Case 'extract refuses to overwrite existing files without -Force (F-24)' {
     finally { Pop-Location }
 }
 
-Test-Case 'Copy-SshKey remote script appends safely and skips a key that is present (F-24)' {
+Test-Case 'Copy-SshKey remote script appends safely and skips a key that is present' {
     $sh = @((Join-Path $env:ProgramFiles 'Git\bin\sh.exe'), (Join-Path $env:ProgramFiles 'Git\usr\bin\sh.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $sh) { Write-Host '        (Git sh.exe not found; skipped)' -ForegroundColor DarkGray; return }
     $tokens = $null; $parseErrors = $null
@@ -1059,7 +1083,7 @@ Test-Case 'Copy-SshKey remote script appends safely and skips a key that is pres
     finally { $env:HOME = $savedHome }
 }
 
-Test-Case 'NO_COLOR drops colors from Write-PspHost and Show-Help (F-25)' {
+Test-Case 'NO_COLOR drops colors from Write-PspHost and Show-Help' {
     $script:HostCalls = @()
     function Write-Host { param([object]$Object, [System.ConsoleColor]$ForegroundColor, [switch]$NoNewline, $BackgroundColor, $Separator) $script:HostCalls += , @($PSBoundParameters.Keys) }
     $env:NO_COLOR = '1'
@@ -1072,6 +1096,637 @@ Test-Case 'NO_COLOR drops colors from Write-PspHost and Show-Help (F-25)' {
     $env:NO_COLOR = '1'
     $help = Show-Help 6>&1 | Out-String
     Assert-True ($help -notmatch [char]27 -and $help -match 'version \d+\.\d+\.\d+') 'Show-Help printed escape codes or no version'
+}
+
+Write-Host '-- Startup path, Windows Terminal and command fixes (2026-11) --' -ForegroundColor Magenta
+
+Test-Case 'Find-ProfileExecutable finds a tool on PATH without Get-Command and returns $null for a missing one' {
+    $bin = Join-Path $script:Sandbox.Work 'bin'
+    New-Item -ItemType Directory -Path $bin -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $bin 'psp-probe-tool.exe'), '', $utf8)
+    $env:PATH = $bin + [System.IO.Path]::PathSeparator + $env:PATH
+    Assert-True ((Find-ProfileExecutable -Name 'psp-probe-tool') -eq (Join-Path $bin 'psp-probe-tool.exe')) 'tool on PATH not found'
+    Assert-True ($null -eq (Find-ProfileExecutable -Name 'psp-no-such-tool')) 'a missing tool was reported'
+}
+
+Test-Case 'ConvertTo-ProfileFastOmpTheme drops the upstream and stash lookups from git segments only' {
+    $theme = '{ "blocks": [ { "segments": [ { "type": "git", "properties": { "fetch_upstream_icon": true, "fetch_stash_count": true }, "template": "{{ .UpstreamIcon }}{{ .HEAD }}{{ if gt .StashCount 0 }} S{{ .StashCount }}{{ end }}" }, { "type": "path", "template": "{{ .Path }} {{ .StashCount }}" } ] } ] }'
+    $fast = ConvertFrom-Json (ConvertTo-ProfileFastOmpTheme -Json $theme)
+    $git = $fast.blocks[0].segments[0]
+    Assert-True ($git.properties.fetch_upstream_icon -eq $false) 'upstream icon still fetched'
+    Assert-True ($git.template -notmatch 'Upstream|StashCount' -and $git.template -match '\.HEAD') "git template not tuned: $($git.template)"
+    Assert-True ($fast.blocks[0].segments[1].template -match 'StashCount') 'a non-git segment was changed'
+    Assert-True ($null -eq (ConvertTo-ProfileFastOmpTheme -Json '{ "blocks": [ { "segments": [ { "type": "path", "template": "{{ .Path }}" } ] } ] }')) 'an unchanged theme was rewritten'
+}
+
+Test-Case 'Get-PspOmpThemeRisk finds command segments, command-running template functions and extends anywhere' {
+    $risky = [ordered]@{
+        'command segment'                = '{ "blocks": [ { "segments": [ { "type": "path" }, { "type": "command", "properties": { "command": "whoami" } } ] } ] }'
+        'template function cmd'          = '{ "console_title_template": "{{ cmd \"calc\" }}" }'
+        'template function readFile'     = '{ "transient_prompt": { "template": "{{ readFile \"C:/secret.txt\" }}" } }'
+        'template function getHostByName' = '{ "blocks": [ { "segments": [ { "type": "text", "template": "{{ getHostByName (printf \"%s.example\" .UserName) }}" } ] } ] }'
+        'extends another config'         = '{ "version": 3, "extends": "./base.omp.json" }'
+    }
+    foreach ($reason in $risky.Keys) {
+        $found = Get-PspOmpThemeRisk -Theme (ConvertFrom-JsonC -Text $risky[$reason])
+        Assert-True (@($found) -contains $reason) "not found: $reason (got $($found -join ', '))"
+    }
+    $safe = ConvertFrom-JsonC -Text '{ "blocks": [ { "segments": [ { "type": "git", "template": "{{ .HEAD }} {{ .Env.USERNAME }}" } ] } ], "tooltips": [] }'
+    Assert-True ((Get-PspOmpThemeRisk -Theme $safe).Count -eq 0) 'a theme with only fields such as .Env was flagged'
+    Assert-True ((Get-PspOmpThemeRisk -Theme $null).Count -eq 0) 'a missing theme was flagged'
+}
+
+Test-Case 'Install-OhMyPoshTheme refuses a theme that can run commands unless allowed' {
+    Install-DownloadStub
+    $global:PspStubTheme = '{ "blocks": [ { "segments": [ { "type": "command", "properties": { "command": "calc.exe" } } ] } ] }'
+    try {
+        $url = Get-OmpThemeUrl -Name 'pure'
+        # The width keeps Windows PowerShell from wrapping the message at the console width.
+        $out = Install-OhMyPoshTheme -ThemeName 'pure' -ThemeUrl $url 6>&1 | Out-String -Width 4096
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path (Get-PspCacheDir) 'pure.omp.json'))) 'a theme with a command segment was installed'
+        Assert-True ($out -match 'allowCommands') "the refusal does not name the opt-in: $out"
+        Assert-True (Install-OhMyPoshTheme -ThemeName 'pure' -ThemeUrl $url -AllowCommands 6>$null) 'an allowed theme was refused'
+        # An existing file with a command segment is not kept as valid without the opt-in.
+        Assert-True (-not (Install-OhMyPoshTheme -ThemeName 'pure' -ThemeUrl $url 6>$null)) 'the existing theme with a command segment was accepted'
+        # A template that runs a program is refused as well.
+        Remove-Item -LiteralPath (Join-Path (Get-PspCacheDir) 'pure.omp.json') -Force
+        $global:PspStubTheme = '{ "blocks": [ { "segments": [ { "type": "text", "template": "{{ cmd \"calc.exe\" }}" } ] } ] }'
+        Assert-True (-not (Install-OhMyPoshTheme -ThemeName 'pure' -ThemeUrl $url 6>$null)) 'a theme whose template runs cmd was installed'
+    }
+    finally { $global:PspStubTheme = $null }
+}
+
+Test-Case 'Get-PspExecutableVersion reads the version resource or asks the program; Test-PspOmpVersionSafe compares with the minimum' {
+    $cmdVersion = Get-PspExecutableVersion -Path (Join-Path ([Environment]::SystemDirectory) 'cmd.exe')
+    Assert-True ($cmdVersion -is [version] -and $cmdVersion.Major -ge 6) "cmd.exe version: $cmdVersion"
+    $fake = Join-Path $script:Sandbox.Work 'omp.cmd'
+    [System.IO.File]::WriteAllText($fake, "@echo oh-my-posh v29.0.4`r`n", $utf8)
+    Assert-True ($null -eq (Get-PspExecutableVersion -Path $fake)) 'a file without a version resource returned a version'
+    Assert-True ((Get-PspExecutableVersion -Path $fake -VersionArgument 'version') -eq [version]'29.0.4') 'the version the program printed was not read'
+    Assert-True ([version](Get-PspComponentPins).OhMyPoshMinimum -le [version](Get-PspComponentPins).OhMyPosh) 'the pinned portable build is older than the minimum'
+    function Get-PspExecutableVersion { param($Path, $VersionArgument) $null = $Path, $VersionArgument; $script:StubVersion }
+    $script:StubVersion = [version]'29.35.0'
+    Assert-True (-not (Test-PspOmpVersionSafe -Path 'x')) '29.35.0 was accepted'
+    $script:StubVersion = [version]'29.35.1'
+    Assert-True (Test-PspOmpVersionSafe -Path 'x') '29.35.1 was refused'
+    $script:StubVersion = $null
+    Assert-True (Test-PspOmpVersionSafe -Path 'x') 'a build whose version cannot be read was refused'
+}
+
+Test-Case 'Oh My Posh older than the minimum never renders: the managed portable build takes over, or the plain prompt stays' {
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $block = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$script:PSP.IsInteractive' -and $n.Clauses[0].Item2.Extent.Text -match '_pspOmpExecutablePath = Get-OhMyPoshExecutablePath' }, $true) | Select-Object -First 1
+    Assert-True ($null -ne $block) 'the Oh My Posh init block was not found'
+    $init = [scriptblock]::Create($block.Extent.Text)
+    $cacheDir = Get-PspCacheDir
+    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $cacheDir 'unit.omp.json'), '{ "blocks": [ { "type": "prompt", "segments": [ { "type": "path", "template": "{{ .Path }}" } ] } ] }', $utf8)
+    $oldExe = Join-Path $script:Sandbox.Work 'old\oh-my-posh.exe'
+    $portableExe = Get-OhMyPoshPortablePath
+    foreach ($p in $oldExe, $portableExe) {
+        New-Item -ItemType Directory -Path (Split-Path $p) -Force | Out-Null
+        [System.IO.File]::WriteAllText($p, 'stub', $utf8)
+    }
+    $_pspThemeConfig = [pscustomobject]@{ theme = [pscustomobject]@{ name = 'unit' } }
+    $_pspRlUser = $null
+    $script:VersionChecks = [System.Collections.Generic.List[string]]::new()
+    function Get-OhMyPoshExecutablePath { $oldExe }
+    function Test-PspOmpVersionSafe { param($Path) $script:VersionChecks.Add($Path); $Path -ne $oldExe }
+    function Get-OhMyPoshPromptText { param([string]$Type, $ExecutablePath, $ConfigPath, [switch]$Prefetch) $null = $ExecutablePath, $ConfigPath, $Prefetch; if ($Type -eq 'secondary') { '>> ' } }
+    function Set-PSReadLineOption { }
+    $envNames = 'VIRTUAL_ENV_DISABLE_PROMPT', 'PYENV_VIRTUALENV_DISABLE_PROMPT', 'POWERLINE_COMMAND', 'POSH_SHELL', 'POSH_SHELL_VERSION', 'CONDA_PROMPT_MODIFIER'
+    $savedEnv = @{}
+    foreach ($n in $envNames) { $savedEnv[$n] = [Environment]::GetEnvironmentVariable($n) }
+    $savedInteractive = $script:PSP.IsInteractive
+    $script:PSP.IsInteractive = $true
+    $script:OhMyPoshExecutablePath = $null
+    try {
+        $warnings = @(& $init 3>&1 | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+        Assert-True ($script:OhMyPoshExecutablePath -eq $portableExe) "rendered with '$($script:OhMyPoshExecutablePath)'"
+        Assert-True ($warnings.Count -eq 0) "warnings: $($warnings -join '; ')"
+        $cache = [System.IO.File]::ReadAllText((Join-Path $cacheDir 'omp-secondary-prompt.txt'))
+        Assert-True ($cache.Contains('|' + $portableExe + '|') -and $cache.Contains('|ompMinimum=')) 'the cache key does not name the portable build and the minimum'
+
+        # The next start checks the old binary once and then finds the cache written for the portable build.
+        $script:VersionChecks.Clear()
+        $script:OhMyPoshExecutablePath = $null
+        $null = & $init 3>&1
+        Assert-True ($script:OhMyPoshExecutablePath -eq $portableExe -and $script:VersionChecks.Count -eq 2) "version checks: $($script:VersionChecks -join ', ')"
+
+        # Without a safe portable build the old binary is not used and only the version warning is shown.
+        Remove-Item -LiteralPath $portableExe -Force
+        Remove-Item -LiteralPath (Join-Path $cacheDir 'omp-secondary-prompt.txt') -Force
+        $script:OhMyPoshExecutablePath = $null
+        $warnings = @(& $init 3>&1 | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+        Assert-True ($null -eq $script:OhMyPoshExecutablePath) 'a build older than the minimum rendered the prompt'
+        Assert-True ($warnings.Count -eq 1 -and [string]$warnings[0] -match 'CVE-2026-73505') "warnings: $($warnings -join '; ')"
+    }
+    finally {
+        $script:PSP.IsInteractive = $savedInteractive
+        $script:OhMyPoshExecutablePath = $null
+        $script:OhMyPoshConfigPath = $null
+        $script:OhMyPoshPromptPrefetch = $null
+        foreach ($n in $envNames) { [Environment]::SetEnvironmentVariable($n, $savedEnv[$n]) }
+    }
+}
+
+Test-Case 'Install-OhMyPoshPortable keeps a newer managed build and never installs a download whose hash differs' {
+    $target = Get-OhMyPoshPortablePath
+    New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+    [System.IO.File]::WriteAllText($target, 'installed', $utf8)
+    [System.IO.File]::WriteAllText((Join-Path (Split-Path $target) 'psp-managed.txt'), "v99.0.0`n", $utf8)
+    $script:DownloadCalls = 0
+    function Invoke-DownloadWithRetry { param($Uri, $OutFile, $TimeoutSec) $null = $Uri, $TimeoutSec; $script:DownloadCalls++; [System.IO.File]::WriteAllText($OutFile, 'not the pinned build', [System.Text.UTF8Encoding]::new($false)) }
+    function Get-PspExecutableVersion { param($Path, $VersionArgument) $null = $Path, $VersionArgument; $script:StubVersion }
+    $script:StubVersion = [version]'99.0.0'
+    $result = Install-OhMyPoshPortable -Confirm:$false 6>$null
+    Assert-True ($result -eq $target -and $script:DownloadCalls -eq 0) 'a managed build newer than the pin was replaced'
+    $script:StubVersion = [version]'30.0.0'
+    $result = Install-OhMyPoshPortable -Confirm:$false 3>$null 6>$null
+    Assert-True ($null -eq $result -and $script:DownloadCalls -eq 1) "a download whose hash differs was accepted: $result"
+    Assert-True ([System.IO.File]::ReadAllText($target) -eq 'installed') 'the installed build was replaced by a download whose hash differs'
+}
+
+Test-Case 'Retired keybindings are reverted, recorded or tagged by an earlier version; user bindings stay' {
+    $manifest = Join-Path (Get-PspCacheDir) 'wt-changes.json'
+    New-Item -ItemType Directory -Path (Get-PspCacheDir) -Force | Out-Null
+    $path = New-WtSettings -Json '{ "profiles": { "defaults": {}, "list": [] }, "actions": [ { "command": "unfocusPane", "id": "User.mine" } ], "keybindings": [ { "id": "User.mine", "keys": "ctrl+a" } ] }'
+    $ctrlA = @([PSCustomObject]@{ keys = 'ctrl+a'; command = 'selectAll' })
+    $null = Update-WindowsTerminalSettingsFile -Path $path -ManifestPath $manifest -Keybindings $ctrlA -Confirm:$false
+    Assert-True (@((Read-JsonFile $path).keybindings | Where-Object { $_.id -eq 'User.profile.ctrla' }).Count -eq 1) 'binding not applied'
+    # A run without -Keybindings (Set-TerminalBackground) keeps it.
+    $null = Update-WindowsTerminalSettingsFile -Path $path -ManifestPath $manifest -Defaults ([PSCustomObject]@{ opacity = 80 }) -Confirm:$false
+    Assert-True (@((Read-JsonFile $path).keybindings | Where-Object { $_.id -eq 'User.profile.ctrla' }).Count -eq 1) 'binding removed by a run that did not sync keybindings'
+    # The configuration no longer lists ctrl+a: the user's own binding comes back and the record is dropped.
+    $null = Update-WindowsTerminalSettingsFile -Path $path -ManifestPath $manifest -Keybindings @() -Confirm:$false
+    $wt = Read-JsonFile $path
+    Assert-True (@($wt.keybindings | Where-Object { $_.keys -eq 'ctrl+a' -and $_.id -eq 'User.mine' }).Count -eq 1) "the user's ctrl+a binding was not restored: $(ConvertTo-PspCanonicalJson $wt.keybindings)"
+    Assert-True (@($wt.actions | Where-Object { $_.id -eq 'User.profile.ctrla' }).Count -eq 0) 'the retired action was left behind'
+    $entry = Get-PspProp (Read-JsonFile $manifest).files $path.ToLowerInvariant()
+    Assert-True (-not (Test-PspProp $entry.bindings 'ctrl+a')) 'the retired binding is still recorded'
+    # A binding tagged by a version without a change record is removed too; the pre-install copy had none.
+    $legacy = New-WtSettings -Json '{ "profiles": { "defaults": {}, "list": [] }, "actions": [ { "command": "selectAll", "id": "User.profile.ctrla" }, { "command": "find", "id": "User.find" } ], "keybindings": [ { "id": "User.profile.ctrla", "keys": "ctrl+a" }, { "id": "User.find", "keys": "ctrl+f" } ] }' -Variant 'Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe'
+    [System.IO.File]::WriteAllText("$legacy.psp-original", '{ "profiles": { "defaults": {}, "list": [] }, "actions": [ { "command": "find", "id": "User.find" } ], "keybindings": [ { "id": "User.find", "keys": "ctrl+f" } ] }', $utf8)
+    $null = Update-WindowsTerminalSettingsFile -Path $legacy -ManifestPath $manifest -Keybindings @() -Confirm:$false
+    $wt = Read-JsonFile $legacy
+    Assert-True (@($wt.keybindings | Where-Object { $_.keys -eq 'ctrl+a' }).Count -eq 0 -and @($wt.actions | Where-Object { $_.id -eq 'User.profile.ctrla' }).Count -eq 0) 'the legacy ctrl+a binding was left behind'
+    Assert-True (@($wt.keybindings | Where-Object { $_.keys -eq 'ctrl+f' }).Count -eq 1) 'an unrelated user binding was removed'
+}
+
+Test-Case '-NoLogo goes right after the executable and only into PowerShell command lines' {
+    $manifest = Join-Path (Get-PspCacheDir) 'wt-changes.json'
+    New-Item -ItemType Directory -Path (Get-PspCacheDir) -Force | Out-Null
+    $q = [char]34
+    $list = @(
+        @{ guid = '{p1}'; name = 'Quoted'; commandline = "${q}C:\Program Files\PowerShell\7\pwsh.exe${q} -NoExit" }
+        @{ guid = '{p2}'; name = 'Via cmd'; commandline = 'cmd.exe /k pwsh' }
+        @{ guid = '{p3}'; name = 'Abbreviated'; commandline = 'pwsh.exe -nol' }
+        @{ guid = '{p4}'; name = 'PowerShell 7 Preview'; source = 'Windows.Terminal.PowerShellCore' }
+        @{ guid = '{p5}'; name = 'PowerShell'; source = 'Windows.Terminal.PowerShellCore' }
+        @{ guid = '{p6}'; name = 'Windows PowerShell'; commandline = '%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe' }
+    )
+    $path = New-WtSettings -Json (ConvertTo-Json -InputObject ([PSCustomObject]@{ profiles = [PSCustomObject]@{ defaults = [PSCustomObject]@{}; list = $list } }) -Depth 5)
+    $null = Update-WindowsTerminalSettingsFile -Path $path -ManifestPath $manifest -NoLogo -Confirm:$false
+    $byName = @{}
+    foreach ($p in @((Read-JsonFile $path).profiles.list)) { $byName[$p.name] = [string](Get-PspProp $p 'commandline') }
+    Assert-True ($byName['Quoted'] -eq "${q}C:\Program Files\PowerShell\7\pwsh.exe${q} -NoLogo -NoExit") "quoted path: $($byName['Quoted'])"
+    Assert-True ($byName['Via cmd'] -eq 'cmd.exe /k pwsh') "another program's command line was changed: $($byName['Via cmd'])"
+    Assert-True ($byName['Abbreviated'] -eq 'pwsh.exe -nol') "an abbreviated -NoLogo got a second one: $($byName['Abbreviated'])"
+    Assert-True (-not $byName['PowerShell 7 Preview']) "the Preview profile was pointed at pwsh.exe: $($byName['PowerShell 7 Preview'])"
+    Assert-True ($byName['PowerShell'] -eq 'pwsh.exe -NoLogo') "the generated PowerShell profile: $($byName['PowerShell'])"
+    Assert-True ($byName['Windows PowerShell'] -eq '%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo') "Windows PowerShell: $($byName['Windows PowerShell'])"
+}
+
+Test-Case 'admin passes every argument to the elevated shell as a quoted literal' {
+    $global:PspStartedArgs = $null
+    Set-Item -Path 'function:global:Start-Process' -Value { param($FilePath, $Verb, $ArgumentList) $global:PspStartedArgs = @($ArgumentList) -join ' ' }
+    admin Write-Output 'a;calc' '-Name:' "it's" -Flag
+    $encoded = [regex]::Match([string]$global:PspStartedArgs, '-EncodedCommand\s+"?([A-Za-z0-9+/=]+)').Groups[1].Value
+    $command = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+    Assert-True ($command -eq "& 'Write-Output' 'a;calc' -Name: 'it''s' -Flag") "unexpected elevated command: $command"
+    $global:PspStartedArgs = $null
+}
+
+Test-Case 'hb -Force -WhatIf uploads nothing' {
+    $file = Join-Path $script:Sandbox.Work 'paste.txt'
+    [System.IO.File]::WriteAllText($file, 'secret-ish', $utf8)
+    $script:Uploads = 0
+    function Invoke-RestMethod { $script:Uploads++ }
+    hb $file -Force -WhatIf 6>$null 3>$null
+    Assert-True ($script:Uploads -eq 0) 'hb uploaded under -WhatIf'
+}
+
+Test-Case 'sed leaves a file without the text untouched and works on PowerShell drives' {
+    $file = Join-Path $script:Sandbox.Work 'conf.ini'
+    [System.IO.File]::WriteAllText($file, "a=1`r`n", $utf8)
+    $stamp = (Get-Item -LiteralPath $file).LastWriteTimeUtc
+    Start-Sleep -Milliseconds 30
+    sed $file 'missing' 'x' 6>$null
+    Assert-True ((Get-Item -LiteralPath $file).LastWriteTimeUtc -eq $stamp -and -not (Test-Path -LiteralPath "$file.bak")) 'a file without the text was rewritten or backed up'
+    $null = New-PSDrive -Name PspSed -PSProvider FileSystem -Root $script:Sandbox.Work -Scope Global
+    try {
+        sed 'PspSed:\conf.ini' 'a=1' 'a=2' 6>$null
+        Assert-True ([System.IO.File]::ReadAllText($file) -eq "a=2`r`n" -and (Test-Path -LiteralPath "$file.bak")) 'sed on a PowerShell drive path failed'
+    }
+    finally { Remove-PSDrive -Name PspSed -Scope Global -ErrorAction SilentlyContinue }
+    $ErrorActionPreference = 'Continue'
+    $out = sed $script:Sandbox.Work 'a' 'b' 2>&1 | Out-String
+    Assert-True ($out -match 'File not found') 'a folder was accepted as a file'
+}
+
+Test-Case 'envload skips variables that change how programs run unless -AllowSensitive' {
+    $envFile = Join-Path $script:Sandbox.Work '.env'
+    [System.IO.File]::WriteAllText($envFile, "PSP_ENV_OK=1`nGIT_SSH_COMMAND=calc.exe`nNODE_OPTIONS=--require ./x.js`nPATH=C:\evil`n", $utf8)
+    $savedPath = $env:PATH
+    try {
+        $warn = envload $envFile 3>&1 6>$null | Out-String
+        Assert-True ($env:PSP_ENV_OK -eq '1') 'a plain variable was not loaded'
+        Assert-True (-not $env:GIT_SSH_COMMAND -and -not $env:NODE_OPTIONS -and $env:PATH -eq $savedPath) 'a sensitive variable was loaded without -AllowSensitive'
+        Assert-True ($warn -match 'GIT_SSH_COMMAND' -and $warn -match 'AllowSensitive') "the skipped names are not reported: $warn"
+        envload $envFile -AllowSensitive 3>$null 6>$null
+        Assert-True ($env:GIT_SSH_COMMAND -eq 'calc.exe') '-AllowSensitive did not load the variable'
+    }
+    finally {
+        $env:PATH = $savedPath
+        foreach ($n in 'PSP_ENV_OK', 'GIT_SSH_COMMAND', 'NODE_OPTIONS') { Remove-Item -LiteralPath "env:$n" -ErrorAction SilentlyContinue }
+    }
+}
+
+Test-Case 'prettyjson accepts pipeline input and keeps a top-level array an array' {
+    $out = '[1, 2]' | prettyjson | Out-String
+    Assert-True ($out -notmatch '"value"' -and $out -notmatch '"Count"') "array re-indented as an object: $out"
+    $multi = @('{', '  "a": [1,', '2]', '}') | prettyjson | Out-String
+    Assert-True ((ConvertFrom-Json $multi).a.Count -eq 2) "multi-line pipeline input failed: $multi"
+}
+
+Test-Case 'bak copies a folder next to itself with its contents, also with a trailing separator' {
+    $dir = Join-Path $script:Sandbox.Work 'site'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $dir 'index.html'), 'hi', $utf8)
+    bak ($dir + '\') 6>$null
+    $copy = @(Get-ChildItem -LiteralPath $script:Sandbox.Work -Directory -Filter 'site.*.bak')
+    Assert-True ($copy.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $copy[0].FullName 'index.html'))) 'folder backup missing or empty'
+    Assert-True (@(Get-ChildItem -LiteralPath $dir -Force).Count -eq 1) 'the backup landed inside the folder'
+}
+
+Test-Case 'killport, Stop-StuckProcess and Remove-LockedItem never stop this session or system processes' {
+    $script:Stopped = @()
+    function Get-NetTCPConnection { [PSCustomObject]@{ OwningProcess = $PID; LocalPort = 5000 } }
+    function Stop-Process { param($Id) $script:Stopped += $Id }
+    killport 5000 -Confirm:$false 3>$null 6>$null
+    Stop-StuckProcess -Id $PID -Confirm:$false 3>$null 6>$null
+    Assert-True ($script:Stopped.Count -eq 0) "this session was stopped: $($script:Stopped -join ',')"
+    $file = Join-Path $script:Sandbox.Work 'locked.bin'
+    [System.IO.File]::WriteAllText($file, 'x', $utf8)
+    function Remove-Item { throw 'locked' }
+    function Find-FileLocker { [PSCustomObject]@{ PID = 4; Name = 'System'; WindowTitle = '' } }
+    function Stop-StuckProcess { $script:Stopped += 'stuck' }
+    Remove-LockedItem $file -KillSystem -Confirm:$false -ErrorAction SilentlyContinue 3>$null 6>$null
+    Assert-True ($script:Stopped.Count -eq 0) 'Remove-LockedItem -KillSystem stopped a system process'
+}
+
+Test-Case 'mtr counts a PowerShell 7 TimedOut reply as loss, and firewall and DNS failures are reported as errors' {
+    function Test-NetConnection { [PSCustomObject]@{ TraceRoute = @('10.0.0.1') } }
+    function Test-Connection { [PSCustomObject]@{ Status = 'TimedOut'; Latency = 0 } }
+    $out = mtr example.invalid -Count 2 6>&1 | Out-String
+    Assert-True ($out -match '10\.0\.0\.1\s+100%') "a timed-out hop was not counted as loss: $out"
+    $saved = $script:PSP.IsAdmin
+    $script:PSP.IsAdmin = $true
+    try {
+        function New-NetFirewallRule { throw 'access denied' }
+        $err = $null
+        fwallow -Name 'PSP test' -Port 1 -Confirm:$false -ErrorAction SilentlyContinue -ErrorVariable err 6>$null
+        Assert-True ((@($err) -join ' ') -match 'Could not add firewall rule') 'a failed firewall rule was not reported'
+    }
+    finally { $script:PSP.IsAdmin = $saved }
+    function Clear-DnsClientCache { throw 'access denied' }
+    $ErrorActionPreference = 'Continue'
+    $out = flushdns 2>&1 6>$null | Out-String
+    Assert-True ($out -match 'Could not flush') "a failed DNS flush was reported as success: $out"
+}
+
+Test-Case 'ConvertTo-NativeArgumentLine keeps an empty argument' {
+    Assert-True ((ConvertTo-NativeArgumentLine @('a', '', 'b c')) -eq 'a "" "b c"') "unexpected: $(ConvertTo-NativeArgumentLine @('a', '', 'b c'))"
+}
+
+Test-Case 'reload warns unless dot-sourced, and runs the profile either way' {
+    New-Item -ItemType Directory -Path (Split-Path $PROFILE) -Force | Out-Null
+    [System.IO.File]::WriteAllText($PROFILE, '$global:PspReloadRuns++', $utf8)
+    $global:PspReloadRuns = 0
+    $warn = reload 3>&1 | Out-String
+    Assert-True ($global:PspReloadRuns -eq 1 -and $warn -match '\. reload') "reload did not warn or did not run the profile: $warn"
+    $warn = . reload 3>&1 | Out-String
+    Assert-True ($global:PspReloadRuns -eq 2 -and [string]::IsNullOrWhiteSpace($warn)) "a dot-sourced reload warned or did not run: $warn"
+    Remove-Variable -Name PspReloadRuns -Scope Global -ErrorAction SilentlyContinue
+}
+
+Test-Case 'Update-Profile saves profile.original.ps1 before rotation, which keeps only timestamped copies' {
+    Install-DownloadStub
+    $global:PspStubSums = (@('Microsoft.PowerShell_profile.ps1', 'theme.json', 'terminal-config.json') | ForEach-Object { '{0}  {1}' -f (Get-CommittedSha256 $_).ToLowerInvariant(), $_ }) -join "`n"
+    try {
+        $d = $script:Sandbox.Ps7Dir
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $d 'Microsoft.PowerShell_profile.ps1'), "### PowerShell Profile (26zl)`r`n# older installed copy", $utf8)
+        [System.IO.File]::WriteAllText((Join-Path $d 'oldprofile.20240101-000000.ps1'), '# my own profile', $utf8)
+        (Get-Item -LiteralPath (Join-Path $d 'oldprofile.20240101-000000.ps1')).LastWriteTime = (Get-Date).AddDays(-30)
+        foreach ($i in 1..6) { [System.IO.File]::WriteAllText((Join-Path $d ('oldprofile.2025010{0}-000000.ps1' -f $i)), "### PowerShell Profile (26zl)`r`n# copy $i", $utf8) }
+        [System.IO.File]::WriteAllText((Join-Path $d 'oldprofile.keep.ps1'), '# not a timestamped backup', $utf8)
+        Update-Profile -Ref v9.9.9 -ErrorAction SilentlyContinue *>&1 | Out-Null
+        Assert-True ([System.IO.File]::ReadAllText((Join-Path $d 'profile.original.ps1')).Trim() -eq '# my own profile') 'profile.original.ps1 is not the user''s own profile'
+        $stamped = @(Get-ChildItem -LiteralPath $d -Filter 'oldprofile.*.ps1' | Where-Object { $_.Name -match '^oldprofile\.\d{8}-\d{6}\.ps1$' })
+        Assert-True ($stamped.Count -eq 5) "expected 5 timestamped backups, found $($stamped.Count)"
+        Assert-True (Test-Path -LiteralPath (Join-Path $d 'oldprofile.keep.ps1')) 'a backup without a timestamp was rotated away'
+    }
+    finally { $global:PspStubSums = $null }
+}
+
+Test-Case 'setup.ps1 stops with exit code 2 and installs nothing when the wizard summary is declined' {
+    # setup.ps1 runs in its own script scope, so the answers live in a global queue.
+    $global:PspWizardQueue = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($a in 'y', 'n') { $global:PspWizardQueue.Enqueue($a) }
+    function Read-Host { param($Prompt, [switch]$AsSecureString) if ($global:PspWizardQueue.Count -eq 0) { throw "unexpected prompt: $Prompt" }; $global:PspWizardQueue.Dequeue() }
+    try { $out = & $setupPath -LocalRepo $repoRoot -CiMode -Wizard *>&1 | Out-String }
+    finally { Remove-Variable -Name PspWizardQueue -Scope Global -ErrorAction SilentlyContinue }
+    Assert-True ($LASTEXITCODE -eq 2) "exit code $LASTEXITCODE`: $out"
+    Assert-True ($out -match 'nothing was installed') 'the cancellation is not reported'
+    Assert-True (-not (Test-Path -LiteralPath $PROFILE)) 'the profile was installed after the summary was declined'
+}
+
+Test-Case 'Runs of a script or command count as non-interactive unless -NoExit comes first' {
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $loop = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] -and $n.Extent.Text -match '_pspScriptRun = \$true' }, $true) | Select-Object -First 1
+    Assert-True ($null -ne $loop) 'the command-line scan was not found'
+    $scan = [scriptblock]::Create('param($a) $_pspArgs = $a; $_pspScriptRun = $false; ' + $loop.Extent.Text + '; $_pspScriptRun')
+    $cases = @(
+        @{ Args = @('pwsh.exe'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-NoLogo', '-WorkingDirectory', 'C:\work'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-ex', 'Bypass'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-File', 'x.ps1'); Expected = $true }
+        @{ Args = @('pwsh.exe', '-c', 'Get-Date'); Expected = $true }
+        @{ Args = @('pwsh.exe', '/Command', 'Get-Date'); Expected = $true }
+        @{ Args = @('powershell.exe', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', 'ZQBjAGgAbwA='); Expected = $true }
+        @{ Args = @('pwsh.exe', '-NoExit', '-Command', 'Get-Date'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-noe', '-c', 'Get-Date'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-Command', 'Get-Date', '-NoExit'); Expected = $true }
+        @{ Args = @('pwsh.exe', '-NoLogo'); Expected = $false }
+        @{ Args = @('pwsh.exe', '-e', 'ZQBjAGgAbwA='); Expected = $true }
+    )
+    foreach ($case in $cases) {
+        $result = & $scan $case.Args
+        Assert-True ($result -eq $case.Expected) ("{0}: expected {1}, got {2}" -f ($case.Args -join ' '), $case.Expected, $result)
+    }
+}
+
+Test-Case 'The startup garbage collection pause is skipped when not interactive and ends once, at the first prompt' {
+    # This test session is not interactive, so loading the profile reserved nothing.
+    Assert-True (-not $script:PspNoGcRegion -and [System.Runtime.GCSettings]::LatencyMode -ne [System.Runtime.GCLatencyMode]::NoGCRegion) 'a non-interactive load held garbage collection off'
+    $before = [System.Runtime.GCSettings]::LatencyMode
+    $script:PspNoGcRegion = [System.GC]::TryStartNoGCRegion(16MB)
+    try {
+        Assert-True ($script:PspNoGcRegion -and [System.Runtime.GCSettings]::LatencyMode -eq [System.Runtime.GCLatencyMode]::NoGCRegion) 'the test could not start a no-GC region'
+        $null = Get-PspPlainPrompt
+        Exit-PspNoGcRegion
+        Assert-True ([System.Runtime.GCSettings]::LatencyMode -eq $before -and -not $script:PspNoGcRegion) "the region did not end: $([System.Runtime.GCSettings]::LatencyMode)"
+        Exit-PspNoGcRegion
+        Assert-True ([System.Runtime.GCSettings]::LatencyMode -eq $before) 'a second call changed the latency mode'
+    }
+    finally {
+        if ([System.Runtime.GCSettings]::LatencyMode -eq [System.Runtime.GCLatencyMode]::NoGCRegion) { [System.GC]::EndNoGCRegion() }
+        $script:PspNoGcRegion = $false
+    }
+}
+
+Test-Case 'The history filter is hooked into PSReadLine and keeps ordinary lines' {
+    Import-Module PSReadLine -ErrorAction Stop
+    $saved = (Get-PSReadLineOption).AddToHistoryHandler
+    try {
+        Register-ProfileHistoryHandler
+        $handler = (Get-PSReadLineOption).AddToHistoryHandler
+        Assert-True ($null -ne $handler) 'no history handler is registered'
+        Assert-True ($handler.Invoke('pwnd hunter2') -eq $false) 'a pwnd password reached history'
+        Assert-True ($handler.Invoke('$s = ConvertTo-SecureString ''x'' -AsPlainText -Force') -eq $false) 'an -AsPlainText line reached history'
+        # PSReadLine 2.2+ answers with its own filter's verdict; 2.0 (Windows PowerShell's built-in copy) has none.
+        $kept = [string]$handler.Invoke('Get-ChildItem')
+        Assert-True ($kept -in 'True', 'MemoryAndFile') "an ordinary line was not kept: $kept"
+    }
+    finally { if ($null -ne $saved) { Set-PSReadLineOption -AddToHistoryHandler $saved } }
+}
+
+Test-Case 'Keybinding ids keep punctuation keys apart, and a binding dropped from the configuration is reported as pending' {
+    $manifest = Join-Path (Get-PspCacheDir) 'wt-changes.json'
+    New-Item -ItemType Directory -Path (Get-PspCacheDir) -Force | Out-Null
+    $path = New-WtSettings -Json '{ "profiles": { "defaults": {}, "list": [] }, "actions": [], "keybindings": [] }'
+    $bindings = @(
+        [PSCustomObject]@{ keys = 'ctrl+='; command = [PSCustomObject]@{ action = 'adjustFontSize'; delta = 1 } }
+        [PSCustomObject]@{ keys = 'ctrl+-'; command = [PSCustomObject]@{ action = 'adjustFontSize'; delta = -1 } }
+        [PSCustomObject]@{ keys = 'ctrl+a'; command = 'selectAll' }
+    )
+    $null = Update-WindowsTerminalSettingsFile -Path $path -ManifestPath $manifest -Keybindings $bindings -Confirm:$false
+    $wt = Read-JsonFile $path
+    $ids = @($wt.keybindings | ForEach-Object { $_.id })
+    Assert-True ($ids.Count -eq 3 -and @($ids | Select-Object -Unique).Count -eq 3) "ids collide: $($ids -join ', ')"
+    Assert-True ($ids -contains 'User.profile.ctrla') 'a binding of letters only changed its id'
+    $plusId = ($wt.keybindings | Where-Object { $_.keys -eq 'ctrl+=' }).id
+    Assert-True ((@($wt.actions | Where-Object { $_.id -eq $plusId })[0]).command.delta -eq 1) 'ctrl+= runs the command of another binding'
+    Assert-True (-not (Test-WtRetiredKeybindingPending -Keybindings $bindings -ManifestPath $manifest)) 'a configured binding counts as retired'
+    Assert-True (Test-WtRetiredKeybindingPending -Keybindings @($bindings[0], $bindings[1]) -ManifestPath $manifest) 'a binding dropped from the configuration is not reported'
+}
+
+Test-Case 'Update-SessionPathFromRegistry keeps the session entries and adds each missing registry entry once' {
+    # The sandbox stubs this function out, so the real one is loaded here.
+    . ([scriptblock]::Create((Get-PspFunctionSource -Path $profilePath -Name 'Update-SessionPathFromRegistry')))
+    $saved = $env:PATH
+    try {
+        $machine = @(([string][Environment]::GetEnvironmentVariable('PATH', 'Machine')) -split ';' | Where-Object { $_ })
+        $env:PATH = 'C:\psp-session-only;' + $(if ($machine.Count) { $machine[0] } else { '' })
+        Update-SessionPathFromRegistry
+        $entries = @($env:PATH -split ';' | Where-Object { $_ })
+        Assert-True ($entries[0] -eq 'C:\psp-session-only') 'a session-only entry was dropped or moved'
+        foreach ($m in $machine) {
+            Assert-True (@($entries | Where-Object { $_.TrimEnd('\') -eq $m.TrimEnd('\') }).Count -eq 1) "registry entry missing or repeated: $m"
+        }
+    }
+    finally { $env:PATH = $saved }
+}
+
+Test-Case 'lint always passes its own settings, so the analyzed folder cannot load custom rules' {
+    $script:LintArgs = $null
+    function Get-Module { param([switch]$ListAvailable, $Name) $null = $ListAvailable, $Name; [PSCustomObject]@{ Name = 'PSScriptAnalyzer' } }
+    function Import-Module { }
+    function Invoke-ScriptAnalyzer { param($Path, [switch]$Recurse, $Settings, [switch]$Fix) $null = $Path, $Recurse, $Fix; $script:LintArgs = @{ Settings = $Settings }; @() }
+    lint $script:Sandbox.Work 6>$null | Out-Null
+    Assert-True ($null -ne $script:LintArgs -and $script:LintArgs.Settings -is [hashtable]) 'lint ran without -Settings'
+    lint $script:Sandbox.Work -Mode CI 6>$null | Out-Null
+    Assert-True (@($script:LintArgs.Settings.ExcludeRules) -contains 'PSAvoidUsingWriteHost') 'the CI mode did not pass its rule list'
+}
+
+Test-Case 'Quoted literals for the elevated shell also double typographic single quotes' {
+    $global:PspStartedArgs = $null
+    Set-Item -Path 'function:global:Start-Process' -Value { param($FilePath, $Verb, $ArgumentList) $global:PspStartedArgs = @($ArgumentList) -join ' ' }
+    $value = 'a' + [char]0x2019 + '; calc'
+    admin Write-Output $value
+    $encoded = [regex]::Match([string]$global:PspStartedArgs, '-EncodedCommand\s+"?([A-Za-z0-9+/=]+)').Groups[1].Value
+    $command = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+    $global:PspStartedArgs = $null
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($command, [ref]$tokens, [ref]$parseErrors)
+    $statements = @($ast.EndBlock.Statements)
+    Assert-True ($statements.Count -eq 1 -and @($parseErrors).Count -eq 0) "the argument ended the quoted string early: $command"
+    $elements = @($statements[0].PipelineElements[0].CommandElements)
+    Assert-True ($elements.Count -eq 2 -and $elements[1].Value -eq $value) "the argument arrived changed: $command"
+}
+
+Test-Case 'envload also skips build, cloud and tool settings that can run programs' {
+    $envFile = Join-Path $script:Sandbox.Work '.env'
+    $names = 'KUBECONFIG', 'JAVA_OPTS', 'RUSTC_WRAPPER', 'AWS_CONFIG_FILE', 'GOOGLE_APPLICATION_CREDENTIALS', 'CC', 'LESSOPEN', 'CARGO_HOME', 'DOCKER_HOST'
+    [System.IO.File]::WriteAllText($envFile, ((@($names | ForEach-Object { "$_=x" }) + 'PSP_ENV_PLAIN=1') -join "`n"), $utf8)
+    $saved = @{}
+    foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+    try {
+        envload $envFile 3>$null 6>$null
+        Assert-True ($env:PSP_ENV_PLAIN -eq '1') 'a plain variable was not loaded'
+        foreach ($n in $names) { Assert-True ([Environment]::GetEnvironmentVariable($n) -eq $saved[$n]) "$n was loaded without -AllowSensitive" }
+    }
+    finally {
+        foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+        Remove-Item -LiteralPath 'env:PSP_ENV_PLAIN' -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'The history filter drops newer token shapes and keeps ordinary lines' {
+    # The token shapes are assembled here so the repository secret scan does not match the test itself.
+    $lines = @(
+        ('$k = ''' + 'sk-' + 'proj-' + ('a' * 24) + '''')
+        ('git push https://oauth2:' + 'glpat-' + ('b' * 20) + '@gitlab.example')
+        ('az storage blob list --connection-string ''' + 'AccountKey=' + ('c' * 12) + '''')
+        ('curl ''https://acct.blob.core.windows.net/c/f?sv=2024&' + 'sig=' + ('d' * 24) + '''')
+        ('$env:DB_' + 'PASS = ''x''')
+    )
+    foreach ($line in $lines) { Assert-True (-not (Test-ProfileHistorySafeLine -Line $line)) "kept in history: $line" }
+    Assert-True (Test-ProfileHistorySafeLine -Line 'Get-ChildItem -Path C:\work') 'an ordinary line was dropped'
+}
+
+Test-Case 'Uninstall-Profile restores the original once and then leaves a profile that is not this one alone' {
+    $d = $script:Sandbox.Ps7Dir
+    $main = Join-Path $d 'Microsoft.PowerShell_profile.ps1'
+    [System.IO.File]::WriteAllText($main, '### PowerShell Profile (26zl)' + "`r`n# installed copy", $utf8)
+    [System.IO.File]::WriteAllText((Join-Path $d 'profile.original.ps1'), '# my own profile', $utf8)
+    Uninstall-Profile -Confirm:$false 6>$null 3>$null | Out-Null
+    Assert-True ([System.IO.File]::ReadAllText($main) -eq '# my own profile') 'the original profile was not restored'
+    [System.IO.File]::WriteAllText($main, '# my own profile, edited', $utf8)
+    Uninstall-Profile -Confirm:$false 6>$null 3>$null | Out-Null
+    Assert-True ([System.IO.File]::ReadAllText($main) -eq '# my own profile, edited') 'a second uninstall replaced a profile that is not this one'
+}
+
+Test-Case 'genpass copies through the clipboard that skips history and writes nothing to the success stream' {
+    $script:Copied = $null
+    function Set-PspSensitiveClipboard { param($Text) $script:Copied = $Text }
+    $out = genpass -Length 24 6>$null
+    Assert-True ($null -eq $out) 'genpass wrote the password to the success stream'
+    Assert-True (([string]$script:Copied).Length -eq 24) "copied: $([string]$script:Copied)"
+}
+
+Test-Case 'Install-OhMyPoshPortable installs only a build signed by the Oh My Posh author' {
+    $target = Get-OhMyPoshPortablePath
+    function Invoke-DownloadWithRetry { param($Uri, $OutFile, $TimeoutSec) $null = $Uri, $TimeoutSec; [System.IO.File]::WriteAllText($OutFile, 'downloaded build', [System.Text.UTF8Encoding]::new($false)) }
+    # The hash check passes, so only the signature decides.
+    function Get-FileHash { param($LiteralPath, $Algorithm) $null = $Algorithm; [PSCustomObject]@{ Hash = [string](Get-PspComponentPins).OhMyPoshSha256[[System.IO.Path]::GetFileName($LiteralPath)] } }
+    $script:Signature = [PSCustomObject]@{ Status = 'Valid'; SignerCertificate = [PSCustomObject]@{ Subject = 'CN=Someone Else' } }
+    function Get-AuthenticodeSignature { param($LiteralPath) $null = $LiteralPath; $script:Signature }
+    Assert-True ($null -eq (Install-OhMyPoshPortable -Force -Confirm:$false 3>$null 6>$null) -and -not [System.IO.File]::Exists($target)) 'a build signed by someone else was installed'
+    $script:Signature = [PSCustomObject]@{ Status = 'NotSigned'; SignerCertificate = $null }
+    Assert-True ($null -eq (Install-OhMyPoshPortable -Force -Confirm:$false 3>$null 6>$null) -and -not [System.IO.File]::Exists($target)) 'an unsigned build was installed'
+    $script:Signature = [PSCustomObject]@{ Status = 'Valid'; SignerCertificate = [PSCustomObject]@{ Subject = 'CN=Jan Joris De Dobbeleer, O=Jan Joris De Dobbeleer' } }
+    Assert-True ((Install-OhMyPoshPortable -Force -Confirm:$false 6>$null) -eq $target -and [System.IO.File]::ReadAllText($target) -eq 'downloaded build') 'a correctly signed build was not installed'
+    Assert-True ([System.IO.File]::Exists((Join-Path (Split-Path $target) 'psp-managed.txt'))) 'the managed marker was not written'
+}
+
+Test-Case 'Versions named in README.md and SECURITY.md match the pins' {
+    . ([scriptblock]::Create((Get-PspAssignmentSource -Path $setupPath -Variable '$script:NerdFontVersion')))
+    $pins = Get-PspComponentPins
+    $docs = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'README.md')) + [System.IO.File]::ReadAllText((Join-Path $repoRoot 'SECURITY.md'))
+    $expected = @(('v' + $pins.OhMyPosh), $script:OmpThemesRef, ('v' + $script:NerdFontVersion), $pins.OhMyPoshMinimum)
+    foreach ($version in $expected) { Assert-True ($docs.Contains($version)) "the docs do not name $version" }
+    # Every release-shaped Oh My Posh or Nerd Fonts version in the docs is one of the pinned ones.
+    $named = @([regex]::Matches($docs, '(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])') | ForEach-Object { $_.Value.TrimStart('v') } | Where-Object { $_ -match '^(29|3[0-9])\.' -or $_ -match '^3\.\d+\.\d+$' } | Select-Object -Unique)
+    $allowed = @($expected | ForEach-Object { $_.TrimStart('v') }) + '1.0.0'
+    $stale = @($named | Where-Object { $allowed -notcontains $_ })
+    Assert-True ($stale.Count -eq 0) "versions in the docs that match no pin: $($stale -join ', ')"
+}
+
+Test-Case 'The prompt path and the tab-title hook call no Microsoft.PowerShell.Management cmdlet (its import costs about 25 ms)' {
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $management = @{}
+    foreach ($c in (Get-Command -Module Microsoft.PowerShell.Management -CommandType Cmdlet)) { $management[$c.Name] = $true }
+    foreach ($a in (Get-Alias | Where-Object { $management.ContainsKey([string]$_.Definition) })) { $management[$a.Name] = $true }
+    $names = @('Invoke-PromptStage', 'Invoke-ProfileHook', 'Get-OhMyPoshPromptText', 'Get-OhMyPoshPromptContext', 'Invoke-OhMyPoshCommand', 'Complete-OhMyPoshCommand',
+        'Get-OhMyPoshChildPath', 'Get-ProfileEnvironmentFingerprint', 'Get-PspPlainPrompt', 'Exit-PspNoGcRegion', 'Get-OhMyPoshExecutablePath', 'Get-ExternalCommandPath',
+        'Find-ProfileExecutable', 'ConvertFrom-JsonC', 'Set-PspFeatureOverride', 'Get-PspCacheDir', 'Test-PspOmpVersionSafe', 'Get-PspExecutableVersion')
+    $bodies = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name }, $true))
+    Assert-True ($bodies.Count -eq $names.Count) "found $($bodies.Count) of $($names.Count) functions"
+    $bodies += @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Register-ProfileHook' -and $n.Extent.Text -match '-EventName PrePrompt' }, $true))
+    $hits = @(foreach ($b in $bodies) {
+            foreach ($c in $b.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $name = $c.GetCommandName()
+                if ($name -and $management.ContainsKey($name)) { '{0} (line {1})' -f $name, $c.Extent.StartLineNumber }
+            }
+        })
+    Assert-True ($hits.Count -eq 0) "Management cmdlets on the prompt path: $($hits -join ', ')"
+}
+
+Test-Case 'Loading the profile in a fresh process does not import Microsoft.PowerShell.Management' {
+    # The cache and plugin folders exist, as after any earlier start, so the load creates nothing.
+    New-Item -ItemType Directory -Path (Join-Path (Get-PspCacheDir) 'plugins') -Force | Out-Null
+    $shell = (Get-Process -Id $PID).Path
+    $out = & $shell -NoProfile -NonInteractive -Command ". '$profilePath' *> `$null; 'mgmt=' + [bool](Get-Module Microsoft.PowerShell.Management)" 2>&1 | Out-String
+    Assert-True ($out -match 'mgmt=False') "the load imported the module: $out"
+}
+
+Test-Case 'The zoxide cache reads the folder through the session API, and the load accepts only caches written that way' {
+    function Invoke-WithTimeout {
+        param([scriptblock]$ScriptBlock, $ArgumentList, $TimeoutSec)
+        $null = $ArgumentList, $TimeoutSec
+        if ($ScriptBlock.ToString() -match 'init --cmd') { "function global:__zoxide_pwd {`n    `$cwd = Microsoft.PowerShell.Management\Get-Location`n}" } else { 'zoxide 0.10.0' }
+    }
+    $cache = Join-Path $script:Sandbox.Work 'zoxide-init.ps1'
+    Assert-True (New-PspZoxideCache -ExecutablePath 'zoxide.exe' -CachePath $cache) 'the cache was not written'
+    $lines = [System.IO.File]::ReadAllLines($cache)
+    $text = $lines -join "`n"
+    Assert-True ($text.Contains('$cwd = $ExecutionContext.SessionState.Path.CurrentLocation') -and -not $text.Contains('Management\Get-Location')) 'Get-Location was not replaced'
+    # The header the writer produces is the one the load path checks for; an older header is regenerated.
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$parseErrors)
+    $check = ($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.StartsWith('^# ZOXIDE_CACHE_VERSION') }, $true) | Select-Object -First 1).Value
+    Assert-True ($lines[0] -match $check) "the load would reject the header '$($lines[0])'"
+    Assert-True (-not ('# ZOXIDE_CACHE_VERSION: zoxide 0.10.0' -match $check)) 'a cache without the session API change is still accepted'
+}
+
+Test-Case 'Install-NerdFonts never extracts an archive whose hash differs' {
+    $script:Extracted = $false
+    function Invoke-DownloadWithRetry { param($Uri, $OutFile, $TimeoutSec, $MaxAttempts) $null = $Uri, $TimeoutSec, $MaxAttempts; [System.IO.File]::WriteAllText($OutFile, 'not the pinned archive', [System.Text.UTF8Encoding]::new($false)) }
+    function Expand-Archive { $script:Extracted = $true }
+    $ok = Install-NerdFonts -FontName 'PspTestFont' -FontDisplayName 'PspTestFont NF' -Version '3.4.0' -Sha256 ('A' * 64) -Confirm:$false 6>$null
+    Assert-True (-not $ok -and -not $script:Extracted) 'an archive whose hash differs was installed'
+}
+
+Test-Case 'setup.ps1 checks local release files against the SHA256SUMS.txt next to them' {
+    $dir = Join-Path $script:Sandbox.Work 'release'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $bundle = 'Microsoft.PowerShell_profile.ps1', 'theme.json', 'terminal-config.json'
+    foreach ($f in @('setup.ps1') + $bundle) { Copy-Item -LiteralPath (Join-Path $repoRoot $f) -Destination $dir }
+    $sums = @(foreach ($f in $bundle) { '{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $dir $f) -Algorithm SHA256).Hash.ToLowerInvariant(), $f })
+    [System.IO.File]::WriteAllText((Join-Path $dir 'SHA256SUMS.txt'), ($sums -join "`n"), $utf8)
+    $out = & (Join-Path $dir 'setup.ps1') -LocalRepo $dir -CiMode -SkipWizard -WhatIf *>&1 | Out-String -Width 4096
+    Assert-True ($out -match 'matches the SHA256SUMS.txt in') "matching files were not reported as verified: $out"
+    # One wrong line stops setup before anything is installed.
+    $sums[0] = ('0' * 64) + '  Microsoft.PowerShell_profile.ps1'
+    [System.IO.File]::WriteAllText((Join-Path $dir 'SHA256SUMS.txt'), ($sums -join "`n"), $utf8)
+    $out = & (Join-Path $dir 'setup.ps1') -LocalRepo $dir -CiMode -SkipWizard *>&1 | Out-String -Width 4096
+    Assert-True ($LASTEXITCODE -ne 0 -and $out -match 'does not match the SHA256SUMS.txt') "a file that differs from SHA256SUMS.txt was accepted: $out"
+    Assert-True (-not (Test-Path -LiteralPath $PROFILE)) 'the profile was installed from files that failed the check'
 }
 
 $script:Stopwatch.Stop()

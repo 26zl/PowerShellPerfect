@@ -347,6 +347,7 @@ Invoke-TestCase -Name 'Install profile in sandbox' -Code {
     Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
 
     & (Join-Path $repoRoot 'setprofile.ps1') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "setprofile.ps1 failed (exit $LASTEXITCODE)" }
 
     if (-not (Test-Path $script:sandboxPs7Profile)) { throw "Missing installed profile: $($script:sandboxPs7Profile)" }
     if (-not (Test-Path $script:sandboxPs5Profile)) { throw "Missing installed profile: $($script:sandboxPs5Profile)" }
@@ -567,9 +568,9 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'Uninstall-Profile' -Code { Uninstall-Profile -All -WhatIf -Confirm:$false | Out-Null }
         Invoke-CommandProbe -Command 'Invoke-ProfileWizard' -Code {
             # Confirm -WhatIf prevents setup wizard downloads.
-            $preFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+            $preFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*' -ErrorAction SilentlyContinue)
             Invoke-ProfileWizard -WhatIf -Confirm:$false | Out-Null
-            $postFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*.ps1' -ErrorAction SilentlyContinue)
+            $postFiles = @(Get-ChildItem -Path $env:TEMP -Filter 'psp-reconfigure-*' -ErrorAction SilentlyContinue)
             if ($postFiles.Count -gt $preFiles.Count) {
                 throw "Invoke-ProfileWizard -WhatIf created temp files it should not have: $($postFiles.Name -join ', ')"
             }
@@ -585,7 +586,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         }
         Invoke-CommandProbe -Command 'Invoke-DownloadWithRetry' -SkipReason 'Internal helper (covered by setup tests)'
         Invoke-CommandProbe -Command 'Invoke-WithTimeout' -SkipReason 'Internal helper (used by OMP/zoxide init)'
-        Invoke-CommandProbe -Command 'Merge-JsonObject' -SkipReason 'Internal helper nested in Update-Profile'
+        Invoke-CommandProbe -Command 'Merge-JsonObject' -SkipReason 'Internal helper shared with setup.ps1; tested by tests/test.ps1 step 14'
 
         # Git
         Invoke-CommandProbe -Command 'gs' -Code {
@@ -631,11 +632,9 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         Invoke-CommandProbe -Command 'g' -SkipReason 'Depends on local zoxide jump target'
 
         # Files and navigation
-        Invoke-CommandProbe -Command 'ls' -Code { ls $workspace | Out-Null }
         Invoke-CommandProbe -Command 'la' -Code { la $workspace | Out-Null }
         Invoke-CommandProbe -Command 'll' -Code { ll $workspace | Out-Null }
         Invoke-CommandProbe -Command 'lt' -Code { lt $workspace | Out-Null }
-        Invoke-CommandProbe -Command 'cat' -Code { cat $textFile | Out-Null }
         # bcat is only defined when bat is installed; exercise it when present, otherwise record a skip.
         if (Get-Command bat -ErrorAction Ignore) {
             Invoke-CommandProbe -Command 'bcat' -Code { bcat $textFile | Out-Null }
@@ -1250,7 +1249,6 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Test-ProfileHistorySafeLine'
         'Save-TrustedDirectories'
         'Read-UserSettingsForWrite'
-        'Get-WindowsTerminalSettingsPath'
         'Get-WindowsTerminalSettingsPaths'
         'Push-TabTitle'
         'Pop-TabTitle'
@@ -1270,6 +1268,18 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         'Copy-PspObject'
         'Merge-PspUserSettings'
         'ConvertTo-PspSortedNode'
+        'Find-ProfileExecutable'
+        'Test-ProfileModuleInstalled'
+        'Get-OhMyPoshPortablePath'
+        'Install-OhMyPoshPortable'
+        'Complete-OhMyPoshCommand'
+        'Get-OhMyPoshChildPath'
+        'Get-ProfileEnvironmentFingerprint'
+        'ConvertTo-ProfileFastOmpTheme'
+        'Import-ProfileFzfModule'
+        'Invoke-ProfileLazyCompleter'
+        'Register-ProfileHistoryHandler'
+        'ConvertTo-ProfilePrettyJson'
     )
     # Helpers named *-Psp* and *-Wt* are internal too (covered by tests/unit.ps1).
     $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ -and $_ -notmatch '-(Psp|Wt)[A-Z]' }

@@ -85,6 +85,14 @@ jobs:
             if (-not $entry) { throw 'empty response' }
           } catch { $problems += "PSFzf $($pins.PSFzf) not found on the PowerShell Gallery" }
           try { $null = Invoke-RestMethod "https://registry.npmjs.org/http-server/$($pins.HttpServer)" } catch { $problems += "http-server $($pins.HttpServer) not found on npm" }
+          # The portable oh-my-posh build pinned in the profile against that release's checksums.txt.
+          $ompSums = Join-Path $work 'omp-checksums.txt'
+          Invoke-WebRequest "https://github.com/JanDeDobbeleer/oh-my-posh/releases/download/v$($pins.OhMyPosh)/checksums.txt" -OutFile $ompSums
+          $omp = @{}
+          foreach ($line in Get-Content $ompSums) { if ($line -match '^([0-9a-fA-F]{64})\s+\*?(\S+)$') { $omp[$Matches[2]] = $Matches[1].ToUpperInvariant() } }
+          foreach ($asset in $pins.OhMyPoshSha256.Keys) {
+            if ($omp[$asset] -ne $pins.OhMyPoshSha256[$asset].ToUpperInvariant()) { $problems += "profile hash for $asset does not match oh-my-posh v$($pins.OhMyPosh)" }
+          }
 
           # Newer upstream releases are reported, not failed.
           foreach ($repo in 'ryanoasis/nerd-fonts', 'JanDeDobbeleer/oh-my-posh') {

@@ -36,8 +36,7 @@ jobs:
 
       - name: Run PSScriptAnalyzer (PSScriptAnalyzerSettings.psd1)
         shell: pwsh
-        # tests/ is excluded: those files call profile aliases (gc, ls, cat, uptime, eventlog) by their short names to
-        # exercise the profile's own definitions, and hold fixtures that trip the secret and path scanners.
+        # tests/ is excluded: the harnesses call commands by alias and hold fixtures that trip the analyzer rules.
         run: pwsh -NoProfile -File tests/lint.ps1 -NoInstall
 
       - name: Smoke-test profile (PS7, sandboxed, load-time budget)
@@ -80,8 +79,7 @@ jobs:
             '/home/'
             '\\\\Users\\\\'
           )
-          # tests/test.ps1 replicates this same check locally, so it contains the regex patterns
-          # we are searching for; excluded by name to avoid self-matching.
+          # tests/test.ps1 contains these patterns, so it is excluded by name.
           $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.Name -ne 'test.ps1' }
           $found = @()
           foreach ($file in $files) {
@@ -314,7 +312,10 @@ jobs:
           # Everything else setup.ps1 loads from the verified profile must exist there.
           . ([scriptblock]::Create((Get-PspAssignmentSource -Path 'setup.ps1' -Variable '$script:SharedFunctionNames')))
           try { $null = Get-PspFunctionSource -Path 'Microsoft.PowerShell_profile.ps1' -Name $script:SharedFunctionNames } catch { $problems += $_.Exception.Message }
-          if ($setup.IndexOf('$script:Bundle = Initialize-InstallBundle') -gt $setup.IndexOf('$installed = Invoke-SetupInstall')) { $problems += 'bundle verification does not come before installation' }
+          # A missing line (index -1) fails as well.
+          $verifyAt = $setup.IndexOf('$script:Bundle = Initialize-InstallBundle', [System.StringComparison]::Ordinal)
+          $installAt = $setup.IndexOf('$installed = Invoke-SetupInstall', [System.StringComparison]::Ordinal)
+          if ($verifyAt -lt 0 -or $installAt -lt 0 -or $verifyAt -gt $installAt) { $problems += 'bundle verification does not come before installation' }
           if ($problems) { $problems | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }; exit 1 }
           Write-Host 'setup.ps1 structure OK' -ForegroundColor Green
 
